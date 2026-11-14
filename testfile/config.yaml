@@ -1,0 +1,22 @@
+# YAML: mappings, sequences, scalars, anchors and aliases
+app:
+  name: "Notefart demo"
+  version: 1.2
+  enabled: true
+  missing_value: null
+  tags: [editor, terminal, unicode]
+
+palette: &palette
+  accent: "#8bc5ff"
+  background: "#171b24"
+
+preview:
+  colors: *palette
+  message: |
+    Hello from YAML.
+    Indentation is part of the syntax.
+  options:
+    - name: mouse
+      active: true
+    - name: clipboard
+      active: false

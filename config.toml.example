@@ -1,0 +1,30 @@
+# Contoh konfigurasi pengguna Notefart.
+# File di folder proyek tidak dibaca otomatis.
+# Coba tanpa mengubah preferensi tersimpan:
+#   cargo run -- --config config.toml.example
+# Lokasi konfigurasi pengguna:
+#   $XDG_CONFIG_HOME/notefart/config.toml (jika XDG_CONFIG_HOME absolut), atau
+#   $HOME/.config/notefart/config.toml
+# Prioritas: bawaan aplikasi < file konfigurasi < flag CLI.
+# Hanya empat key string di bawah yang didukung; jangan tambahkan section.
+
+# Tema: "dark", "light", "terminal".
+# "terminal" mengikuti warna dasar terminal.
+theme = "dark"
+
+# Warna: "auto", "truecolor", "256", "16", "none".
+# "auto" mengikuti kemampuan/environment terminal; "none" tanpa warna eksplisit.
+color = "auto"
+
+# Ikon: "unicode", "nerd", "ascii".
+# Contoh ini memilih Nerd Font secara eksplisit; atur font di terminal.
+# Gunakan "unicode" (bawaan aplikasi) atau "ascii" jika glyph tidak tersedia.
+icons = "nerd"
+
+# Clipboard: "auto", "internal", "system".
+# "auto": Wayland (wl-copy + wl-paste), lalu X11 (xclip), jika tersedia.
+# Tanpa helper/display atau saat sesi SSH terdeteksi, "auto" memakai internal.
+# "internal": clipboard dalam aplikasi saja, tidak mengakses clipboard sistem.
+# "system": meminta backend eksternal; kegagalan ditampilkan, bukan disamarkan.
+# Helper tidak diinstal otomatis. OSC 52 belum didukung.
+clipboard = "auto"

@@ -1,0 +1,31 @@
+/* CSS: selectors, custom properties, units, functions and media queries. */
+:root {
+  --background: #171b24;
+  --foreground: #dce3ee;
+  --accent: #8bc5ff;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  padding: 2rem;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: ui-monospace, monospace;
+}
+
+.note {
+  max-width: 48rem;
+  padding: 1.5rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.75rem;
+}
+
+.selected, .note:hover {
+  color: var(--accent);
+}
+
+@media (max-width: 40rem) {
+  body { padding: 1rem; }
+  .note { width: calc(100% - 2rem); }
+}

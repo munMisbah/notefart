@@ -1,0 +1,20 @@
+# YML uses the same YAML syntax; this is data, not an executed workflow.
+name: Syntax preview
+on: "manual"
+
+stages:
+  - name: prepare
+    timeout_seconds: 30
+    env:
+      MODE: "demo"
+      RETRIES: 3
+  - name: inspect
+    enabled: true
+    inputs:
+      - "sample.ts"
+      - "sample.tsx"
+      - "sample.js"
+
+summary: >
+  Open each file in Notefart
+  to compare syntax colors.

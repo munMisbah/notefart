@@ -1,0 +1,40 @@
+[package]
+name = "notefart"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "naf"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28.1"
+ratatui = { version = "0.29.0", default-features = false, features = ["crossterm"] }
+signal-hook = "0.3.18"
+unicode-segmentation = "1.13.3"
+unicode-width = "=0.2.0"
+ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
+rustix = { version = "1.1.6", features = ["event", "fs", "stdio", "termios", "process"] }
+tempfile = "3.27.0"
+blake3 = { version = "1.8.7", features = ["pure"] }
+xattr = "1.7.0"
+
+# User preferences file parsing (serde-free DeTable/DeValue API).
+toml = { version = "1.2.1", default-features = false, features = ["std", "parse"] }
+
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-onig"] }
+
+# Build-time only: combines the bundled defaults with the vendored
+# TypeScript/TSX grammars into the dump embedded by src/syntax.rs. The
+# application runtime keeps loading the dump (no yaml-load there).
+[build-dependencies]
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-onig", "yaml-load", "dump-create"] }
+
+# Keep interactive `cargo run` responsive while retaining debug information
+# and assertions; unit tests retain the fast-to-compile unoptimized profile.
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 0
