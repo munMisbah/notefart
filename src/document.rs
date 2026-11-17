@@ -69,9 +69,90 @@ pub(crate) struct Cell<'a> {
 struct EditDelta {
     rev_before: u64,
     rev_after: u64,
+    edit: Edit,
+}
+
+#[derive(Debug, Clone)]
+enum Edit {
+    Splice(Splice),
+    Indent(IndentBatch),
+}
+
+#[derive(Debug, Clone)]
+struct Splice {
     char_start: usize,
     removed: String,
     inserted_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndentPrefix {
+    Spaces(u8),
+    Tab,
+}
+
+impl IndentPrefix {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Spaces(count) => &TAB_SPACES[..usize::from(count)],
+            Self::Tab => "\t",
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Spaces(count) => usize::from(count),
+            Self::Tab => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndentEdit {
+    start: usize,
+    prefix: IndentPrefix,
+}
+
+impl IndentEdit {
+    fn change(self, remove: bool) -> TextChange {
+        TextChange {
+            start: self.start,
+            old_end: self.start + if remove { self.prefix.len() } else { 0 },
+            new_end: self.start + if remove { 0 } else { self.prefix.len() },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndentBatch {
+    // Original scalar positions in ascending order. Apply backwards; invert
+    // forwards so each splice still uses its original intermediate position.
+    edits: Vec<IndentEdit>,
+    dedent: bool,
+}
+
+impl IndentBatch {
+    fn apply(&self, rope: &mut Rope, inverse: bool) {
+        let remove = self.dedent != inverse;
+        let mut apply = |edit: &IndentEdit| {
+            if remove {
+                rope.remove(edit.start..edit.start + edit.prefix.len());
+            } else {
+                rope.insert(edit.start, edit.prefix.text());
+            }
+        };
+        if inverse {
+            self.edits.iter().for_each(&mut apply);
+        } else {
+            self.edits.iter().rev().for_each(&mut apply);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LastChange {
+    Single(TextChange),
+    Indent { inverse: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,12 +178,58 @@ impl TextChange {
     }
 }
 
+/// Borrow batch metadata from the last history entry instead of copying it
+/// into a second vector merely to remap views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextChanges<'a> {
+    Single(TextChange),
+    Indent {
+        batch: &'a IndentBatch,
+        inverse: bool,
+    },
+}
+
+impl TextChanges<'_> {
+    pub(crate) fn start(self) -> usize {
+        match self {
+            Self::Single(change) => change.start,
+            Self::Indent { batch, .. } => batch.edits[0].start,
+        }
+    }
+
+    pub(crate) fn map(self, mut position: usize, right_affinity: bool) -> usize {
+        match self {
+            Self::Single(change) => change.map(position, right_affinity),
+            Self::Indent { batch, inverse } => {
+                let remove = batch.dedent != inverse;
+                if inverse {
+                    for edit in &batch.edits {
+                        if edit.start > position {
+                            break;
+                        }
+                        position = edit.change(remove).map(position, right_affinity);
+                    }
+                } else {
+                    let end = batch.edits.partition_point(|edit| edit.start <= position);
+                    for edit in batch.edits[..end].iter().rev() {
+                        position = edit.change(remove).map(position, right_affinity);
+                    }
+                }
+                position
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct GeometryPoint {
     chars: usize,
     bytes: usize,
     column: usize,
 }
+
+#[derive(Debug, Default)]
+pub(crate) struct LineWidthCursor(GeometryPoint);
 
 #[derive(Debug)]
 struct LineGeometry {
@@ -146,7 +273,7 @@ pub(crate) struct Document {
     next_rev: u64,
     text_revision: u64,
     changed_from: usize,
-    last_change: Option<TextChange>,
+    last_change: Option<LastChange>,
     geometry: GeometryCache,
 }
 
@@ -158,13 +285,16 @@ impl Default for Document {
 
 impl Document {
     pub(crate) fn new(text: &str) -> Self {
-        let rope = Rope::from_str(text);
+        Self::from_session(Rope::from_str(text), false)
+    }
+
+    pub(crate) fn from_session(rope: Rope, dirty: bool) -> Self {
         Self {
             rope,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_rev: 0,
-            saved_rev: Some(0),
+            saved_rev: (!dirty).then_some(0),
             next_rev: 1,
             text_revision: 0,
             changed_from: 0,
@@ -186,8 +316,22 @@ impl Document {
         self.changed_from
     }
 
-    pub(crate) fn last_change(&self) -> Option<TextChange> {
-        self.last_change
+    pub(crate) fn last_change(&self) -> Option<TextChanges<'_>> {
+        match self.last_change? {
+            LastChange::Single(change) => Some(TextChanges::Single(change)),
+            LastChange::Indent { inverse } => {
+                let stack = if inverse {
+                    &self.redo_stack
+                } else {
+                    &self.undo_stack
+                };
+                let delta = stack.last().expect("last indentation has a history entry");
+                let Edit::Indent(batch) = &delta.edit else {
+                    unreachable!("last indentation references an indentation entry");
+                };
+                Some(TextChanges::Indent { batch, inverse })
+            }
+        }
     }
 
     fn record_change(&mut self, position: usize) {
@@ -300,6 +444,48 @@ impl Document {
         next_rope_grapheme_boundary(self.rope.slice(..), pos)
     }
 
+    pub(crate) fn word_left(&self, pos: usize) -> usize {
+        let mut pos = pos.min(self.len_chars());
+        if !self.is_grapheme_boundary(pos) {
+            pos = self.previous(pos);
+        }
+        if pos == 0 {
+            return 0;
+        }
+        let mut previous = self.previous(pos);
+        if char_class(self.rope.char(previous)) == CharClass::Whitespace {
+            pos = self.class_start(0, pos, CharClass::Whitespace);
+            if pos == 0 {
+                return 0;
+            }
+            previous = self.previous(pos);
+        }
+        self.class_start(
+            self.line_start(self.line_of(previous)),
+            pos,
+            char_class(self.rope.char(previous)),
+        )
+    }
+
+    pub(crate) fn word_right(&self, pos: usize) -> usize {
+        let len = self.len_chars();
+        let mut pos = pos.min(len);
+        if !self.is_grapheme_boundary(pos) {
+            pos = self.previous(pos);
+        }
+        if pos == len {
+            return len;
+        }
+        let end = self.line_end(self.line_of(pos));
+        if pos < end {
+            pos = self.class_end(pos, end, char_class(self.rope.char(pos)));
+        }
+        if pos < len && char_class(self.rope.char(pos)) == CharClass::Whitespace {
+            pos = self.class_end(pos, len, CharClass::Whitespace);
+        }
+        pos
+    }
+
     pub(crate) fn word_range(&self, pos: usize) -> Range<usize> {
         let len = self.len_chars();
         if len == 0 {
@@ -322,28 +508,39 @@ impl Document {
             self.previous(pos)
         };
         let target_class = char_class(self.rope.char(target));
-        let mut start = target;
-        while start > line_start {
-            let previous = self.previous(start);
-            if char_class(self.rope.char(previous)) != target_class {
-                break;
-            }
-            start = previous;
-        }
-        let mut end = self.next(target).min(line_end);
-        while end < line_end && char_class(self.rope.char(end)) == target_class {
-            end = self.next(end).min(line_end);
-        }
-
-        start..end
+        self.class_start(line_start, target, target_class)
+            ..self.class_end(target, line_end, target_class)
     }
 
-    pub(crate) fn replace(
-        &mut self,
-        range: Range<usize>,
-        insert: &str,
-    ) -> Result<usize, EditError> {
-        self.last_change = None;
+    // Only a class change at a grapheme boundary ends the run. Traverse the rope
+    // once per direction, preserving the leading character's class per grapheme.
+    fn class_start(&self, limit: usize, pos: usize, class: CharClass) -> usize {
+        for (offset, ch) in self
+            .rope
+            .chars_at(pos)
+            .reversed()
+            .take(pos - limit)
+            .enumerate()
+        {
+            let candidate = pos - offset - 1;
+            if char_class(ch) != class && self.is_grapheme_boundary(candidate) {
+                return self.next(candidate);
+            }
+        }
+        limit
+    }
+
+    fn class_end(&self, pos: usize, limit: usize, class: CharClass) -> usize {
+        for (offset, ch) in self.rope.slice(pos..limit).chars().enumerate() {
+            let candidate = pos + offset;
+            if char_class(ch) != class && self.is_grapheme_boundary(candidate) {
+                return candidate;
+            }
+        }
+        limit
+    }
+
+    fn validate_range(&self, range: &Range<usize>) -> Result<(), EditError> {
         if range.start > range.end {
             return Err(EditError::InvalidRange {
                 start: range.start,
@@ -358,12 +555,21 @@ impl Document {
                 len,
             });
         }
-        if !self.is_grapheme_boundary(range.start) {
-            return Err(EditError::SplitsGrapheme { pos: range.start });
+        for pos in [range.start, range.end] {
+            if !self.is_grapheme_boundary(pos) {
+                return Err(EditError::SplitsGrapheme { pos });
+            }
         }
-        if !self.is_grapheme_boundary(range.end) {
-            return Err(EditError::SplitsGrapheme { pos: range.end });
-        }
+        Ok(())
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        range: Range<usize>,
+        insert: &str,
+    ) -> Result<usize, EditError> {
+        self.last_change = None;
+        self.validate_range(&range)?;
 
         if range.is_empty() && insert.is_empty() {
             return Ok(range.start);
@@ -391,92 +597,148 @@ impl Document {
         self.undo_stack.push(EditDelta {
             rev_before: self.current_rev,
             rev_after: new_rev,
-            char_start: range.start,
-            removed,
-            inserted_chars,
+            edit: Edit::Splice(Splice {
+                char_start: range.start,
+                removed,
+                inserted_chars,
+            }),
         });
         self.current_rev = new_rev;
         self.redo_stack.clear();
-        self.last_change = Some(TextChange {
+        self.last_change = Some(LastChange::Single(TextChange {
             start: range.start,
             old_end: range.end,
             new_end: range.start + inserted_chars,
-        });
+        }));
 
         Ok(cursor)
     }
 
-    pub(crate) fn undo(&mut self) -> Option<usize> {
+    /// Shift touched line prefixes atomically. The range is scalar and
+    /// half-open; an empty range targets the current line.
+    pub(crate) fn indent_lines(
+        &mut self,
+        range: Range<usize>,
+        dedent: bool,
+    ) -> Result<(), EditError> {
         self.last_change = None;
-        let delta = self.undo_stack.pop()?;
-        self.record_change(delta.char_start);
-        let remove_end = delta.char_start + delta.inserted_chars;
-        let redo_removed = String::from(self.rope.slice(delta.char_start..remove_end));
-
-        if delta.inserted_chars > 0 {
-            self.rope.remove(delta.char_start..remove_end);
-        }
-        if !delta.removed.is_empty() {
-            self.rope.insert(delta.char_start, &delta.removed);
-        }
-
-        let restored_chars = delta.removed.chars().count();
-        let mut cursor = delta.char_start + restored_chars;
-        if !self.is_grapheme_boundary(cursor) {
-            cursor = self.next(cursor);
-        }
-
-        self.current_rev = delta.rev_before;
-        self.redo_stack.push(EditDelta {
-            rev_before: delta.rev_before,
-            rev_after: delta.rev_after,
-            char_start: delta.char_start,
-            removed: redo_removed,
-            inserted_chars: restored_chars,
+        self.validate_range(&range)?;
+        let first = self.line_of(range.start);
+        let last = self.line_of(if range.is_empty() {
+            range.end
+        } else {
+            range.end - 1
         });
-        self.last_change = Some(TextChange {
-            start: delta.char_start,
-            old_end: remove_end,
-            new_end: delta.char_start + restored_chars,
+        let mut start = self.line_start(first);
+        let mut edits = if dedent {
+            Vec::new()
+        } else {
+            Vec::with_capacity(last - first + 1)
+        };
+        for line in self.rope.lines_at(first).take(last - first + 1) {
+            let prefix = if !dedent {
+                Some(IndentPrefix::Spaces(TAB_STOP as u8))
+            } else if line.get_char(0) == Some('\t') {
+                Some(IndentPrefix::Tab)
+            } else {
+                let mut count = line
+                    .chars()
+                    .take(TAB_STOP)
+                    .take_while(|&ch| ch == ' ')
+                    .count();
+                while count > 0 && !self.is_grapheme_boundary(start + count) {
+                    count -= 1;
+                }
+                (count > 0).then_some(IndentPrefix::Spaces(count as u8))
+            };
+            if let Some(prefix) = prefix {
+                edits.push(IndentEdit { start, prefix });
+            }
+            start += line.len_chars();
+        }
+        let Some(first_edit) = edits.first() else {
+            return Ok(());
+        };
+        self.record_change(first_edit.start);
+        let batch = IndentBatch { edits, dedent };
+        batch.apply(&mut self.rope, false);
+        let new_rev = self.next_rev;
+        self.next_rev += 1;
+        self.undo_stack.push(EditDelta {
+            rev_before: self.current_rev,
+            rev_after: new_rev,
+            edit: Edit::Indent(batch),
         });
+        self.current_rev = new_rev;
+        self.redo_stack.clear();
+        self.last_change = Some(LastChange::Indent { inverse: false });
+        Ok(())
+    }
 
-        Some(cursor)
+    pub(crate) fn undo(&mut self) -> Option<usize> {
+        self.history_step(true)
     }
 
     pub(crate) fn redo(&mut self) -> Option<usize> {
+        self.history_step(false)
+    }
+
+    fn history_step(&mut self, undo: bool) -> Option<usize> {
         self.last_change = None;
-        let delta = self.redo_stack.pop()?;
-        self.record_change(delta.char_start);
-        let remove_end = delta.char_start + delta.inserted_chars;
-        let undo_removed = String::from(self.rope.slice(delta.char_start..remove_end));
-
-        if delta.inserted_chars > 0 {
-            self.rope.remove(delta.char_start..remove_end);
-        }
-        if !delta.removed.is_empty() {
-            self.rope.insert(delta.char_start, &delta.removed);
-        }
-
-        let restored_chars = delta.removed.chars().count();
-        let mut cursor = delta.char_start + restored_chars;
+        let mut delta = if undo {
+            self.undo_stack.pop()?
+        } else {
+            self.redo_stack.pop()?
+        };
+        let start = match &delta.edit {
+            Edit::Splice(splice) => splice.char_start,
+            Edit::Indent(batch) => batch.edits[0].start,
+        };
+        self.record_change(start);
+        let mut cursor = match &mut delta.edit {
+            Edit::Splice(splice) => {
+                let remove_end = start + splice.inserted_chars;
+                let inverse_removed = String::from(self.rope.slice(start..remove_end));
+                if splice.inserted_chars > 0 {
+                    self.rope.remove(start..remove_end);
+                }
+                if !splice.removed.is_empty() {
+                    self.rope.insert(start, &splice.removed);
+                }
+                let restored_chars = splice.removed.chars().count();
+                splice.removed = inverse_removed;
+                splice.inserted_chars = restored_chars;
+                self.last_change = Some(LastChange::Single(TextChange {
+                    start,
+                    old_end: remove_end,
+                    new_end: start + restored_chars,
+                }));
+                start + restored_chars
+            }
+            Edit::Indent(batch) => {
+                batch.apply(&mut self.rope, undo);
+                self.last_change = Some(LastChange::Indent { inverse: undo });
+                start
+                    + if batch.dedent != undo {
+                        0
+                    } else {
+                        batch.edits[0].prefix.len()
+                    }
+            }
+        };
         if !self.is_grapheme_boundary(cursor) {
             cursor = self.next(cursor);
         }
-
-        self.current_rev = delta.rev_after;
-        self.undo_stack.push(EditDelta {
-            rev_before: delta.rev_before,
-            rev_after: delta.rev_after,
-            char_start: delta.char_start,
-            removed: undo_removed,
-            inserted_chars: restored_chars,
-        });
-        self.last_change = Some(TextChange {
-            start: delta.char_start,
-            old_end: remove_end,
-            new_end: delta.char_start + restored_chars,
-        });
-
+        self.current_rev = if undo {
+            delta.rev_before
+        } else {
+            delta.rev_after
+        };
+        if undo {
+            self.redo_stack.push(delta);
+        } else {
+            self.undo_stack.push(delta);
+        }
         Some(cursor)
     }
 
@@ -556,6 +818,32 @@ impl Document {
             }
         }
         point
+    }
+
+    /// Resume a width scan without rescanning the prefix or allocating checkpoints.
+    /// The caller resets the cursor when the document revision or line changes.
+    pub(crate) fn measure_line_width(
+        &self,
+        line: usize,
+        cursor: &mut LineWidthCursor,
+        budget: usize,
+    ) -> (usize, Option<usize>) {
+        let start = self.line_start(line);
+        let end = self.line_end(line);
+        let mut cells = LineCells::from_point(self.rope.slice(start..end), start, cursor.0);
+        let mut used = 0;
+        while used < budget && cells.advance_width() {
+            cursor.0 = GeometryPoint {
+                chars: cells.cur_char - start,
+                bytes: cells.cursor.cur_cursor(),
+                column: cells.cur_col,
+            };
+            used += 1;
+        }
+        (
+            used,
+            (cursor.0.chars == end - start).then_some(cursor.0.column),
+        )
     }
 
     /// Resume at or before a visual column; callers must still clip prefix cells.
@@ -657,16 +945,47 @@ impl<'a> LineCells<'a> {
             finished: true,
         }
     }
-}
 
-impl<'a> Iterator for LineCells<'a> {
-    type Item = Cell<'a>;
+    fn advance_width(&mut self) -> bool {
+        let Some((raw, chars)) = self.next_raw() else {
+            return false;
+        };
+        let width = if raw.as_ref() == "\t" {
+            TAB_STOP - self.cur_col % TAB_STOP
+        } else if raw.chars().any(is_control_or_bidi) {
+            let mut width = 0;
+            let mut segment = 0;
+            for (index, ch) in raw.char_indices() {
+                if is_control_or_bidi(ch) {
+                    width += raw[segment..index].width();
+                    let mut escaped = AsciiLength::default();
+                    push_escaped_char(&mut escaped, ch);
+                    width += escaped.0;
+                    segment = index + ch.len_utf8();
+                }
+            }
+            (width + raw[segment..].width()).max(1)
+        } else {
+            let width = raw.width();
+            if width == 0 {
+                let mut escaped = AsciiLength::default();
+                for ch in raw.chars() {
+                    let _ = write!(escaped, "\\u{{{:04x}}}", ch as u32);
+                }
+                escaped.0.max(1)
+            } else {
+                width
+            }
+        };
+        self.cur_char += chars;
+        self.cur_col += width;
+        true
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_raw(&mut self) -> Option<(Cow<'a, str>, usize)> {
         if self.finished {
             return None;
         }
-
         let a = self.cursor.cur_cursor();
         let b = loop {
             match self
@@ -693,26 +1012,27 @@ impl<'a> Iterator for LineCells<'a> {
                     }
                 }
                 Err(GraphemeIncomplete::PreContext(idx)) => {
-                    let (ctx_chunk, ctx_start, _, _) =
-                        self.text.chunk_at_byte(idx.saturating_sub(1));
-                    self.cursor
-                        .provide_context(&ctx_chunk[..idx - ctx_start], ctx_start);
+                    let (chunk, start, _, _) = self.text.chunk_at_byte(idx.saturating_sub(1));
+                    self.cursor.provide_context(&chunk[..idx - start], start);
                 }
                 Err(error) => panic!("grapheme iterator invariant failed: {error:?}"),
             }
         };
-
-        let (raw_cow, g_chars) = if a < self.cur_chunk_start {
+        if a < self.cur_chunk_start {
             let slice = self.text.byte_slice(a..b);
-            let chars = slice.len_chars();
-            (Cow::Owned(String::from(slice)), chars)
+            Some((Cow::Owned(String::from(slice)), slice.len_chars()))
         } else {
-            let a_rel = a - self.cur_chunk_start;
-            let b_rel = b - self.cur_chunk_start;
-            let sub = &self.cur_chunk[a_rel..b_rel];
-            let chars = sub.chars().count();
-            (Cow::Borrowed(sub), chars)
-        };
+            let sub = &self.cur_chunk[a - self.cur_chunk_start..b - self.cur_chunk_start];
+            Some((Cow::Borrowed(sub), sub.chars().count()))
+        }
+    }
+}
+
+impl<'a> Iterator for LineCells<'a> {
+    type Item = Cell<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (raw_cow, g_chars) = self.next_raw()?;
 
         let start = self.cur_char;
         let end = start + g_chars;
@@ -795,19 +1115,26 @@ fn is_control_or_bidi(ch: char) -> bool {
     ch.is_control() || is_bidi_or_invisible_format(ch)
 }
 
-fn push_escaped_char(out: &mut String, ch: char) {
-    match ch {
-        '\0' => out.push_str("\\0"),
-        '\t' => out.push_str("\\t"),
-        '\n' => out.push_str("\\n"),
-        '\r' => out.push_str("\\r"),
-        c if c.is_ascii_control() => {
-            let _ = write!(out, "\\x{:02x}", c as u32);
-        }
-        c => {
-            let _ = write!(out, "\\u{{{:04x}}}", c as u32);
-        }
+// The escape formatter emits ASCII; count it without constructing display text.
+#[derive(Default)]
+struct AsciiLength(usize);
+
+impl std::fmt::Write for AsciiLength {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0 += text.len();
+        Ok(())
     }
+}
+
+fn push_escaped_char(out: &mut impl std::fmt::Write, ch: char) {
+    let _ = match ch {
+        '\0' => out.write_str("\\0"),
+        '\t' => out.write_str("\\t"),
+        '\n' => out.write_str("\\n"),
+        '\r' => out.write_str("\\r"),
+        c if c.is_ascii_control() => write!(out, "\\x{:02x}", c as u32),
+        c => write!(out, "\\u{{{:04x}}}", c as u32),
+    };
 }
 
 fn is_rope_grapheme_boundary(slice: RopeSlice<'_>, char_idx: usize) -> bool {
@@ -924,6 +1251,19 @@ mod tests {
         );
         let end = doc.line_end(line);
         let end_col = cells.last().map_or(0, |cell| cell.column + cell.width);
+        let mut width_cursor = super::LineWidthCursor::default();
+        let mut measured = None;
+        for _ in 0..=cells.len() {
+            measured = doc.measure_line_width(line, &mut width_cursor, 13).1;
+            if measured.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            measured,
+            Some(end_col),
+            "scrollbar and rendered cell widths must agree"
+        );
         assert_eq!(doc.column_of(end), end_col);
         assert_eq!(doc.position_at(line, usize::MAX), end);
         assert!(
@@ -1280,6 +1620,68 @@ mod tests {
     }
 
     #[test]
+    fn word_selection_uses_each_graphemes_first_character_class() {
+        let pieces = ["a\u{0301}b", " \u{0301}\t", "\u{0600}c👩‍💻🇮🇩!", "d_"];
+        let text = pieces.concat() + "\r\n\nnext";
+        let doc = Document::new(&text);
+        let mut start = 0;
+        for piece in pieces {
+            let end = start + piece.chars().count();
+            for pos in start..end {
+                assert_eq!(doc.word_range(pos), start..end, "position {pos}");
+            }
+            start = end;
+        }
+        assert_eq!(doc.word_range(start), start - 2..start);
+        assert_eq!(doc.word_range(start + 2), start + 2..start + 2);
+    }
+
+    #[test]
+    fn word_navigation_skips_whole_whitespace_graphemes_and_newlines() {
+        let pieces = [
+            "left",
+            " \u{0301}\t\r\n\n",
+            "e\u{0301}右_",
+            "\u{0600}a👩‍💻",
+            "\n  ",
+            "end",
+        ];
+        let mut offsets = vec![0];
+        for piece in pieces {
+            offsets.push(offsets.last().unwrap() + piece.chars().count());
+        }
+        let doc = Document::new(&pieces.concat());
+        for (from, to) in [(0, 2), (2, 3), (3, 5), (5, 6), (6, 6)] {
+            assert_eq!(doc.word_right(offsets[from]), offsets[to]);
+        }
+        for (from, to) in [(0, 0), (2, 0), (3, 2), (5, 3), (6, 5)] {
+            assert_eq!(doc.word_left(offsets[from]), offsets[to]);
+        }
+        assert_eq!(doc.word_right(offsets[4]), offsets[5]);
+        assert_eq!(doc.word_left(offsets[5] - 1), offsets[3]);
+        let empty = Document::new("");
+        assert_eq!(empty.word_left(0), 0);
+        assert_eq!(empty.word_right(0), 0);
+    }
+
+    #[test]
+    fn word_navigation_and_selection_cross_long_rope_runs() {
+        let word = "é_\u{0301}世".repeat(2048);
+        let spaces = " ".repeat(8192);
+        let doc = Document::new(&format!("head {word}{spaces}tail"));
+        let end = 5 + word.chars().count();
+        let tail = end + spaces.len();
+        for pos in [5, 1023, end / 2, end - 1] {
+            assert_eq!(doc.word_range(pos), 5..end);
+        }
+        assert_eq!(doc.word_right(5), tail);
+        assert_eq!(doc.word_left(tail), 5);
+        assert_eq!(doc.word_range(end + 4096), end..tail);
+        assert_eq!(doc.word_right(end + 4096), tail);
+        assert_eq!(doc.word_left(end + 4096), 5);
+    }
+
+    #[test]
     fn lone_cr_is_visible_content_and_reachable_at_line_end() {
         let doc = Document::new("a\r");
         assert_eq!(doc.line_end(0), 2);
@@ -1389,33 +1791,33 @@ mod tests {
         doc.replace(6..11, "notefart").unwrap();
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 6,
                 old_end: 11,
                 new_end: 14,
-            })
+            }))
         );
         assert_eq!(doc.text().to_string(), "hello notefart");
 
         doc.undo().unwrap();
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 6,
                 old_end: 14,
                 new_end: 11,
-            })
+            }))
         );
         assert_eq!(doc.text().to_string(), "hello world");
 
         doc.redo().unwrap();
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 6,
                 old_end: 11,
                 new_end: 14,
-            })
+            }))
         );
         assert_eq!(doc.text().to_string(), "hello notefart");
 
@@ -1424,32 +1826,32 @@ mod tests {
         doc.replace(0..5, "hi").unwrap();
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 0,
                 old_end: 5,
                 new_end: 2,
-            })
+            }))
         );
         assert_eq!(doc.text().to_string(), "hi world");
 
         doc.undo().unwrap();
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 0,
                 old_end: 2,
                 new_end: 5,
-            })
+            }))
         );
 
         doc.redo().unwrap();
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 0,
                 old_end: 5,
                 new_end: 2,
-            })
+            }))
         );
     }
 
@@ -1516,11 +1918,11 @@ mod tests {
         let change = doc.last_change().unwrap();
         assert_eq!(
             change,
-            TextChange {
+            TextChanges::Single(TextChange {
                 start: 0,
                 old_end: 0,
                 new_end: 2,
-            }
+            })
         );
         // Position 0 left stays at 0; right moves to 2 (snaps forward to 3)
         assert_eq!(change.map(0, false), 0);
@@ -1536,11 +1938,11 @@ mod tests {
         assert_eq!(undone_cursor, 0);
         assert_eq!(
             doc.last_change(),
-            Some(TextChange {
+            Some(TextChanges::Single(TextChange {
                 start: 0,
                 old_end: 2,
                 new_end: 0,
-            })
+            }))
         );
 
         // Combining mark appended onto 'e' before 'x': "ex" -> "e\u{0301}x"
@@ -1550,11 +1952,11 @@ mod tests {
         let ch = combine_doc.last_change().unwrap();
         assert_eq!(
             ch,
-            TextChange {
+            TextChanges::Single(TextChange {
                 start: 1,
                 old_end: 1,
                 new_end: 2,
-            }
+            })
         );
         assert_eq!(ch.map(0, false), 0);
         assert_eq!(ch.map(1, false), 1);
@@ -1568,14 +1970,138 @@ mod tests {
         let rch = replace_doc.last_change().unwrap();
         assert_eq!(
             rch,
-            TextChange {
+            TextChanges::Single(TextChange {
                 start: 1,
                 old_end: 4,
                 new_end: 2,
-            }
+            })
         );
         assert_eq!(rch.map(4, false), 2);
         assert_eq!(rch.map(4, true), 2);
         assert_eq!(rch.map(5, false), 3);
+    }
+
+    #[test]
+    fn restored_dirty_checkpoint_survives_undo_until_explicit_save() {
+        let mut doc = Document::from_session(Rope::from_str("unsaved session text"), true);
+        doc.replace(0..0, "x").unwrap();
+        doc.undo().unwrap();
+        assert!(doc.is_dirty());
+
+        doc.mark_saved();
+        doc.replace(0..0, "y").unwrap();
+        assert!(doc.is_dirty());
+        doc.undo().unwrap();
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn indent_lines_excludes_end_line_and_undoes_as_one_checkpoint() {
+        let mut doc = Document::new("α\n\n界\nlast");
+        let end = doc.line_start(3);
+        doc.indent_lines(0..end, false).unwrap();
+        assert_eq!(doc.text().to_string(), "    α\n    \n    界\nlast");
+        assert!(doc.is_dirty());
+        assert_eq!(doc.changed_from(), 0);
+        doc.undo().unwrap();
+        assert_eq!(doc.text().to_string(), "α\n\n界\nlast");
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.undo(), None);
+        doc.redo().unwrap();
+        assert_eq!(doc.text().to_string(), "    α\n    \n    界\nlast");
+        doc.mark_saved();
+        doc.undo().unwrap();
+        assert!(doc.is_dirty());
+        doc.redo().unwrap();
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn indent_lines_dedent_preserves_tabs_mixed_prefixes_and_graphemes() {
+        let original = "\tα\r\n  \t界\r\n \u{301}x\r\n   \u{301}y\r\nplain";
+        let mut doc = Document::new(original);
+        doc.indent_lines(0..doc.len_chars(), true).unwrap();
+        assert_eq!(
+            doc.text().to_string(),
+            "α\r\n\t界\r\n \u{301}x\r\n \u{301}y\r\nplain"
+        );
+        doc.undo().unwrap();
+        assert_eq!(doc.text().to_string(), original);
+        assert!(!doc.is_dirty());
+        doc.redo().unwrap();
+        assert_eq!(
+            doc.text().to_string(),
+            "α\r\n\t界\r\n \u{301}x\r\n \u{301}y\r\nplain"
+        );
+    }
+
+    #[test]
+    fn indent_lines_maps_each_prefix_without_collapsing_interior_positions() {
+        let mut doc = Document::new("ab\ncd\nef");
+        doc.indent_lines(0..doc.len_chars(), false).unwrap();
+        let change = doc.last_change().unwrap();
+        for (old, new) in [(0, 4), (1, 5), (3, 11), (4, 12), (6, 18), (8, 20)] {
+            assert_eq!(change.map(old, true), new);
+        }
+        assert_eq!(change.map(0, false), 0);
+        assert_eq!(change.map(3, false), 7);
+        assert_eq!(change.map(6, false), 14);
+        doc.undo().unwrap();
+        let inverse = doc.last_change().unwrap();
+        for (old, restored) in [(4, 0), (5, 1), (11, 3), (12, 4), (18, 6), (20, 8)] {
+            assert_eq!(inverse.map(old, true), restored);
+        }
+        assert_eq!(inverse.map(2, true), 0);
+        doc.redo().unwrap();
+        assert_eq!(doc.last_change().unwrap().map(4, true), 12);
+    }
+
+    #[test]
+    fn indent_lines_noop_and_invalid_ranges_keep_revision_dirty_and_redo() {
+        let mut doc = Document::new("plain\r\n \u{301}x");
+        doc.indent_lines(0..doc.len_chars(), false).unwrap();
+        doc.undo().unwrap();
+        let revision = doc.revision();
+        doc.indent_lines(0..doc.len_chars(), true).unwrap();
+        assert_eq!(doc.revision(), revision);
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.last_change(), None);
+        assert!(matches!(
+            doc.indent_lines(2..1, false),
+            Err(EditError::InvalidRange { .. })
+        ));
+        assert!(matches!(
+            doc.indent_lines(0..99, true),
+            Err(EditError::OutOfBounds { .. })
+        ));
+        assert!(matches!(
+            doc.indent_lines(0..6, false),
+            Err(EditError::SplitsGrapheme { .. })
+        ));
+        assert_eq!(doc.revision(), revision);
+        assert_eq!(doc.text().to_string(), "plain\r\n \u{301}x");
+        doc.redo().unwrap();
+        assert_eq!(doc.text().to_string(), "    plain\r\n     \u{301}x");
+        doc.undo().unwrap();
+        doc.indent_lines(0..0, false).unwrap();
+        assert_eq!(doc.redo(), None);
+        assert_eq!(doc.text().to_string(), "    plain\r\n \u{301}x");
+    }
+
+    #[test]
+    fn indent_lines_roundtrips_many_rope_lines_with_interleaved_splices() {
+        let original = "αe\u{301}\t界\n".repeat(1025);
+        let mut doc = Document::new(&original);
+        let after_indent = "    αe\u{301}\t界\n".repeat(1025);
+        doc.indent_lines(0..doc.len_chars(), false).unwrap();
+        assert_eq!(doc.text().to_string(), after_indent);
+        doc.replace(0..0, "header\n").unwrap();
+        doc.undo().unwrap();
+        assert_eq!(doc.text().to_string(), after_indent);
+        doc.undo().unwrap();
+        assert_eq!(doc.text().to_string(), original);
+        doc.redo().unwrap();
+        doc.redo().unwrap();
+        assert_eq!(doc.text().to_string(), format!("header\n{after_indent}"));
     }
 }

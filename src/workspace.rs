@@ -1,6 +1,9 @@
 use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
     io,
     ops::Range,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
 };
 
@@ -8,14 +11,26 @@ use ratatui::layout::Rect;
 
 use crate::{
     chrome,
-    document::{Document, TextChange},
+    document::{Document, TextChanges},
     explorer::Explorer,
     file_io::{self, DiskState, FileError, FileFormat, LoadedFile},
     layout::{Axis, PaneMinimum, SplitTree},
+    scrollbar::WidthCache,
+    session::{
+        DocumentState, LoadedSession, MAX_DOCUMENTS, MAX_PANES, MAX_SESSION_BYTES, MAX_TEXT_BYTES,
+        MAX_VIEWS, PaneState, SessionImage, SessionMetadata, VERSION, ViewState,
+    },
     ui::TabCaption,
 };
 
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: u16 = 28;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditViewPolicy {
+    FollowEdit,
+    MapCursor,
+    PreserveSelection,
+}
 
 pub(crate) fn snap_right(doc: &Document, pos: usize) -> usize {
     let pos = pos.min(doc.len_chars());
@@ -89,6 +104,7 @@ pub(crate) struct Tab {
     pub preferred_column: Option<usize>,
     pub top_line: usize,
     pub left_cell: usize,
+    pub horizontal_width: WidthCache,
 }
 
 impl Tab {
@@ -101,6 +117,7 @@ impl Tab {
             preferred_column: None,
             top_line: 0,
             left_cell: 0,
+            horizontal_width: WidthCache::default(),
         }
     }
 
@@ -113,6 +130,7 @@ impl Tab {
             preferred_column: self.preferred_column,
             top_line: self.top_line,
             left_cell: self.left_cell,
+            horizontal_width: WidthCache::default(),
         }
     }
 
@@ -122,6 +140,7 @@ impl Tab {
         self.preferred_column = None;
         self.top_line = 0;
         self.left_cell = 0;
+        self.horizontal_width = WidthCache::default();
     }
 
     pub(crate) fn selection(&self) -> Option<Range<usize>> {
@@ -176,7 +195,12 @@ impl Tab {
         doc.position_at(line.min(doc.line_count().saturating_sub(1)), col)
     }
 
-    fn remap_non_initiating(&mut self, doc: &Document, old_top_anchor: usize, change: TextChange) {
+    fn remap_non_initiating(
+        &mut self,
+        doc: &Document,
+        old_top_anchor: usize,
+        change: TextChanges<'_>,
+    ) {
         let mapped_top = snap_left(doc, change.map(old_top_anchor, false));
         self.top_line = doc.line_of(mapped_top);
 
@@ -189,7 +213,7 @@ impl Tab {
             self.anchor = (new_anchor != new_cursor).then_some(new_anchor);
         }
 
-        if old_cursor >= change.start {
+        if old_cursor >= change.start() {
             self.preferred_column = None;
         }
     }
@@ -295,16 +319,18 @@ pub(crate) struct Workspace {
 }
 
 impl Workspace {
-    pub(crate) fn new(explorer_root: PathBuf) -> (Self, Option<String>) {
-        let (explorer, warning, explorer_root) = match Explorer::new(explorer_root.clone()) {
-            // Keep explorer_root/root_label in sync with the explorer's
-            // canonical root so retries and parent navigation stay consistent.
-            Ok(exp) => {
-                let root = exp.root().to_path_buf();
-                (Some(exp), None, root)
+    fn open_explorer(root: PathBuf) -> (Option<Explorer>, Option<String>, PathBuf) {
+        match Explorer::new(root.clone()) {
+            Ok(explorer) => {
+                let root = explorer.root().to_path_buf();
+                (Some(explorer), None, root)
             }
-            Err(err) => (None, Some(err.to_string()), explorer_root),
-        };
+            Err(error) => (None, Some(error.to_string()), root),
+        }
+    }
+
+    pub(crate) fn new(explorer_root: PathBuf) -> (Self, Option<String>) {
+        let (explorer, warning, explorer_root) = Self::open_explorer(explorer_root);
         let root_label = explorer_root.to_string_lossy().into_owned();
         let workspace = Self {
             documents: vec![DocumentBuffer::new_blank(1)],
@@ -328,6 +354,231 @@ impl Workspace {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
         };
         (workspace, warning)
+    }
+
+    pub(crate) fn session_image(&self) -> io::Result<SessionImage<'_>> {
+        let needs_cwd = !self.explorer_root.is_absolute()
+            || self.documents.iter().any(|document| {
+                document
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| !path.is_absolute())
+            });
+        let cwd = needs_cwd.then(std::env::current_dir).transpose()?;
+        let encode_path = |path: &Path| -> io::Result<Vec<u8>> {
+            if path.is_absolute() {
+                Ok(path.as_os_str().as_bytes().to_vec())
+            } else {
+                let cwd = cwd.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "session path is not absolute")
+                })?;
+                Ok(cwd.join(path).into_os_string().into_vec())
+            }
+        };
+        let mut documents = Vec::with_capacity(self.documents.len());
+        let mut texts = Vec::with_capacity(self.documents.len());
+        for document in &self.documents {
+            documents.push(DocumentState {
+                id: document.id,
+                path: document.path.as_deref().map(&encode_path).transpose()?,
+                baseline: document.baseline.clone(),
+                format: document.format,
+                read_only: document.read_only.clone(),
+                dirty: document.document.is_dirty(),
+                text_bytes: document.document.text().len_bytes() as u64,
+            });
+            texts.push(document.document.text());
+        }
+        let panes = self
+            .panes
+            .iter()
+            .map(|pane| PaneState {
+                id: pane.id,
+                active_view_id: pane.active_tab_id,
+                tabs: pane
+                    .tabs
+                    .iter()
+                    .map(|tab| ViewState {
+                        id: tab.id,
+                        document_id: tab.document_id,
+                        cursor: tab.cursor,
+                        anchor: tab.anchor,
+                        preferred_column: tab.preferred_column,
+                        top_line: tab.top_line,
+                        left_cell: tab.left_cell,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(SessionImage {
+            metadata: SessionMetadata {
+                version: VERSION,
+                explorer_root: encode_path(&self.explorer_root)?,
+                explorer_visible: self.explorer_visible,
+                explorer_focused: self.explorer_focused,
+                sidebar_width: self.sidebar_width,
+                active_pane_id: self.active_pane_id,
+                documents,
+                panes,
+                tree: self.tree.session_nodes(),
+            },
+            texts,
+        })
+    }
+
+    pub(crate) fn restore_session(loaded: LoadedSession) -> io::Result<(Self, Option<String>)> {
+        let invalid = |message: &'static str| io::Error::new(io::ErrorKind::InvalidData, message);
+        let LoadedSession { metadata, texts } = loaded;
+        if metadata.version != VERSION
+            || metadata.documents.is_empty()
+            || metadata.documents.len() > MAX_DOCUMENTS
+            || metadata.panes.is_empty()
+            || metadata.panes.len() > MAX_PANES
+            || metadata.documents.len() != texts.len()
+        {
+            return Err(invalid("invalid session version/document/pane counts"));
+        }
+        let root = decode_session_path(metadata.explorer_root)?;
+        let mut documents = Vec::with_capacity(metadata.documents.len());
+        let mut document_index = HashMap::with_capacity(metadata.documents.len());
+        let mut max_document = 0;
+        let mut total_bytes = 0u64;
+        for (state, text) in metadata.documents.into_iter().zip(texts) {
+            if state.id == 0
+                || document_index.insert(state.id, documents.len()).is_some()
+                || state.text_bytes > MAX_TEXT_BYTES as u64
+                || text.len_bytes() as u64 != state.text_bytes
+                || (state.baseline.is_some() && state.path.is_none())
+            {
+                return Err(invalid("invalid session document identity/text/baseline"));
+            }
+            total_bytes = total_bytes
+                .checked_add(state.text_bytes)
+                .ok_or_else(|| invalid("session text length overflow"))?;
+            if total_bytes > MAX_SESSION_BYTES {
+                return Err(invalid("session snapshot exceeds 256 MiB"));
+            }
+            max_document = max_document.max(state.id);
+            let path = state.path.map(decode_session_path).transpose()?;
+            documents.push(DocumentBuffer {
+                id: state.id,
+                display_label: compute_display_label(path.as_deref()),
+                document: Document::from_session(text, state.dirty),
+                path,
+                baseline: state.baseline,
+                format: state.format,
+                read_only: state.read_only,
+            });
+        }
+        let mut paths = HashSet::new();
+        let mut identities = HashSet::new();
+        for document in &documents {
+            if document
+                .path
+                .as_deref()
+                .is_some_and(|path| !paths.insert(path))
+                || document
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|baseline| !identities.insert(baseline.identity()))
+            {
+                return Err(invalid("session contains duplicate file documents"));
+            }
+        }
+        let mut panes = Vec::with_capacity(metadata.panes.len());
+        let mut pane_ids = HashSet::with_capacity(metadata.panes.len());
+        let mut view_ids = HashSet::new();
+        let mut used_documents = HashSet::with_capacity(documents.len());
+        let mut pane_documents = HashSet::new();
+        let mut max_pane = 0;
+        let mut max_view = 0;
+        let max_column = MAX_TEXT_BYTES * 12;
+        for state in metadata.panes {
+            if state.id == 0 || !pane_ids.insert(state.id) || state.tabs.is_empty() {
+                return Err(invalid("invalid session pane identity/tabs"));
+            }
+            max_pane = max_pane.max(state.id);
+            pane_documents.clear();
+            let mut tabs = Vec::with_capacity(state.tabs.len().min(MAX_VIEWS));
+            for view in state.tabs {
+                if view.id == 0
+                    || !view_ids.insert(view.id)
+                    || view_ids.len() > MAX_VIEWS
+                    || !pane_documents.insert(view.document_id)
+                {
+                    return Err(invalid("invalid/duplicate session view"));
+                }
+                let &index = document_index
+                    .get(&view.document_id)
+                    .ok_or_else(|| invalid("session view references a missing document"))?;
+                let document = &documents[index].document;
+                used_documents.insert(view.document_id);
+                max_view = max_view.max(view.id);
+                let cursor = snap_right(document, view.cursor);
+                let anchor = view
+                    .anchor
+                    .map(|anchor| snap_right(document, anchor))
+                    .filter(|&anchor| anchor != cursor);
+                tabs.push(Tab {
+                    id: view.id,
+                    document_id: view.document_id,
+                    cursor,
+                    anchor,
+                    preferred_column: view.preferred_column.map(|column| column.min(max_column)),
+                    top_line: view.top_line.min(document.line_count().saturating_sub(1)),
+                    left_cell: view.left_cell.min(max_column),
+                    horizontal_width: WidthCache::default(),
+                });
+            }
+            if !tabs.iter().any(|tab| tab.id == state.active_view_id) {
+                return Err(invalid("session pane active view is missing"));
+            }
+            panes.push(Pane {
+                id: state.id,
+                active_tab_id: state.active_view_id,
+                tabs,
+            });
+        }
+        if !pane_ids.contains(&metadata.active_pane_id) || used_documents.len() != documents.len() {
+            return Err(invalid(
+                "session active pane is missing or documents are orphaned",
+            ));
+        }
+        let ordered_panes: Vec<_> = panes.iter().map(|pane| pane.id).collect();
+        let tree = SplitTree::from_session_nodes(metadata.tree, &ordered_panes)?;
+        let next_document_id = max_document
+            .checked_add(1)
+            .ok_or_else(|| invalid("session document ID overflow"))?;
+        let next_view_id = max_view
+            .checked_add(1)
+            .ok_or_else(|| invalid("session view ID overflow"))?;
+        let next_pane_id = max_pane
+            .checked_add(1)
+            .ok_or_else(|| invalid("session pane ID overflow"))?;
+        let (explorer, warning, explorer_root) = Self::open_explorer(root);
+        let explorer_focused =
+            metadata.explorer_focused && metadata.explorer_visible && explorer.is_some();
+        let root_label = explorer_root.to_string_lossy().into_owned();
+        Ok((
+            Self {
+                documents,
+                panes,
+                active_pane_id: metadata.active_pane_id,
+                tree,
+                next_document_id,
+                next_view_id,
+                next_pane_id,
+                tx_top_anchors_scratch: Vec::new(),
+                mins_scratch: Vec::new(),
+                explorer,
+                explorer_root,
+                root_label,
+                explorer_visible: metadata.explorer_visible,
+                explorer_focused,
+                sidebar_width: metadata.sidebar_width.clamp(18, 40),
+            },
+            warning,
+        ))
     }
 
     #[cfg(test)]
@@ -676,7 +927,7 @@ impl Workspace {
         &mut self,
         doc_id: u64,
         initiating_view_id: u64,
-        use_edit_cursor: bool,
+        view_policy: EditViewPolicy,
         f: impl FnOnce(&mut Document) -> (R, Option<usize>),
     ) -> Option<(R, bool)> {
         let doc_idx = self.documents.iter().position(|d| d.id == doc_id)?;
@@ -707,15 +958,17 @@ impl Workspace {
                         .iter()
                         .find_map(|&(id, pos)| (id == tab.id).then_some(pos))
                         .unwrap_or(0);
-                    if tab.id == initiating_view_id {
+                    if tab.id == initiating_view_id
+                        && view_policy != EditViewPolicy::PreserveSelection
+                    {
                         let mapped_top = snap_left(doc, change.map(old_top_anchor, false));
                         tab.top_line = doc.line_of(mapped_top);
-                        if use_edit_cursor {
-                            tab.cursor = edit_cursor
-                                .unwrap_or_else(|| snap_right(doc, change.map(tab.cursor, true)));
+                        tab.cursor = if view_policy == EditViewPolicy::FollowEdit {
+                            edit_cursor
+                                .unwrap_or_else(|| snap_right(doc, change.map(tab.cursor, true)))
                         } else {
-                            tab.cursor = snap_right(doc, change.map(tab.cursor, true));
-                        }
+                            snap_right(doc, change.map(tab.cursor, true))
+                        };
                         tab.anchor = None;
                         tab.preferred_column = None;
                     } else {
@@ -1025,6 +1278,23 @@ impl Workspace {
     }
 }
 
+fn decode_session_path(bytes: Vec<u8>) -> io::Result<PathBuf> {
+    if bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NUL in session path",
+        ));
+    }
+    let path = PathBuf::from(OsString::from_vec(bytes));
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session path is not absolute",
+        ));
+    }
+    Ok(path)
+}
+
 fn compute_display_label(path: Option<&Path>) -> String {
     match path {
         Some(p) => match p.file_name() {
@@ -1168,7 +1438,7 @@ mod tests {
         let doc_id = open1.document_id;
 
         // Edit unsaved in pane1
-        ws.edit_transaction(doc_id, open1.view_id, true, |doc| {
+        ws.edit_transaction(doc_id, open1.view_id, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..0, "unsaved ").unwrap();
             (c, Some(c))
         });
@@ -1282,14 +1552,14 @@ mod tests {
         let v1 = ws.active_view_id();
         let doc1 = ws.active_document().unwrap().id;
 
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..0, "line0\nline1\nline2\nline3\n").unwrap();
             (c, Some(c))
         });
 
         let v_other_doc = ws.add_blank_tab();
         let doc2 = ws.active_document().unwrap().id;
-        ws.edit_transaction(doc2, v_other_doc, true, |doc| {
+        ws.edit_transaction(doc2, v_other_doc, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..0, "independent").unwrap();
             (c, Some(c))
         });
@@ -1316,7 +1586,7 @@ mod tests {
 
         // Insert "added\n" at 0 from v1 in pane1
         ws.activate_view(pane1, v1);
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..0, "added\n").unwrap();
             (c, Some(c))
         });
@@ -1328,7 +1598,7 @@ mod tests {
         assert_eq!(v2_tab.preferred_column, None);
 
         // Undo from v1 shifts v2 back
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.undo();
             (c.is_some(), c)
         });
@@ -1344,7 +1614,7 @@ mod tests {
             v1_tab.cursor = 20;
             v1_tab.top_line = 3;
         }
-        ws.edit_transaction(doc1, v2, true, |doc| {
+        ws.edit_transaction(doc1, v2, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.redo();
             (c.is_some(), c)
         });
@@ -1370,7 +1640,7 @@ mod tests {
 
         // "e\u{0301}x\ny" -> chars: 'e'(0), '\u{0301}'(1), 'x'(2), '\n'(3), 'y'(4)
         // Wait: start with "ab\ncd" (5 chars)
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..0, "ab\ncd").unwrap();
             (c, Some(c))
         });
@@ -1388,7 +1658,7 @@ mod tests {
             v2_tab.preferred_column = Some(2);
         }
         ws.activate_pane(pane1);
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..3, "Z\n").unwrap(); // deletes "ab\n", inserts "Z\n"
             (c, Some(c))
         });
@@ -1404,7 +1674,7 @@ mod tests {
             v2_tab.cursor = 0;
             v2_tab.preferred_column = Some(0);
         }
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(2..4, "XY").unwrap();
             (c, Some(c))
         });
@@ -1436,7 +1706,7 @@ mod tests {
         // Index 1 is INSIDE the merged grapheme "a\u{0301}" (is_grapheme_boundary(1) == false)!
         // Right-affinity cursor snaps FORWARD to 2; left-affinity viewport anchor snaps BACKWARD to 0!
         let len = ws.document(doc1).unwrap().document.len_chars();
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(0..len, "a\n\u{0301}").unwrap();
             (c, Some(c))
         });
@@ -1445,7 +1715,7 @@ mod tests {
             v2_tab.cursor = 2;
             v2_tab.top_line = 1; // line_start(1) == 2
         }
-        ws.edit_transaction(doc1, v1, true, |doc| {
+        ws.edit_transaction(doc1, v1, EditViewPolicy::FollowEdit, |doc| {
             let c = doc.replace(1..2, "").unwrap();
             (c, Some(c))
         });

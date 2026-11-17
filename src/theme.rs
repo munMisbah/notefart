@@ -249,30 +249,11 @@ impl Theme {
         }
     }
 
-    /// Whether explicit background colors cannot be trusted (monochrome,
-    /// ANSI 16, and `Terminal` palettes). Renderers use this to fall back to
-    /// reverse/bold cues instead of distinct background colors.
-    pub(crate) const fn uses_reverse_cues(&self) -> bool {
-        self.uses_reverse_cues
-    }
-
-    /// Style for focused interactive controls (such as active dialog buttons).
+    /// Style for focused controls, using the readable selection color pair.
     ///
-    /// Always applies `Modifier::BOLD`, and adds `Modifier::REVERSED` in
-    /// monochrome, ANSI 16, and `Terminal` modes so focus remains legible
-    /// without relying on colors alone.
+    /// Bold distinguishes the focused control from other selected content.
     pub fn focus_style(&self) -> Style {
-        if self.uses_reverse_cues {
-            Style::default()
-                .fg(self.fg)
-                .bg(self.canvas)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(self.canvas)
-                .bg(self.accent)
-                .add_modifier(Modifier::BOLD)
-        }
+        self.selection_style().add_modifier(Modifier::BOLD)
     }
 }
 
@@ -308,9 +289,9 @@ fn resolve_color_mode(
     ColorMode::Ansi16
 }
 
-// Notefart Dark (exact docs/DESIGN.md truecolor hex values)
+// Notefart Dark foregrounds and selection over the terminal's default canvas.
 const PALETTE_DARK_TRUECOLOR: Theme = Theme {
-    canvas: Color::from_u32(0x17_1B_24),
+    canvas: Color::Reset,
     fg: Color::from_u32(0xDC_E3_EE),
     muted: Color::from_u32(0xA4_AF_C0),
     border: Color::from_u32(0x74_82_9A),
@@ -331,9 +312,9 @@ const PALETTE_DARK_TRUECOLOR: Theme = Theme {
     uses_reverse_cues: false,
 };
 
-// Notefart Light (exact docs/DESIGN.md truecolor hex values)
+// Notefart Light foregrounds and selection over the terminal's default canvas.
 const PALETTE_LIGHT_TRUECOLOR: Theme = Theme {
-    canvas: Color::from_u32(0xF5_F7_FB),
+    canvas: Color::Reset,
     fg: Color::from_u32(0x20_2A_3A),
     muted: Color::from_u32(0x53_61_76),
     border: Color::from_u32(0x69_77_8B),
@@ -354,12 +335,10 @@ const PALETTE_LIGHT_TRUECOLOR: Theme = Theme {
     uses_reverse_cues: false,
 };
 
-// Precomputed xterm-256 palette for Notefart Dark.
-// Adjusted from raw Euclidean RGB nearest where needed for hue and contrast:
-// - selection uses 24 (#005F87) so selection stays visibly blue and >=4.5:1 with fg 254.
-// - border uses 103 (#8787AF) to keep cool slate separation >=3.0:1 across all surfaces.
+// Precomputed xterm-256 foregrounds and selection for Notefart Dark.
+// Selection uses 24 (#005F87) for >=4.5:1 contrast with fg 254.
 const PALETTE_DARK_256: Theme = Theme {
-    canvas: Color::Indexed(234),
+    canvas: Color::Reset,
     fg: Color::Indexed(254),
     muted: Color::Indexed(249),
     border: Color::Indexed(103),
@@ -380,13 +359,10 @@ const PALETTE_DARK_256: Theme = Theme {
     uses_reverse_cues: false,
 };
 
-// Precomputed xterm-256 palette for Notefart Light.
-// Adjusted from raw Euclidean RGB nearest to guarantee hue & >=4.5:1 contrast:
-// - success/string use 22 (#005F00) instead of gray 238 or colliding with type 23.
-// - keyword uses 91 (#8700AF) instead of 61 (which fell below 4.5:1 on raised 254).
-// - selection uses 153 (#AFD7FF) for sky-blue separation from surface/raised.
+// Precomputed xterm-256 foregrounds and selection for Notefart Light.
+// Keep semantic hues distinct and fg/selection contrast >=4.5:1.
 const PALETTE_LIGHT_256: Theme = Theme {
-    canvas: Color::Indexed(231),
+    canvas: Color::Reset,
     fg: Color::Indexed(236),
     muted: Color::Indexed(60),
     border: Color::Indexed(66),
@@ -836,68 +812,20 @@ mod tests {
     }
 
     fn assert_theme_contrasts(theme: &Theme, label: &str) {
-        let surfaces = [("canvas", theme.canvas)];
-        let text_roles = [
-            ("fg", theme.fg),
-            ("muted", theme.muted),
-            ("accent", theme.accent),
-            ("success", theme.success),
-            ("warning", theme.warning),
-            ("error", theme.error),
-            ("syntax.plain", theme.syntax(Token::Plain)),
-            ("syntax.comment", theme.syntax(Token::Comment)),
-            ("syntax.keyword", theme.syntax(Token::Keyword)),
-            ("syntax.string", theme.syntax(Token::String)),
-            ("syntax.number", theme.syntax(Token::Number)),
-            ("syntax.function", theme.syntax(Token::Function)),
-            ("syntax.type", theme.syntax(Token::Type)),
-            ("syntax.heading", theme.syntax(Token::Heading)),
-            ("syntax.emphasis", theme.syntax(Token::Emphasis)),
-            ("syntax.code", theme.syntax(Token::Code)),
-            ("syntax.link", theme.syntax(Token::Link)),
-            ("syntax.quote", theme.syntax(Token::Quote)),
-            ("syntax.marker", theme.syntax(Token::Marker)),
-        ];
-
-        for (bg_name, bg) in surfaces {
-            for (fg_name, fg) in text_roles {
-                let ratio = contrast_ratio(fg, bg);
-                assert!(
-                    ratio >= 4.5,
-                    "{label}: {fg_name} on {bg_name} contrast {ratio:.2} < 4.5"
-                );
-            }
-            for (border_name, border) in [("border", theme.border), ("accent", theme.accent)] {
-                let ratio = contrast_ratio(border, bg);
-                assert!(
-                    ratio >= 3.0,
-                    "{label}: {border_name} on {bg_name} contrast {ratio:.2} < 3.0"
-                );
-            }
+        assert_eq!(
+            theme.canvas,
+            Color::Reset,
+            "{label}: preserve terminal background"
+        );
+        // The terminal canvas is unknown; only application-owned color pairs
+        // have a measurable contrast guarantee.
+        for (role, style) in [
+            ("selection", theme.selection_style()),
+            ("focus", theme.focus_style()),
+        ] {
+            let ratio = contrast_ratio(style.fg.unwrap(), style.bg.unwrap());
+            assert!(ratio >= 4.5, "{label}: {role} contrast {ratio:.2} < 4.5");
         }
-
-        let sel_ratio = contrast_ratio(theme.fg, theme.selection);
-        assert!(
-            sel_ratio >= 4.5,
-            "{label}: fg on selection contrast {sel_ratio:.2} < 4.5"
-        );
-
-        let focus_ratio = contrast_ratio(theme.canvas, theme.accent);
-        assert!(
-            focus_ratio >= 4.5,
-            "{label}: canvas on accent contrast {focus_ratio:.2} < 4.5"
-        );
-
-        let match_ratio = contrast_ratio(theme.canvas, theme.warning);
-        assert!(
-            match_ratio >= 4.5,
-            "{label}: canvas on warning contrast {match_ratio:.2} < 4.5"
-        );
-
-        assert_ne!(
-            theme.selection, theme.canvas,
-            "{label}: selection == canvas"
-        );
     }
 
     #[test]

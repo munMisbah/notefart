@@ -142,6 +142,18 @@ fn run_event_loop(
 fn handle_input(app: &mut ProbeApp, event: InputEvent) -> bool {
     match event {
         InputEvent::Terminal(event) => app.handle_event(event, Instant::now()),
+        InputEvent::ControlSequencePending => {
+            app.push_log(
+                LogCategory::Key,
+                "Ctrl+G resumes input; terminal sequence incomplete".into(),
+                None,
+            );
+            true
+        }
+        InputEvent::ControlSequenceResumed => {
+            app.push_log(LogCategory::Key, "Input resumed".into(), None);
+            true
+        }
         InputEvent::PasteRejected => {
             app.push_log(
                 LogCategory::Paste,

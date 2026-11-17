@@ -40,10 +40,6 @@ impl Field {
         &self.text
     }
 
-    pub(crate) fn into_string(self) -> String {
-        self.text
-    }
-
     pub(crate) fn view(&self) -> FieldView<'_> {
         FieldView {
             text: &self.text,

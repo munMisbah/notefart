@@ -1,9 +1,13 @@
+use std::{collections::HashSet, io};
+
 use ratatui::layout::Rect;
+
+use crate::session::{MAX_PANES, TreeNode};
 
 const RATIO_BASIS: u64 = 65_536;
 const DEFAULT_RATIO: u32 = 32_768;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Axis {
     Columns,
     Rows,
@@ -26,6 +30,7 @@ pub(crate) struct PaneRect {
 pub(crate) struct Divider {
     pub id: u64,
     pub axis: Axis,
+    /// Resize hit area: column gap or the first subtree's bottom-border row.
     pub area: Rect,
     pub parent: Rect,
     pub first_min: u16,
@@ -73,6 +78,105 @@ impl SplitTree {
             root: 0,
             next_divider_id: 1,
         }
+    }
+
+    pub(crate) fn session_nodes(&self) -> Vec<TreeNode> {
+        let live = self.nodes.len() - self.free.len();
+        let mut pending = Vec::with_capacity(live);
+        let mut nodes = Vec::with_capacity(live);
+        pending.push(self.root);
+        let mut index = 0;
+        while index < pending.len() {
+            match self.nodes[pending[index]]
+                .as_ref()
+                .expect("live split node")
+            {
+                Node::Leaf { pane } => nodes.push(TreeNode::Leaf { pane_id: *pane }),
+                Node::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => {
+                    let first_index = pending.len();
+                    pending.push(*first);
+                    let second_index = pending.len();
+                    pending.push(*second);
+                    nodes.push(TreeNode::Split {
+                        axis: *axis,
+                        ratio: *ratio,
+                        first: first_index,
+                        second: second_index,
+                    });
+                }
+            }
+            index += 1;
+        }
+        nodes
+    }
+
+    pub(crate) fn from_session_nodes(saved: Vec<TreeNode>, panes: &[u64]) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid session split tree");
+        if panes.is_empty() || panes.len() > MAX_PANES || saved.len() != panes.len() * 2 - 1 {
+            return Err(invalid());
+        }
+        let mut remaining: HashSet<u64> = panes.iter().copied().collect();
+        if remaining.len() != panes.len() || remaining.contains(&0) {
+            return Err(invalid());
+        }
+        let mut parents = vec![0u8; saved.len()];
+        let mut nodes = Vec::with_capacity(saved.len());
+        let mut next_divider_id = 1;
+        for (index, saved) in saved.into_iter().enumerate() {
+            let node = match saved {
+                TreeNode::Leaf { pane_id } => {
+                    if !remaining.remove(&pane_id) {
+                        return Err(invalid());
+                    }
+                    Node::Leaf { pane: pane_id }
+                }
+                TreeNode::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                } => {
+                    if ratio > RATIO_BASIS as u32
+                        || first <= index
+                        || second <= index
+                        || first == second
+                        || first >= parents.len()
+                        || second >= parents.len()
+                        || parents[first] != 0
+                        || parents[second] != 0
+                    {
+                        return Err(invalid());
+                    }
+                    parents[first] = 1;
+                    parents[second] = 1;
+                    let divider = next_divider_id;
+                    next_divider_id += 1;
+                    Node::Split {
+                        divider,
+                        axis,
+                        ratio,
+                        first,
+                        second,
+                    }
+                }
+            };
+            nodes.push(Some(node));
+        }
+        if !remaining.is_empty() || parents[1..].iter().any(|&count| count != 1) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            nodes,
+            free: Vec::new(),
+            root: 0,
+            next_divider_id,
+        })
     }
 
     pub(crate) fn split(&mut self, pane: u64, new_pane: u64, axis: Axis) -> Option<u64> {
@@ -367,7 +471,8 @@ impl SplitTree {
                             let first_min = w1.min(u16::MAX as u32) as u16;
                             let second_min = w2.min(u16::MAX as u32) as u16;
                             let avail = rect.width - 1;
-                            let first_w = split_span(avail, *ratio, first_min, second_min);
+                            let first_w =
+                                split_span(u32::from(avail), *ratio, first_min, second_min);
                             let second_w = avail - first_w;
                             let first_rect = Rect {
                                 x: rect.x,
@@ -401,9 +506,9 @@ impl SplitTree {
                         Axis::Rows => {
                             let first_min = h1.min(u16::MAX as u32) as u16;
                             let second_min = h2.min(u16::MAX as u32) as u16;
-                            let avail = rect.height - 1;
+                            let avail = u32::from(rect.height);
                             let first_h = split_span(avail, *ratio, first_min, second_min);
-                            let second_h = avail - first_h;
+                            let second_h = (avail - u32::from(first_h)) as u16;
                             let first_rect = Rect {
                                 x: rect.x,
                                 y: rect.y,
@@ -412,13 +517,13 @@ impl SplitTree {
                             };
                             let div_rect = Rect {
                                 x: rect.x,
-                                y: rect.y + first_h,
+                                y: rect.y + first_h.saturating_sub(1),
                                 width: rect.width,
-                                height: 1,
+                                height: u16::from(first_h > 0),
                             };
                             let second_rect = Rect {
                                 x: rect.x,
-                                y: rect.y + first_h + 1,
+                                y: rect.y + first_h,
                                 width: rect.width,
                                 height: second_h,
                             };
@@ -445,14 +550,25 @@ impl SplitTree {
             return false;
         }
 
-        let (parent_start, total_span) = match divider.axis {
-            Axis::Columns => (eff_parent.x, eff_parent.width),
-            Axis::Rows => (eff_parent.y, eff_parent.height),
+        let (parent_start, total_span, avail, hit_offset) = match divider.axis {
+            Axis::Columns => (
+                eff_parent.x,
+                eff_parent.width,
+                u32::from(eff_parent.width) - 1,
+                0,
+            ),
+            Axis::Rows => (
+                eff_parent.y,
+                eff_parent.height,
+                u32::from(eff_parent.height),
+                1,
+            ),
         };
-
-        let required = (divider.first_min as u32)
-            .saturating_add(1)
-            .saturating_add(divider.second_min as u32);
+        let combined = u32::from(divider.first_min) + u32::from(divider.second_min);
+        let required = match divider.axis {
+            Axis::Columns => combined + 1,
+            Axis::Rows => combined,
+        };
         if required > total_span as u32 {
             return false;
         }
@@ -489,11 +605,12 @@ impl SplitTree {
             return false;
         };
 
-        let avail = total_span - 1;
         if avail > 0 {
-            let desired = coordinate.saturating_sub(parent_start);
-            let max_first = avail - divider.second_min;
-            let clamped = desired.clamp(divider.first_min, max_first);
+            let desired = u32::from(coordinate)
+                .saturating_add(hit_offset)
+                .saturating_sub(u32::from(parent_start));
+            let max_first = avail - u32::from(divider.second_min);
+            let clamped = desired.clamp(u32::from(divider.first_min), max_first);
             let new_ratio =
                 ((clamped as u64 * RATIO_BASIS + (avail as u64 / 2)) / avail as u64) as u32;
             if let Some(Node::Split { ratio, .. }) = self.nodes[target_idx].as_mut() {
@@ -531,17 +648,14 @@ fn combine_min(axis: Axis, first: (u32, u32), second: (u32, u32)) -> (u32, u32) 
             first.0.saturating_add(1).saturating_add(second.0),
             first.1.max(second.1),
         ),
-        Axis::Rows => (
-            first.0.max(second.0),
-            first.1.saturating_add(1).saturating_add(second.1),
-        ),
+        Axis::Rows => (first.0.max(second.0), first.1.saturating_add(second.1)),
     }
 }
 
-fn split_span(avail: u16, ratio: u32, first_min: u16, second_min: u16) -> u16 {
-    let raw = ((avail as u64 * ratio as u64 + RATIO_BASIS / 2) / RATIO_BASIS) as u16;
-    let max_first = avail - second_min;
-    raw.clamp(first_min, max_first)
+fn split_span(avail: u32, ratio: u32, first_min: u16, second_min: u16) -> u16 {
+    let raw = ((u64::from(avail) * u64::from(ratio) + RATIO_BASIS / 2) / RATIO_BASIS) as u32;
+    let max_first = avail - u32::from(second_min);
+    raw.clamp(u32::from(first_min), max_first) as u16
 }
 
 fn prepare_lookup(mins: &[PaneMinimum], scratch: &mut Vec<(u64, u16, u16)>) {
@@ -616,14 +730,19 @@ mod tests {
                 Axis::Columns => {
                     assert_eq!(d.area.width, 1);
                     assert_eq!(d.area.height, d.parent.height);
+                    total_cells += d.area.width as u64 * d.area.height as u64;
+                    all_rects.push(d.area);
                 }
                 Axis::Rows => {
                     assert_eq!(d.area.height, 1);
                     assert_eq!(d.area.width, d.parent.width);
+                    for pane in &layout.panes {
+                        if rects_overlap(d.area, pane.area) {
+                            assert_eq!(d.area.bottom(), pane.area.bottom());
+                        }
+                    }
                 }
             }
-            total_cells += d.area.width as u64 * d.area.height as u64;
-            all_rects.push(d.area);
         }
 
         for i in 0..all_rects.len() {
@@ -724,11 +843,11 @@ mod tests {
             },
         ];
 
-        // Left subtree (1 Rows 3): min = (max(10,14), 2+1+4) = (14, 7)
+        // Left subtree (1 Rows 3): min = (max(10,14), 2+4) = (14, 6)
         // Deep subtree (4 Cols 5): min = (10+1+11, max(2,5)) = (22, 5)
-        // Right subtree (2 Rows deep): min = (max(12,22), 3+1+5) = (22, 9)
-        // Root (left Cols right): min = (14+1+22, max(7,9)) = (37, 9)
-        assert_eq!(tree.minimum(&mins), (37, 9));
+        // Right subtree (2 Rows deep): min = (max(12,22), 3+5) = (22, 8)
+        // Root (left Cols right): min = (14+1+22, max(6,8)) = (37, 8)
+        assert_eq!(tree.minimum(&mins), (37, 8));
 
         let area = Rect::new(3, 2, 80, 24);
         let mut layout = Layout::default();
@@ -919,16 +1038,17 @@ mod tests {
         let r_div = layout.dividers[0];
         assert!(rows_tree.resize(&r_div, 0));
         rows_tree.layout(r_area, 1, &mins, &mut layout);
-        assert_eq!(layout.dividers[0].area.y, 7);
+        assert_eq!(layout.dividers[0].area.y, r_area.y + mins[0].height - 1);
         assert!(rows_tree.resize(&r_div, u16::MAX));
         rows_tree.layout(r_area, 1, &mins, &mut layout);
-        assert_eq!(layout.dividers[0].area.y, 22);
+        assert_eq!(
+            layout.dividers[0].area.y,
+            r_area.bottom() - mins[1].height - 1
+        );
     }
 
     #[test]
     fn resize_places_every_cell_accurately_even_at_u16_max() {
-        let mut tree = SplitTree::new(1);
-        tree.split(1, 2, Axis::Columns).unwrap();
         let mins = [
             PaneMinimum {
                 id: 1,
@@ -941,17 +1061,29 @@ mod tests {
                 height: 1,
             },
         ];
-
-        let area = Rect::new(0, 0, u16::MAX, 10);
-        let mut layout = Layout::default();
-        tree.layout(area, 1, &mins, &mut layout);
-        let div = layout.dividers[0];
-
-        for target_x in [1, 2, 17, 16384, 32767, 32768, 65532, 65533] {
-            assert!(tree.resize(&div, target_x));
+        for axis in [Axis::Columns, Axis::Rows] {
+            let mut tree = SplitTree::new(1);
+            tree.split(1, 2, axis).unwrap();
+            let area = match axis {
+                Axis::Columns => Rect::new(0, 0, u16::MAX, 10),
+                Axis::Rows => Rect::new(0, 0, 10, u16::MAX),
+            };
+            let mut layout = Layout::default();
             tree.layout(area, 1, &mins, &mut layout);
-            assert_tiling_invariants(&tree, area, &mins, &layout);
-            assert_eq!(layout.dividers[0].area.x, target_x);
+            let div = layout.dividers[0];
+            for target in [0, 1, 2, 17, 16384, 32767, 32768, 65532, 65533, 65534] {
+                if target == 65534 || (axis == Axis::Columns && target == 0) {
+                    continue;
+                }
+                assert!(tree.resize(&div, target));
+                tree.layout(area, 1, &mins, &mut layout);
+                assert_tiling_invariants(&tree, area, &mins, &layout);
+                let position = match axis {
+                    Axis::Columns => layout.dividers[0].area.x,
+                    Axis::Rows => layout.dividers[0].area.y,
+                };
+                assert_eq!(position, target);
+            }
         }
     }
 
@@ -976,9 +1108,9 @@ mod tests {
         assert!(tree.can_split(1, Axis::Columns, Rect::new(0, 0, 34, 2), &mins));
         assert!(!tree.can_split(1, Axis::Columns, Rect::new(0, 0, 33, 2), &mins));
 
-        // Splitting pane 2 along Rows predicts 10+1+12 = 23 width, 2+1+2 = 5 height
-        assert!(tree.can_split(2, Axis::Rows, Rect::new(0, 0, 23, 5), &mins));
-        assert!(!tree.can_split(2, Axis::Rows, Rect::new(0, 0, 23, 4), &mins));
+        // Splitting pane 2 along Rows predicts 23 width and 2+2 = 4 height.
+        assert!(tree.can_split(2, Axis::Rows, Rect::new(0, 0, 23, 4), &mins));
+        assert!(!tree.can_split(2, Axis::Rows, Rect::new(0, 0, 23, 3), &mins));
 
         // Missing pane and zero areas
         assert!(!tree.can_split(99, Axis::Columns, Rect::new(0, 0, 100, 100), &mins));
@@ -1008,7 +1140,7 @@ mod tests {
                 height: 2,
             },
         ];
-        // Full minimum = (21, 5)
+        // Full minimum = (21, 4), retaining both independent frame borders.
         let full = Rect::new(1, 1, 60, 20);
         let mut layout = Layout::default();
         tree.layout(full, 3, &mins, &mut layout);
@@ -1031,7 +1163,8 @@ mod tests {
         );
 
         // Collapse by height, active is pane 2
-        let too_short = Rect::new(1, 1, 60, 4);
+        let min_height = u16::try_from(tree.minimum(&mins).1).unwrap();
+        let too_short = Rect::new(1, 1, 60, min_height - 1);
         tree.layout(too_short, 2, &mins, &mut layout);
         assert!(layout.collapsed);
         assert!(layout.dividers.is_empty());

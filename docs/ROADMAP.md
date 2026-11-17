@@ -2,7 +2,7 @@
 
 Status: draft tanpa tanggal rilis. Urutan di bawah adalah usulan implementasi balanced, bukan pengurangan fitur yang telah disepakati.
 
-Diagnostik, editor aman, workspace dan hybrid panel + tab/shared view sudah berjalan pada cakupan Linux yang dinyatakan. Tahap berikutnya pemolesan UI/UX dan validasi penggunaan harian. Kompilasi/mockup saja bukan bukti tahap selesai; hasil nyata dicatat di bawah.
+Diagnostik, editor aman, workspace, hybrid panel + tab/shared view dan P1 terpilih sudah berjalan. Sesuai keputusan pengguna, tahap 4 ditutup untuk matriks Linux yang telah dibuktikan; bukan klaim seluruh terminal/font/host SSH. Bukti serta batas terkini ada di [hasil P1 aksesibilitas dan pencarian](#hasil-p1-aksesibilitas-dan-pencarian). Publish dan installer tetap terpisah.
 
 Nama executable saat ini **`naf`**; produk dan namespace konfigurasi tetap Notefart/`notefart`. Perintah serta path binary `notefart` pada laporan batch sebelum migrasi di bawah adalah catatan pemeriksaan historis, bukan alias atau instruksi build aktif. Instruksi terkini ada di [README.md](README.md#menjalankan-editor); output binary/artifact lama telah dibersihkan pada migrasi.
 
@@ -174,6 +174,8 @@ Pekerjaan:
 - Tulis panduan instalasi, shortcut, dukungan terminal, dan keterbatasan berdasarkan aplikasi yang benar-benar tersedia.
 
 Lulus jika: seluruh kriteria PRODUCT.md terpenuhi pada cakupan dukungan yang dinyatakan, tidak ada kehilangan data yang diketahui pada alur yang didukung, dan dokumentasi tidak menjanjikan kemampuan yang belum ada.
+
+Status terkini: **ditutup pada cakupan Linux teruji yang disetujui pengguna**; lihat [hasil P1 dan penutupan](#hasil-p1-aksesibilitas-dan-pencarian). Pernyataan gap pada catatan batch lama di bawah adalah kondisi historis, bukan status pengujian terbaru.
 
 ### Hasil batch pemolesan UI/UX
 
@@ -449,6 +451,247 @@ Binary sebelum SHA-256 `fbc1ffa669c47d907378071a59ab2311e2f679ec78aedc47808cc101
 - Tiga sesi TUI menjalankan nama `naf` melalui PATH sementara khusus driver, tanpa flag tambahan: editor Untitled bisa diketik/undo; `naf test.txt` membuka path relatif serta edit/save/undo memulihkan bytes sumber; `naf new.txt` tidak membuat file sampai Save. Semuanya keluar 0 dan memulihkan termios/alternate screen/mouse/bracketed paste. Ini bukan pemasangan binary ke PATH pengguna.
 - Command packaging dari YAML final dijalankan lokal: arsip memuat tepat `naf`, template dan dua notice, bytes binary sesuai release dan mode 0755. Upload/run GitHub belum dijalankan; status remote tidak diubah. Fixture sementara dibersihkan; hasil build baru tetap di `target/`.
 
+### Hasil navigasi kata panjang dan validasi editor tmux
+
+Lanjutan non-security tahap 4 menutup celah pengukuran navigasi kata dari batch geometri sparse. Baseline nyata menunjukkan Ctrl+panah pada satu run panjang masih mengulang lookup Rope/grapheme per langkah. `Document::word_left`/`word_right` kini menghitung arah yang dibutuhkan saja; double-click memakai pemindaian yang sama untuk kedua ujung seleksi. Iterator char berjalan berurutan, perubahan kelas hanya memutus run pada boundary grapheme. Tidak ada penyalinan teks, indeks/cache baru, perubahan kelas kata atau dependency tambahan.
+
+#### Pengukuran lokal
+
+Linux x86_64, dev opt-level 1, tmux 3.5a dengan server/socket terisolasi, `TERM=tmux-256color`, viewport 120×36, ASCII/tanpa warna, clipboard internal dan tanpa konfigurasi pengguna. Satu pass per fixture/binary, filesystem cache tidak dikosongkan. Timer dimulai sebelum `tmux send-keys` sampai `capture-pane` menampilkan posisi cursor yang dituju; overhead subprocess/pengamatan termasuk. Ini bukan percentile, waktu native murni, frame fisik atau SLA.
+
+Fixture ASCII: `HEAD ` + 1.048.576 karakter `a` + ` TAIL\nNEXT` (1.048.591 byte). Fixture Unicode: `HEAD ` + 32.768 pengulangan `e` + combining acute + `世_` + ` TAIL\nNEXT` (229.391 byte). Fixture spasi: `HEAD` + 1.048.576 spasi + `TAIL\nNEXT` (1.048.589 byte). Pada fixture kata, satu Ctrl+Right awal menuju awal kata panjang sebelum interval ukur. Ctrl+Right terukur melintasi run dan mengisi geometri dingin menuju `TAIL`; Ctrl+Left berikutnya kembali dengan cache geometri yang sudah hangat.
+
+| Fixture / aksi | Sebelum (ms) | Sesudah (ms) |
+| --- | ---: | ---: |
+| Kata ASCII — Ctrl+Right | 1745,4 | 257,3 |
+| Kata ASCII — Ctrl+Left | 1525,6 | 46,2 |
+| Kata Unicode — Ctrl+Right | 248,3 | 100,2 |
+| Kata Unicode — Ctrl+Left | 235,2 | 65,9 |
+| Spasi — Ctrl+Right | 1742,9 | 229,4 |
+| Spasi — Ctrl+Left | 2606,1 | 40,5 |
+
+SHA-256 binary sebelum `fc83f0b67db6be170b624a92e2354beffa77b952bd3d38215896f3063e2166e2`; sesudah `025418dd9ea111c5b197ced40fac94f8dcc2e9730b2de4d997bc8c959f76e9b6`. Kedua binary memakai resep fixture dan urutan input identik. Bytes fixture tidak berubah dan seluruh sesi ukur keluar status 0. Tidak ada klaim startup/RAM umum membaik.
+
+#### Bukti perilaku dan batas
+
+- `rustfmt` pada file Rust berubah, `cargo test --locked --bin naf document::tests`: **19 lolos**, lalu `cargo build --locked --bin naf` sukses. Tiga regresi baru mencakup kelas karakter pertama grapheme, combining/Prepend/ZWJ/RI, whitespace lintas CRLF/baris kosong, run lintas chunk, seleksi dan endpoint navigasi. Suite lengkap tidak dijalankan; ini bukan security test.
+- Empat sesi editor tmux: Dark/truecolor/Unicode, Light/256/Unicode, Terminal/none/ASCII dan Dark/16/Nerd. Ctrl+panah serta Ctrl+Shift+panah memilih kata Unicode; paste mengganti seleksi tepat. F8/F9 menghasilkan tiga view shared; undo/redo dan save dari view lain menghasilkan bytes yang diharapkan.
+- Resize 120×36→20×6 menyisakan view aktif, seleksi/paste/save saat compact tetap berlaku; kembali 120×36 memulihkan tiga view dengan teks terbaru. F12 menutup satu panel tanpa membuang dokumen shared. Double-click SGR pada kata memilih hanya kata tersebut, penggantian dapat di-undo dari panel lain, lalu seluruh bytes sumber dipulihkan.
+- Frame split dan compact diamati melalui `capture-pane`; empat sesi keluar 0, termios sebelum/sesudah identik dan output menonaktifkan alternate screen, mouse serta bracketed paste. Seluruh fixture, driver, salinan baseline dan server tmux sementara dibersihkan; konfigurasi/font pengguna tidak diubah.
+- Pemindaian tetap perlu membaca run yang dilintasi; boundary Unicode tertentu memerlukan lookbehind dan geometri dingin masih memiliki biaya. Tidak ada indeks seluruh dokumen, batas keras CPU/RSS atau janji semua file hingga 64 MiB cepat.
+- Sesi validasi tidak memiliki display yang terpasang; executable emulator grafis dan `sshd` tidak ditemukan di PATH. Input tmux memakai `send-keys`/paste buffer dan injeksi protokol mouse, bukan keyboard/klik manusia atau validasi shortcut client tmux. Matriks font/emulator/SSH, evaluasi visual final dan kriteria rilis tahap 4 tetap terbuka. Session restore tetap fitur tambahan; installer tetap ditunda sampai publish.
+
+### Hasil session restore otomatis
+
+Pengguna memilih aktivasi otomatis pada `naf` tanpa path. Implementasi menambahkan `session` untuk I/O, ekspor/impor workspace, rekonstruksi split tree dan integrasi startup/quit. Tab, panel aktif, urutan/ratio split, cursor/selection/viewport serta buffer Untitled/dirty dipulihkan; satu dokumen shared tetap satu teks/history. Baseline disk asli dan format/read-only disimpan, sedangkan undo/redo dimulai ulang.
+
+- `rustfmt` pada file berubah; `cargo test --locked --bin naf restored_dirty_checkpoint`: **1 lolos**; `cargo test --locked --bin naf cli_`: **4 lolos** (CLI/config/theme), lalu `cargo build --locked --bin naf` sukses tanpa warning. Regresi baru membuktikan undo setelah restore dirty tidak mengaku bersih sebelum Save eksplisit. Suite luas tidak dijalankan.
+- Lima sesi TUI tmux 3.5a, `TERM=tmux-256color`, ASCII/tanpa warna/clipboard internal dan konfigurasi/state fixture terisolasi. Exit normal lalu relaunch dari CWD berbeda memulihkan body tab/panel/ratio/viewport/fokus identik. Selection yang dipulihkan mengganti teks tepat; shared background tab mempertahankan cursor independen.
+- Buffer Untitled dapat di-Save As setelah restore; dirty source tidak berubah di disk sampai Ctrl+S eksplisit, lalu BOM/CRLF dan bytes yang diharapkan tepat. Close tab dirty tetap meminta Save/Discard/Cancel; Discard tidak muncul lagi pada snapshot normal-exit berikutnya.
+- `--no-session` mempertahankan quit guard dan launch file langsung membuka file yang diminta. Keduanya tidak mengubah snapshot default. Resize 120×36→20×6 menunggu acknowledgement chrome compact aplikasi, lalu kembali 120×36 memulihkan panel. Lima sesi pass akhir keluar 0, termios identik sebelum/sesudah dan alternate screen/mouse/bracketed paste dipulihkan.
+- CLI `--help` diamati pada binary baru. SHA-256 binary dev `53da2e1676267c20e77bd0e0a2a006d5324791bcde0240566d982dab892afa3c`. Driver awal dikoreksi untuk viewport nonaktif setelah split, menunggu dialog hilang setelah Esc, dan acknowledgement renderer saat resize; tidak mengubah produk untuk meluluskan asumsi driver.
+- Snapshot memakai format v1 NAFSES01, metadata JSON 4 MiB, teks 64 MiB/dokumen, total 256 MiB dan batas 1024 dokumen/256 panel/4096 view. Lokasi/privasi serta semantik sumber berubah/hilang ada di [ARCHITECTURE.md](ARCHITECTURE.md#keputusan-session-restore-otomatis) dan [SECURITY.md](SECURITY.md#snapshot-sesi-dan-privasi).
+- Security test terarah dan review terpisah diselesaikan model `atmo/alicn/deepseek-v4.1-flash-1017`; integrator memeriksa laporan serta log hasil tanpa menjalankan ulang pengujian tersebut. Tidak ditemukan kerentanan sesi yang terkonfirmasi; cakupan parser, mode/link, lock/isolation, kegagalan save, konflik source dan batasnya ada di [SECURITY.md](SECURITY.md#hasil-verifikasi-model-terpisah).
+- Temuan UX pesan `--no-session` ganda diperbaiki dengan satu pemilik konteks di App. Build dev akhir sukses, SHA-256 `9242eb967a5af206c4338a83af34b8270434faadab5da3b644b2d5a0c6e6c53b`; model yang sama mengamati ulang instance kedua ditolak nonblocking dengan saran hanya satu kali, tanpa mengulang suite keamanan.
+- Bukti fungsional dan verifikasi keamanan terarah tidak menjanjikan crash recovery, performa snapshot ekstrem, perlindungan dari semua race/filesystem, font/emulator fisik, SSH atau penutupan seluruh tahap 4. Installer tetap ditunda sampai publish.
+
+### Hasil visibilitas explorer berdasarkan startup
+
+- `naf` tanpa path selalu memulai dengan explorer tampil, termasuk restore snapshot yang sebelumnya hidden. Buffer/tab/split, root dan lebar explorer tetap dipulihkan. `--no-session` tanpa path juga menampilkan explorer; argumen folder tampil, argumen file existing maupun baru tersembunyi.
+- Ctrl+B yang sudah tersedia dipakai untuk hide/unhide, tanpa shortcut kedua atau flag baru. F2 tetap pindah fokus. Hide/unhide mempertahankan root/lebar/buffer; drag pembatas dan layout compact tetap berlaku.
+- `cargo fmt --all -- --check` lolos; `cargo test --locked --bin naf app::tests::explorer_navigation_focus_and_open_flows -- --exact`: **1 lolos**; `cargo build --locked --bin naf` sukses tanpa warning. Help CLI menampilkan aturan startup baru. Tidak menjalankan suite luas atau security test.
+- **Tujuh sesi TUI tmux 3.5a**, `TERM=tmux-256color`, ASCII/tanpa warna/clipboard internal, config dan state fixture terisolasi: startup tanpa path; restore sesi hidden dari CWD lain; file existing; file baru; folder; tanpa sesi; dan relaunch untuk lebar tersimpan. Semua menghasilkan visibility yang diminta, exit 0, termios identik dan alternate screen nonaktif setelah keluar.
+- Input nyata membuktikan toggle dua arah, hide saat explorer fokus lalu mengetik kembali di editor, drag lebar enam kolom, resize 120×36→20×6→120×36, serta pemulihan lebar/root/buffer saat relaunch. Mouse setelah toggle tetap mengedit posisi yang tepat; Save menulis bytes fixture yang diharapkan dan undo/Save mengembalikan sumber. File baru hanya dibuat saat Save.
+- Driver awal mengasumsikan lima karakter ketikan sebagai satu undo; dikoreksi menjadi lima transaksi tanpa mengubah produk. Server tmux dan fixture sementara dibersihkan. Ini bukti protokol/cell, bukan validasi terminal/font fisik atau shortcut client tmux.
+
+### Hasil validasi workflow release pada terminal Orca
+
+- `cargo build --locked --release --bin naf` sukses tanpa warning. `target/release/naf --version` menghasilkan `naf 0.1.0`; SHA-256 binary teruji `3129c03a30c881acb41bda69dedcf8e7a5d941aeac33caf716e7fbd61fe380cf`. Tidak ada perubahan kode produksi pada batch validasi ini.
+- Terminal Orca baru dibuat tanpa mengambil fokus atau memakai terminal pengguna. Hasil create menyatakan `surface: background`; observasi memakai `terminal read --screen` dengan `source: screen`, bukan output repaint bertumpuk. Lingkungan aktual: Linux, 120×40, `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=en_US.UTF-8`, tanpa tmux.
+- **Tiga sesi aplikasi release** memakai fixture/config/state terisolasi dan clipboard internal. Profil yang dijalankan: Dark/truecolor/Unicode serta Light/256/ASCII. Ini membuktikan alur pada backend terminal langsung, bukan screenshot GUI atau validasi warna/font fisik.
+- Sesi file: paste UTF-8 CJK/combining, split shared, edit lalu undo/redo dari panel lain, Replace All dan undo/redo lintas panel, serta Save menghasilkan bytes tepat. Ctrl+B/F2 mengembalikan input ke editor sesudah explorer di-hide. Klik pada sel kedua CJK snap ke awal grapheme; edit/undo/Save tetap tepat. Copy seluruh dokumen ke tab baru, paste, Save As dan close menghasilkan salinan Unicode identik.
+- Sesi default: buffer Untitled/dirty Unicode dibuka dalam tiga view nested; explorer disembunyikan sebelum Ctrl+Q. Relaunch dari CWD lain memulihkan root, tiga view dan teks, tetapi explorer tampil sesuai aturan startup. Save As setelah restore memperbarui seluruh caption shared; F1 dan Esc mempertahankan field serta pending Save As. Menutup satu panel mempertahankan shared document.
+- Ketiga sesi keluar 0 dan termios sebelum/sesudah identik. Receipt close terminal fixture mengonfirmasi `ptyKilled: true`; fixture serta driver sementara dibersihkan. Tidak menyentuh file/config/snapshot pengguna atau terminal lain.
+- Percobaan `tui-idle` pada shell biasa timeout; kondisi tersebut tidak dipakai sebagai bukti editor. Setiap aksi berikutnya diperiksa melalui screen aktual dan bytes file, tanpa mengulang input yang sudah diterima.
+- Batas: host tidak menyediakan DISPLAY/Wayland maupun emulator grafis; provider Computer Use gagal memuat python3-gi/AT-SPI. Tidak memasang paket desktop atau mengambil fokus pengguna. Glyph/font fisik, shortcut keyboard client, klik mouse fisik, koneksi SSH nyata, platform lain dan matriks penggunaan panjang tetap belum dibuktikan. Tidak menjalankan security test, suite unit luas, packaging, GitHub Actions, publish atau installer; tahap 4 belum ditutup.
+
+### Hasil perbaikan bug P0 audit AGY
+
+- Cakupan: temuan 1.1–1.5, 1.7–1.10, serta kontras foreground pilihan explorer pada 2.1. Status per temuan tercatat di [laporan AGY](E-TO-E_TEST_AGY.md#status-tindak-lanjut-batch-p0); wishlist P1/P2 tidak dinaikkan menjadi fitur.
+- Kontrak tetap: Discard berlaku langsung per dokumen, Cancel berikutnya tidak memulihkannya; aturan startup explorer dan `Ctrl+B` mengikuti keputusan pengguna. Dialog menjelaskan konsekuensi Discard.
+- Integrator menjalankan `cargo fmt --all`, `cargo build --locked --bin naf`, dan `cargo build --locked --release --bin naf`; semuanya berhasil tanpa warning build. `./target/release/naf --version` menghasilkan `naf 0.1.0`.
+- Worker `atmo/alicn/deepseek-v4.1-flash-1017` menjalankan `cargo fmt --all -- --check` dan `cargo test --locked --all-targets`: **293 passed, 0 failed**, serta dua target example tanpa test. Percobaan awal menemukan sembilan assertion lama yang masih memperlakukan `StatusMessage` sebagai string; integrator memperbaiki bagian `cfg(test)` lalu worker mengulang pemeriksaan yang gagal. Tidak ada shim string atau perubahan produksi untuk meluluskan assertion tersebut.
+- Review read-only worker atas retry path, kelanjutan Save/Close/Quit, guard Choices kecil, dan overlay Pending/Resumed tidak menemukan kebutuhan perubahan. Worker juga membuktikan tiga kelompok runtime PTY: OSC/DCS dan BEL/ST terfragmentasi, bare SS3/F1, serta paste literal/terfragmentasi dan shortcut nyata setelah paste. Detail dan batasnya ada di [SECURITY](SECURITY.md#verifikasi-input-batch-agy-p0).
+- Integrator membuktikan **8 sesi aplikasi TUI non-security** pada fixture terisolasi dan socket tmux sendiri: tujuh debug dan satu release. Skenario meliputi retry Open, retry Save As yang meneruskan Quit, penolakan Discard tersembunyi pada 20×6, notice keluar pada 10×3, canvas compact, status Saved yang tetap terlihat bersama warning highlight terlambat, batas scroll horizontal, serta retry Save As/Quit pada release.
+- Runtime warna Light truecolor memperlihatkan border editor aktif RGB `25,92,168` dan canvas compact RGB `245,247,251`. Pada delapan sesi integrator, aplikasi exit 0, termios kembali seperti sebelum launch, dan alternate screen nonaktif setelah keluar.
+- Driver smoke dikoreksi agar memilih border editor, menunggu redraw compact/modal selesai, menerima label keluar adaptif, dan tidak menganggap viewport horizontal otomatis direset. Koreksi driver bukan perubahan produk untuk meluluskan pemeriksaan.
+- SHA-256 debug: `4ee3da662e8de40d8b526e03346cc6e62eda06d6d74a876c16886a660315822c`; release: `94c0e09a9ac491b9a510e09ddcc66b619975dcc6149e9869f7793fcd81525b52`. Koreksi assertion setelah build hanya menyentuh `cfg(test)`; hash debug tetap sama.
+- Cleanup: fixture dan server tmux milik delapan smoke integrator dibersihkan, skrip throwaway worker dihapus, dan terminal worker dilepas setelah laporan diterima. Server runtime worker sudah nonaktif; socket stale milik pengujian dihapus. Enam tautan/path/anchor dokumentasi baru diperiksa dan valid.
+- Batas bukti: tmux/PTY lokal, bukan validasi font/GUI terminal fisik, SSH, installer, atau CI. Ambiguitas byte legacy `Alt+]`/OSC tidak dihilangkan; recovery memakai `Ctrl+G`, bukan timeout yang mengeksekusi payload tertunda.
+
+### Hasil background terminal dan tab aksesibel
+
+- Permintaan pengguna mengganti canvas solid dengan background terminal agar efek glass tidak tertutup. Semua palet kini memakai `Color::Reset` untuk canvas tanpa flag/config baru; foreground Dark/Light tetap dapat dipilih sesuai latar, sedangkan Terminal memakai foreground default.
+- Tab aktif memakai pasangan `selection`/`fg` untuk seluruh label, ikon, dirty/read-only dan close; marker fokus serta bold tetap ada. ANSI16/Terminal/none menggunakan reverse sebagai pembeda nonwarna. Prefix field fokus memakai pasangan seleksi yang terbaca, bukan canvas default sebagai foreground di atas accent.
+- `chrome::pane_areas` menambahkan satu baris kosong sebelum gutter/teks pada panel setinggi minimal 5. Tinggi minimum 4 menghilangkan gap agar editor compact 12×6 tetap menyisakan satu baris teks. Controller memakai snapshot `text_area` yang diterbitkan renderer; klik gap tidak menjadi posisi teks.
+- `cargo fmt --all`, **14 tes terarah warna/UI/geometri**, dan `cargo build --locked --release --bin naf` lolos. Compile test awal menemukan import `Color` yang belum ada; diperbaiki melalui code action LSP sebelum tes dijalankan. Build awal juga menemukan accessor `uses_reverse_cues` obsolete; referensi LSP hanya deklarasi, accessor dihapus dan build release akhir selesai tanpa warning.
+- Tiga sesi aplikasi release memakai fixture/config/state terisolasi: Dark/truecolor/Nerd, Light/256/Unicode, dan Terminal/none/ASCII. Capture sel/SGR menunjukkan background default pada canvas, highlight tab aktif dan prefix field dengan pasangan foreground yang tepat, serta reverse/bold tanpa warna.
+- Sesi utama membuktikan pindah/close tab lewat mouse, dirty marker, klik gap tanpa memindahkan cursor, klik teks pada offset baru, save dengan isi fixture yang diperiksa, split, collapse pada 12×6, lalu restore panel dan spacing. Dua profil tambahan memeriksa fallback warna/fokus dan pemadatan minimum.
+- Driver dikoreksi mengikuti prefix field aktual, Undo satu karakter, dan acknowledgement frame compact aplikasi, bukan reflow tmux sesaat. Tidak ada perubahan produksi untuk meluluskan asumsi driver. Ketiga sesi exit 0, termios kembali seperti sebelum launch, alternate screen nonaktif; fixture, server tmux dan socket stale milik pengujian dibersihkan.
+- SHA-256 release teruji: `2c58af398ec294a7c3ac40ef495b3dd17f61225d1ca82193b9ffc9ca9eee407c`.
+- Batas: bukti terminal/sel lokal, bukan pembuktian compositor glass, glyph/font fisik, client keyboard/mouse, SSH atau CI. Kontras canvas tidak lagi dapat dihitung dari RGB milik aplikasi; tes kontras hanya menjamin pasangan yang memang dikendalikan aplikasi. Tidak menjalankan security test, suite seluruh target, packaging atau installer.
+
+### Hasil perapatan jarak split bertingkat
+
+- Permintaan pengguna: celah atas–bawah tampak terlalu tinggi dibanding kiri–kanan. Split Rows kini tanpa baris kosong tambahan; Columns tetap satu kolom. Kedua panel mempertahankan frame masing-masing; spacing tab-ke-teks dan background terminal tidak diubah.
+- Minimum, preflight, layout dan resize memakai tinggi Rows tanpa gap. Hit resize menumpang border bawah subtree atas; koordinat drag/keyboard dikonversi ke span pertama dengan offset satu baris. Border/tab/teks tidak dihapus atau dijadikan satu area hit.
+- `cargo fmt --all` dan 17 target tes geometri/UI diperiksa: putaran awal 16 lolos, satu tes collapse masih menganggap tinggi 4 selalu kurang. Batasnya diubah menjadi minimum tree dikurangi satu, lalu target tersebut diulang dan lolos. Invariant coverage kini menghitung pane/gap kolom, sedangkan hit Rows hanya boleh menumpang border bawah. Akurasi resize diuji pada kedua orientasi hingga koordinat `u16`.
+- Smoke Nerd awal membuktikan split bertingkat, mouse dan keyboard resize Rows, resize Columns, klik teks/save serta collapse 12×6 dan restore ratio. Frame tersimpan juga memperlihatkan grip Rows tertutup pengisian gap kolom pada perpotongan. Urutan render divider dibalik agar ancestor digambar terakhir, tanpa alokasi atau pass tambahan; regresi border/grip mencakup layout sederhana/bertingkat, tiga profil ikon dan seluruh panel yang dapat fokus. Target regresi diulang dan lolos; build release akhir tanpa warning.
+- Dua smoke pada release akhir: Nerd/truecolor membuktikan grip perpotongan terlihat dan dapat di-drag, shortcut resize tetap satu langkah, gap kolom tetap satu, serta klik teks/save tetap tepat. ASCII/none membuktikan F9 memuat dua panel setinggi 4 pada body 8 baris (terminal 12×11), mempertahankan border/grip dan restore saat diperbesar.
+- Seluruh tiga sesi memakai fixture/config/state dan server tmux sendiri, exit 0, mengembalikan termios dan menonaktifkan alternate screen. Fixture, server dan socket stale milik batch dibersihkan.
+- SHA-256 release akhir: `ad3493a902691aa4d5bc21cd569c06412c26cfb6edb1557ea6f1430f2e9aa151`.
+- Batas: verifikasi sel/protokol terminal lokal, bukan jaminan jarak pixel identik pada setiap rasio font, GUI/font fisik, input client atau SSH. Tidak menjalankan security test, suite seluruh target, CI atau installer.
+
+### Hasil border bersama dan grip terpusat
+
+- Laporan pengguna: grip horizontal menempel pada salah satu dari dua border. Percobaan glyph baseline hanya mendekatkan posisi dan tidak dipertahankan. Pengguna memilih satu border bersama, bukan menambah baris celah atau menerima posisi perkiraan.
+- Rows kini berbagi satu baris antara border bawah subtree atas dan border atas subtree bawah; grip berada pada centerline yang sama. Minimum/preflight/layout/resize menghitung border sekali. Span sementara memakai `u32` untuk `parent.height + 1`; akurasi kedua orientasi hingga batas `u16` tetap diperiksa.
+- Renderer membentuk junction atas/bawah/cross, termasuk kolom yang tidak sejajar. Judul panel digambar sekali setelah stroke divider, dengan budget sebelum grip/junction; pada minimum sempit label teks menggantikan ikon yang tidak muat. Tab, textarea, fokus dan jalur keyboard/mouse tetap terpisah dari shared border.
+- `cargo fmt --all`, **19 tes terarah geometri/UI** dan `cargo build --locked --release --bin naf` lolos tanpa warning build. Regresi renderer meliputi 78 frame: tiga profil ikon, empat topologi split, lebar 12/25/60 yang muat, dan seluruh panel fokus. Invariant tiling mengizinkan overlap hanya pada border bersama, bukan konten atau kontrol tab.
+- Dua sesi release akhir memakai fixture/config/state dan server tmux terisolasi. Nerd/truecolor membuktikan empat panel, grip tengah, junction yang sejajar maupun tidak, resize Rows/Columns via mouse dan keyboard, judul pada lebar 25, collapse 12×6/restore ratio, serta klik teks/save dengan isi fixture diperiksa. ASCII/none membuktikan dua panel minimum pada 12×10 (body 7, tiap panel 4 dengan satu border bersama), judul tidak menimpa grip, grow dan resize.
+- Sel aktual TUI diraster dengan DejaVu Sans Mono lokal: grip midline berada pada satu garis bersama, bukan menggeser glyph menuju celah setengah baris. Ini inspeksi font lokal, bukan screenshot emulator/font client pengguna. Dependency raster hanya alat inspeksi terisolasi, bukan dependency proyek atau perubahan font sistem.
+- Kedua sesi exit 0, termios kembali seperti sebelum launch, alternate screen nonaktif. Fixture, server tmux dan socket stale milik pengujian dibersihkan; percobaan baseline sebelumnya juga sudah ditutup.
+- SHA-256 release akhir: `fd45421fdff12bc663b775748fa94efcc622c4242f195f707a08b38606dd3d16`.
+- Batas: bukti sel/protokol dan raster font lokal; GUI/font fisik, input client, SSH dan CI belum dibuktikan. Tidak menjalankan security test atau suite seluruh target.
+
+### Hasil koreksi frame terpisah dan celah tipis
+
+- Klarifikasi pengguna: yang diinginkan adalah dua frame dengan celah tipis menyerupai pemisah kiri–kanan, bukan satu border bersama. Implementasi shared border sebelumnya salah menafsirkan tampilan yang dimaksud; keputusan itu digantikan oleh bagian ini. Indikator glyph berikut kemudian dihapus setelah laporan glitch; lihat [hasil penghapusan indikator horizontal](#hasil-penghapusan-indikator-horizontal).
+- Kedua frame dikembalikan utuh pada dua baris bertetangga, tanpa baris spacer. Minimum/layout/preflight kembali menjumlahkan tinggi kedua subtree; pane tidak overlap. Hit resize tetap pada border bawah subtree atas, dengan offset drag/keyboard yang sama.
+- Unicode/Nerd memakai combining diaeresis below U+0324 pada stroke, corner atau space yang sudah ada. Dua titik berada rendah menuju celah tanpa menghapus garis/sudut; ASCII memakai underscore. Ini tidak menambah row, dependency proyek, atau alokasi string per frame. Junction, budget judul shared border dan renderer judul terpisah yang obsolete dihapus; judul kembali ke frame normal.
+- `cargo fmt --all`, **19 tes terarah geometri/UI** dan `cargo build --locked --release --bin naf` lolos tanpa warning build. Matriks 78 frame tetap mencakup empat topologi, tiga profil ikon, lebar 12/25/60 yang muat dan semua fokus; rasio kolom juga memaksa grip menumpang corner untuk memastikan bentuknya tetap utuh.
+- Dua sesi release terisolasi: Nerd/truecolor membuktikan glyph di stroke/space/corner, empat panel, mouse/keyboard resize, hit teks/save yang diperiksa isi filenya, collapse 12×6 serta restore rasio. ASCII/none membuktikan dua frame minimum pada 12×11, fallback underscore, grow dan drag. Keduanya exit 0, mengembalikan termios dan menonaktifkan alternate screen; fixture, server tmux dan socket stale dibersihkan.
+- Raster dari sel TUI aktual dengan DejaVu Sans Mono lokal pada sel 10×20 memperlihatkan celah kiri–kanan dan atas–bawah yang sebanding. Warna raster disederhanakan untuk inspeksi posisi; bukan screenshot client pengguna. Metrik font/line height tetap dapat mengubah posisi pixel dan bentuk combining glyph; ASCII tersedia bila rendering glyph tidak sesuai.
+- SHA-256 release akhir: `316e1c0afbfbd0b78b38e52dd72aabcd70689293f1f873558d1e1b05d18cc60a`.
+- Batas: bukti sel/protokol dan raster font lokal; GUI/font fisik, input client, SSH dan CI belum dibuktikan. Tidak menjalankan security test atau suite seluruh target.
+
+### Hasil penghapusan indikator horizontal
+
+- Pengguna melaporkan glitch pada client dan menyetujui penghapusan titik horizontal. Seluruh indikator Rows dihapus, termasuk combining U+0324 Unicode/Nerd dan underscore ASCII; tidak diganti dengan glyph lain.
+- Dua frame, jarak, minimum dan hit resize tidak berubah. Renderer hanya menghias gap Columns; hit Rows tetap pada border bawah subtree atas. Helper/urutan overpaint khusus indikator Rows dihapus.
+- `cargo fmt --all`, **satu tes regresi UI** dan `cargo build --locked --release --bin naf` lolos tanpa warning. Matriks 78 frame memeriksa seluruh baris border bawah terhadap frame/corner/space normal, mencakup empat topologi, tiga profil ikon, lebar 12/25/60 yang muat dan semua fokus.
+- Sesi release Nerd/truecolor pada 120×32: empat panel; drag horizontal tanpa indikator, shortcut Alt+Shift+Up, drag kolom, corner normal tepat di bekas lokasi indikator, serta collapse 12×6 dan restore dengan geometry utuh.
+- Sesi release ASCII/none: dua panel minimum 12×11 memiliki border `+----------+` tanpa underscore. Setelah grow ke 80×24, drag/shortcut Rows serta grip `:` dan drag Columns tetap berfungsi.
+- Kedua sesi terisolasi exit 0, mengembalikan termios dan menonaktifkan alternate screen; isi fixture tidak berubah. Fixture, server tmux, socket dan helper sementara dibersihkan.
+- Batas: bukti sel/protokol TUI aktual, bukan GUI/font fisik client pengguna. Tidak menjalankan security test, suite seluruh target, SSH, packaging atau CI.
+
+### Hasil P1 aksesibilitas dan pencarian
+
+**P1 terpilih selesai; tahap 4 ditutup untuk matriks Linux yang sudah dibuktikan**, sesuai keputusan pengguna setelah batas fisik/non-loopback dijelaskan. Ini bukan persetujuan seluruh usulan P1/P2 audit atau klaim dukungan terminal/platform universal.
+
+- Dua worker implementasi AGY menangani renderer/helper/shortcut dan enumerasi match. Integrator memiliki state/action serta caller `app`, lalu mengintegrasikan dua review read-only AGY.
+- Temuan review berupa cache reload dengan revisi yang dipakai ulang, Find maju yang melewatkan overlap, dan hit mouse stale ketika membuka Search diperbaiki dengan regresi. Navigasi konfirmasi default Cancel, konteks path, resize explorer, helper 80 kolom, overflow disabled, prefill dan penghitung/wrap lulus alur nyata.
+- Seluruh eksekusi live pada batch ini dikerjakan `atmo/alicn/deepseek-v4.1-flash-1017`; integrator memeriksa laporan, log, data hasil dan screenshot emulator. Audit/security serta clipboard eksternal historis tidak dijalankan ulang; bukti sebelumnya tetap memiliki cakupan dan batasnya di [SECURITY](SECURITY.md#hasil-verifikasi-model-terpisah) dan [clipboard sistem](#hasil-clipboard-sistem-dan-konfigurasi-persisten).
+
+| Pemeriksaan | Hasil dan cakupan |
+|---|---|
+| Baseline P1 `efa4926d…` | Format check, `cargo test --locked --all-targets` **310/310** (dua example tanpa test), dan build release lolos. Matriks aplikasi **384 cek: 382 lolos, 2 gagal** pada override warna; bukan klaim 384 lolos |
+| Fix output warna `49c83ac2…` | Format check, satu regresi backend nyata dengan **5 subprocess terisolasi**, satu regresi helper, dan build release lolos; **21/21 pemeriksaan warna/font terarah** lolos. Suite 310, matriks 384 dan soak tidak diulang atau dialihkan ke hash ini |
+| Emulator/font aktual | xfce4-terminal 1.1.4/VTE pada Xvfb: Dark/truecolor/Nerd, Light/256/Unicode, Terminal/16/ASCII dan none/ASCII, termasuk dirty/seleksi/dialog/tiny/split. DejaVu Sans Mono, fallback CJK WQY, serta **JetBrainsMono Nerd Font Mono** upstream v3.5.1 dibuktikan dengan `fc-match` ke file scratch dan screenshot aktual |
+| Client tmux 3.5a | Client benar-benar attach melalui PTY; F1/F10, Ctrl+S/Q dan Alt+Shift+Right mencapai aplikasi. Prefix bawaan mengonsumsi satu Ctrl+B; Ctrl+B dua kali meneruskan toggle explorer |
+| SSH nyata | OpenSSH ke sshd loopback terisolasi `127.0.0.1:22222`; `SSH_CONNECTION`, edit/save bytes tepat, mouse SGR, resize dan termios remote terbukti. Bukan pengujian host non-loopback |
+| Penggunaan panjang | Pada baseline `efa4926d…`: **943,1 detik, 197 siklus, 0 error**; fixture 103.094 byte tetap ber-SHA `28cb058b59165b31e23429a25530c9d11dec28bbd212d49e871cab86e4e2e86e`. Exit 0 dan termios/alternate screen/mouse/bracketed paste dipulihkan |
+
+Sampel proses selama soak baseline; bukan batas CPU/RSS, bukti bebas kebocoran, atau SLA:
+
+| Sampel | CPU kumulatif (s) | RSS (KiB) | VmHWM (KiB) |
+|---|---:|---:|---:|
+| Awal | 0,01 | 5.624 | 5.684 |
+| Tengah | 5,93 | 5.892 | 5.892 |
+| Akhir | 11,87 | 5.892 | 5.892 |
+
+Temuan runtime warna diselesaikan, bukan disembunyikan dengan mengubah dokumentasi: `Theme` tetap meresolusikan Auto/`NO_COLOR`/override/None; `terminal::use_theme_color_policy()` mengizinkan backend Crossterm mengeluarkan token tema tanpa menerapkan `NO_COLOR` kedua kali. CLI truecolor/256 dan config truecolor kini menang; Auto+`NO_COLOR` serta None tetap tanpa warna. Tidak ada mutasi environment pengguna atau perubahan raw mode/probe/cleanup.
+
+Regresi baru memakai token accent, sebab foreground/canvas ANSI16 memang `Reset` sesuai desain. Perbaikan kompilasi tes UI dan assertion helper duplikat hanya menyentuh `cfg(test)`; tes helper menilai akses/hit geometry, bukan memaksa dua label F1.
+
+- SHA-256 release baseline P1: `efa4926d7f8c654839f6a6e70314d4157a770d86bfbd0f6cfeec490b5712fdfe`.
+- SHA-256 release akhir: `49c83ac2e2278c1441a2b6842e0e2520fe5c55d0d11a123ddfbe495cf5643c10`.
+- Cakupan penutupan: Linux x86_64 UTF-8, PTY, VTE/font aktual pada display virtual dengan input XTEST, client tmux dan SSH loopback di atas. Layar/input/font fisik pengguna, host SSH non-loopback, OS/emulator lain, palette/line-height kustom dan compositor glass tidak diklaim teruji. Discovery host tambahan tidak memberi akses autentikasi; tidak menebak credential.
+- Batas operasional dan hasil ukuran/baris besar tetap mengikuti [PRODUCT](PRODUCT.md#usulan-batas-dukungan-awal), [profil dokumen besar](#hasil-status-panjang-dan-profil-dokumen-besar) serta [geometri sparse](#hasil-geometri-sparse-untuk-baris-panjang); penutupan ini tidak mengubah batas menjadi jaminan latensi atau memori.
+- Publish, installer, CI remote dan packaging ulang bukan bagian batch ini. Penutupan penggunaan harian tidak menyatakan distribusi publik siap atau menghapus batas keamanan/filesystem yang sudah dicatat.
+- Cleanup: seluruh worker run telah exit dan terminalnya dilepas; tmux/Xvfb/sshd, socket, fixture, key, font/paket scratch serta driver uji dibersihkan. Evidence/log/laporan dipertahankan terpisah dari fixture; sumber ringkasan adalah `/tmp/naf-tahap4-verifikasi-final.md` dan `/tmp/naf-final-verify/evidence/`. Tidak menyentuh buffer/config/snapshot pengguna.
+
+### Hasil indent dan dedent blok
+
+- Pengguna menyetujui fitur editing berikutnya: indent/dedent blok, bukan scrollbar atau persiapan publish. Tab pada seleksi multibaris menambah empat spasi per baris; Shift+Tab menghapus satu tab awal atau hingga empat spasi. Range setengah-terbuka, blank/EOF, arah seleksi dan normal Tab satu baris mengikuti [kontrak](ARCHITECTURE.md#kontrak-indentdedent-blok).
+- `Document` menyimpan batch prefix ringkas sebagai satu history checkpoint, terpisah dari splice biasa; pemetaan view meminjam metadata history, tidak menyalin seluruh blok atau membuat String per baris. Forward diterapkan dari belakang, inversenya dari depan. Seluruh 17 caller bool workspace dimigrasikan ke `EditViewPolicy`; tidak ada shim.
+- Seluruh tes/live dilakukan `atmo/alicn/deepseek-v4.1-flash-1017`. Integrator membaca log, laporan dan screen aktual tanpa menjalankan ulang tes. Review read-only dialihkan ke model itu dengan persetujuan pengguna setelah AGY tidak tersedia; tidak ada klaim review AGY lolos pada batch ini.
+- Review read-only selesai tanpa temuan defect source-level pada empat kombinasi indent/dedent × forward/inverse, peminjaman metadata history, checkpoint dirty, remap shared view dan isolasi routing. Guard marker-vs-history tetap merupakan invariant internal yang dijaga semua jalur mutasi; tidak ditambah fallback palsu. Pemetaan inverse dedent prefix campuran/CRLF pada view lain ditelusuri manual, bukan diklaim memiliki regresi khusus.
+
+| Pemeriksaan terarah | Hasil |
+|---|---:|
+| `cargo test --locked --bin naf document::tests` | 25 lolos |
+| `cargo test --locked --bin naf workspace::tests` | 11 lolos |
+| `cargo test --locked --bin naf app::tests` | 77 lolos |
+| Skenario live tmux 3.5a/PTY | 23 lolos |
+
+- `cargo fmt --all -- --check`, build release `--locked --release --bin naf` serta CLI/F1 help berhasil. Lima regresi `indent_lines_*` dan empat `block_*` ikut berjalan; suite seluruh target tidak dijalankan.
+- Live membuktikan seleksi maju/balik dan endpoint awal baris berikutnya, Tab berulang, blank/EOF tanpa newline tambahan, tab stop CJK, dedent tab/1–4 spasi/prefix campuran/combining/ZWJ, no-op yang mempertahankan redo, serta satu undo yang memulihkan 200 baris sekaligus. Save BOM/CRLF mempertahankan bytes format; read-only dan modal/field/explorer tidak menerima edit bocor.
+- Dua pane shared dengan caret/seleksi interior pada baris berbeda menjaga posisi logis dan viewport setelah prefix berubah; undo/redo lintas pane mempertahankan satu teks/history. Resize 120×36→90×28→140×40 serta klik SGR pada teks bergeser sesuai kolom render. Find sesudah mutasi memperbarui match/posisi, bukan memakai hasil stale.
+- Sesi exit 0; termios sebelum/sesudah identik dan alternate screen/mouse/bracketed paste dipulihkan. Input berasal dari protokol tmux/PTY dan CSI Z untuk Shift+Tab, bukan perangkat fisik atau GUI/font baru. CSI-u/Kitty tidak dinegosiasikan dan tidak menjadi fallback; event Tab+Shift juga dicakup unit aplikasi.
+- SHA-256 release teruji: `fb0afd0d3268a654beb859fa37355b928e3dc8527787800a57416f1d7510ab6d`.
+- Batas: tidak mengulang audit keamanan, soak 15 menit, seluruh matriks font/SSH tahap 4, CI atau packaging. Ini bukan SLA performa/memori dan tidak mengubah batas operasional file/history.
+- Driver, HOME/XDG, server/socket dan fixture uji dibersihkan setelah hasil diperiksa; laporan serta log/screen/termios dipertahankan di `/tmp/naf-indent-live-final.md` dan `/tmp/naf-indent-evidence/`. Tidak mengubah file, snapshot, konfigurasi atau font pengguna.
+
+### Hasil scrollbar editor
+
+- Pengguna menyetujui scrollbar vertikal/horizontal per view editor, bukan scrollbar explorer/help/field atau persiapan publish. Track di dalam frame, klik page, drag thumb, ukuran minimum dan lebar horizontal mengikuti [kontrak](ARCHITECTURE.md#scrollbar-editor).
+- Integrator memformat source yang berubah dan membangun release; seluruh tes dan live dijalankan `atmo/alicn/deepseek-v4.1-flash-1017`. Dua tugas QA independen memakai fixture/HOME/XDG serta tmux/PTY terisolasi, tanpa edit repository. AGY tidak dipakai pada batch ini.
+- Putaran awal menemukan dua kegagalan tes serta tiga defect runtime: rail satu sel dengan thumb nol pada gutter tujuh digit; offset horizontal pane nonaktif tidak dinormalisasi saat lebar bertambah; kembali ke sel endpoint thumb terkuantisasi mempertahankan offset lama. Integrator memperbaiki ketiganya, memisahkan redraw metadata dari invalidasi syntax, menghapus assertion timing internal satu-render-step, serta memigrasikan fixture cursor ke ukuran yang masih memuat barisnya.
+
+| Filter tes `cargo test --locked --bin naf` | Putaran awal | Setelah perbaikan |
+|---|---|---|
+| `document::tests` | 25 lolos | Tidak diulang; source tidak berubah |
+| `workspace::tests` | 11 lolos | Tidak diulang; source tidak berubah |
+| `app::tests` | 78 lolos, 1 gagal | 80 lolos, termasuk regresi resize pane nonaktif |
+| `ui::tests` | 39 lolos, 1 gagal | Regresi cursor yang gagal: 1 lolos; 39 lainnya tidak diulang |
+| `chrome::tests` | 4 lolos | 4 lolos, termasuk minimum track dua sel |
+| `scrollbar::tests` | 3 lolos | 3 lolos, termasuk endpoint terkuantisasi |
+
+- Recheck akhir berjumlah **88 tes terarah lolos**, tanpa suite seluruh target. Build `cargo build --locked --release --bin naf` berhasil. Integrator membaca log tes dan tangkapan layar aktual, tidak menjalankan ulang tes.
+- Live awal membuktikan track/page/drag kedua sumbu, view shared F8/F9, wheel yang berbatas sama, cursor/seleksi/dirty tetap, CJK/tab/combining/ZWJ/CRLF, refresh sesudah edit/undo, resize kecil dan fallback, ASCII/Unicode/Nerd serta output background default terminal. Pada build awal `d9f03e5…`, pengukuran lebar baris sekitar 4 MiB selesai sekitar 9,27 detik setelah launch; input tetap diproses ketika `?` tampil. Ini observasi satu host, bukan SLA atau jaminan giant grapheme.
+- Live build akhir mengulang kasus yang terdampak: pada 12×18 dengan satu juta baris, horizontal rail disembunyikan, row tambahan menjadi teks dan vertical/keyboard/wheel tetap berfungsi; smoke 80×24 serta 100×35 menjaga kedua sumbu. Resize divider dan terminal dengan tinggi tetap menormalisasi pane nonaktif sampai satu sel caret EOL, bukan halaman kosong. Press/no-motion tidak melompat; kembali ke sel pertama/terakhir mencapai 0/maksimum tanpa keluar track.
+- Resize pane aktif tetap boleh mengikuti caret seperti sebelumnya; normalisasi viewport tidak mengubah cursor/seleksi/fokus. Release lintas pane, ketik/undo sesudahnya dan pemulihan setelah resize lulus. Exit 0 dan termios identik; alternate screen, mouse dan bracketed paste dipulihkan pada pemeriksaan yang direkam.
+- SHA-256 release akhir teruji: `16677d3446c62b94aaf107512d8b14c4658dbb89304caeffa069c9056a58a357`.
+- Batas: input/protokol dan output berasal dari tmux/PTY Linux, bukan mouse/font/glass fisik. Tidak mengulang audit keamanan, soak, font/SSH matrix tahap 4, CI atau packaging; pengukuran 4 MiB tidak diulang setelah perbaikan batas. Penutupan tahap 4 sebelumnya tidak diperluas ke platform baru.
+- Laporan awal: `/tmp/naf-scrollbar-core-final.md` dan `/tmp/naf-scrollbar-edge-final.md`; recheck: `/tmp/naf-scrollbar-recheck-core-final.md` dan `/tmp/naf-scrollbar-recheck-edge-final.md`. Log/screen/termios dipertahankan pada direktori `*-evidence` masing-masing. Fixture, HOME/XDG, driver dan prompt sementara dibersihkan; seluruh worker sukses telah exit dan terminalnya dilepas. Rekam startup gagal tetap historis dengan `ownership_transferred`, bukan proses aktif yang perlu ditutup paksa.
+
+### Hasil scrollbar Explorer dan F1
+
+- Batch lanjutan menambahkan rail vertikal pada tree dan katalog bantuan, dengan [kontrak geometri/input](ARCHITECTURE.md#scrollbar-explorer-dan-f1). Scrollbar horizontal Explorer, indikator overflow field, theme/keymap runtime serta publish tetap terpisah.
+- Integrator memformat lima file source yang berubah dan membangun `cargo build --locked --release --bin naf`. Tes dan TUI nyata dijalankan dua tugas read-only `atmo/alicn/deepseek-v4.1-flash-1017` pada binary beku yang sama, memakai fixture/HOME/XDG dan server tmux/PTY sendiri. AGY tidak dipakai.
+
+| Filter `cargo test --locked --bin naf` | Kasus berbeda yang lulus |
+|---|---|
+| `app::tests` | 82 |
+| `ui::tests` | 40 |
+| `chrome::tests` | 4 |
+| `help::tests -- --test-threads=1` | 4 |
+
+- Total **130 kasus berbeda lulus, 0 gagal**, termasuk regresi `explorer_scrollbar_preserves_selection_focus_and_document_and_rejects_changed_rows` dan `help_scrollbar_preserves_suspended_field_and_cancels_on_resize_or_keys`. Filter chrome tercatat berulang pada log worker; angka tabel menghitung kasus berbeda, bukan jumlah eksekusi. Suite seluruh target tidak dijalankan.
+- Live Explorer membuktikan klik page, drag/no-motion/endpoint, wheel clamp, release lintas editor, pilihan/fokus/caret/dirty/undo tetap, expand/collapse/refresh, parent row serta divider independen. Folder kosong/satu entry memiliki rail disabled; tinggi minimum 120×6 menyembunyikan rail dan tetap menerima keyboard/wheel. Hide, resize sempit dan perubahan konteks membatalkan capture lama; resize tetap boleh memunculkan pilihan sesuai perilaku sebelumnya.
+- Live F1 membuktikan rail/footer terpisah, page/drag/wheel/keyboard sampai akhir katalog, wrapping dan limit yang konsisten pada 80×24, 120×36, 40×10 dan 20×6; 19×5 memakai tiny tanpa rail. Resize saat End atau thumb ditahan tidak menyisakan drag. Find/Replace, Open/Save As serta konfirmasi unsaved kembali dengan state yang sama; pointer di belakang popup tidak diteruskan ke editor/tree.
+- Smoke editor kedua sumbu tetap menjaga cursor/seleksi; key membatalkan capture. ASCII/Unicode/Nerd opt-in, SGR default terminal, CLI/F1 katalog gesture serta exit 0 dan pemulihan termios/alternate-screen/mouse/paste dibuktikan dari capture/stream. Integrator membaca hasil tes dan tangkapan layar aktual, tidak menjalankan ulang tes.
+- SHA-256 release teruji: `90de52fe93c40cbcfc48fb46050f9d2eba1f1624ab07e75bf143da04eb318d32`.
+- Batas: Linux tmux/PTY dengan input mouse SGR sintetis, bukan mouse/font/glass fisik. Burst event live tidak menjamin batching sebelum redraw; guard stale-hit juga dicakup regresi unit. Help selalu lebih panjang dari viewport, sehingga rail disabled pada konten yang muat bukan skenario live Help. Tidak mengulang audit keamanan, soak, SSH/font matrix, 4 MiB, CI atau packaging; tidak memperluas penutupan tahap 4 ke platform baru.
+- Laporan: `/tmp/naf-nav-scroll-core-final.md` dan `/tmp/naf-nav-scroll-help-final.md`; log, capture dan stream berada di `/tmp/naf-nav-scroll-core-evidence/` dan `/tmp/naf-nav-scroll-help-evidence/`.
+- Fixture/HOME/XDG, driver, helper dan prompt sementara milik batch dibersihkan setelah hasil diperiksa; laporan serta bukti runtime dipertahankan. Server tmux uji sudah dihentikan oleh worker dan kedua terminal worker sukses telah dilepas. Startup Help yang gagal memakai terminal yang kemudian berhasil dipakai retry; terminal tersebut tidak ditutup paksa melalui rekam gagal.
+
+
+
+
+
+
 ## Disiplin verifikasi
 
 - Gunakan unit test untuk invariant dokumen, transaksi, checkpoint, posisi view, dan layout; bukan snapshot wording atau source text.
@@ -459,12 +702,12 @@ Binary sebelum SHA-256 `fbc1ffa669c47d907378071a59ab2311e2f679ec78aedc47808cc101
 
 ## Fitur tambahan — session restore
 
-Dicatat atas permintaan pengguna untuk kenyamanan ala Notepad, bukan perluasan menuju IDE. **Belum diimplementasikan**, dan tidak menjadi prasyarat penyelesaian batch clipboard/konfigurasi atau janji rilis.
+Fitur tambahan ini kini **tersedia untuk exit normal**, bukan perluasan menuju IDE atau syarat baru batch clipboard/konfigurasi yang sudah selesai.
 
-- Rencana cakupan: membuka kembali file dan urutan tab, panel aktif, layout split, serta posisi cursor/scroll.
-- Pemulihan dokumen Untitled dan perubahan belum disimpan juga perlu dirancang agar pengalaman session benar-benar berguna; jangan menganggap menyimpan daftar path sudah melindungi buffer tersebut.
-- Sebelum implementasi, tetapkan izin/lokasi snapshot, penanganan snapshot rusak, file hilang/berubah di luar aplikasi, dan privasi isi buffer. Restore tidak boleh menimpa file sumber secara diam-diam.
-- Session restore berbeda dari crash recovery. Saat ini keluar tetap menggunakan Save/Discard/Cancel; tidak ada penyimpanan sesi, autosave, atau jaminan pemulihan setelah crash.
+- `naf` tanpa path memulihkan file/buffer, tab dan urutannya, panel aktif, layout split, cursor/selection/scroll dan root/visibility/fokus/lebar explorer. Untitled serta perubahan belum disimpan ikut disimpan, bukan sekadar daftar path.
+- Pengguna memilih aktivasi otomatis. Ctrl+Q menyimpan sesi lalu keluar hanya jika sukses; `--no-session` dan launch file/folder tetap terpisah dengan Save/Discard/Cancel. Close tab/panel tetap memeriksa dirty final view.
+- Snapshot privat tidak dienkripsi; lokasi/batas/lock/format ditetapkan di ARCHITECTURE.md. Restore memulihkan buffer persis dan baseline asli, bukan reload atau overwrite sumber secara diam-diam. Undo/redo dimulai ulang setelah restore.
+- Session restore berbeda dari crash recovery: tidak ada autosave atau snapshot baru saat signal/panic/proses mati. Perubahan/discard dalam sesi yang berakhir abnormal tidak mengganti snapshot exit normal sebelumnya.
 
 ## Distribusi — installer saat publish
 

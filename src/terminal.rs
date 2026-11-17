@@ -206,7 +206,13 @@ impl TerminalSession {
     }
 }
 
-fn verify_tty() -> io::Result<()> {
+/// The editor theme already resolves config/CLI and environment precedence.
+/// Do not let the backend independently apply NO_COLOR a second time.
+pub(crate) fn use_theme_color_policy() {
+    crossterm::style::force_color_output(true);
+}
+
+pub(crate) fn verify_tty() -> io::Result<()> {
     if !io::stdin().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -271,4 +277,75 @@ fn restore_active_modes() -> io::Result<()> {
     drop(stdout);
     restore_mode!(MODE_RAW, disable_raw_mode());
     first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_theme_color_policy;
+    use crate::theme::{ColorMode, Theme, ThemeKind};
+    use ratatui::{
+        backend::{Backend, CrosstermBackend},
+        buffer::Cell,
+    };
+
+    #[test]
+    fn theme_policy_controls_real_backend_output() {
+        const CASE_ENV: &str = "NAF_TEST_THEME_COLOR_CASE";
+        let Ok(case) = std::env::var(CASE_ENV) else {
+            // Crossterm caches a process-global flag. Isolate each environment
+            // instead of racing the rest of the suite with set_var/force calls.
+            let thread = std::thread::current();
+            let name = thread.name().expect("test thread has a name");
+            for case in ["truecolor", "256", "16", "none", "auto"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture"])
+                    .env(CASE_ENV, case)
+                    .env("NO_COLOR", "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        };
+        let mode = match case.as_str() {
+            "truecolor" => ColorMode::Truecolor,
+            "256" => ColorMode::Ansi256,
+            "16" => ColorMode::Ansi16,
+            "none" => ColorMode::None,
+            "auto" => ColorMode::Auto,
+            _ => panic!("unknown isolated color case"),
+        };
+        let theme = Theme::new(ThemeKind::Dark, mode);
+        use_theme_color_policy();
+        let mut cell = Cell::new("x");
+        // ANSI16 deliberately inherits the terminal foreground and canvas.
+        // Exercise a semantic color rather than assuming text must be colored.
+        cell.set_fg(theme.accent).set_bg(theme.canvas);
+        let mut bytes = Vec::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut bytes);
+            backend.draw(std::iter::once((0, 0, &cell))).unwrap();
+        }
+        let ansi = String::from_utf8(bytes).unwrap();
+        let has_color = ansi.split("\x1b[").any(|sequence| {
+            let Some((parameters, _)) = sequence.split_once('m') else {
+                return false;
+            };
+            parameters.split(';').any(|parameter| {
+                parameter
+                    .parse::<u16>()
+                    .is_ok_and(|value| matches!(value, 30..=38 | 40..=48 | 90..=97 | 100..=107))
+            })
+        });
+        assert_eq!(
+            has_color,
+            !matches!(mode, ColorMode::None | ColorMode::Auto),
+            "resolved {case} under NO_COLOR=1 emitted {ansi:?}",
+        );
+    }
 }

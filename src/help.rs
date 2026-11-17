@@ -19,9 +19,9 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::shortcuts::SECTIONS;
 use crate::theme::{IconMode, Theme};
 use crate::ui::{self, CommandHit, MIN_DIALOG_SIZE};
+use crate::{layout::Axis, scrollbar::Scrollbar, shortcuts::SECTIONS};
 
 /// Largest help dialog width; wider terminals center it with side margins.
 const HELP_MAX_WIDTH: u16 = 72;
@@ -365,12 +365,17 @@ impl RowStream {
 /// Counts every visual row of the catalog at `wrap_width` using the same
 /// traversal as drawing, without allocating.
 fn total_rows(wrap_width: u16) -> usize {
-    let mut stream = RowStream::new(wrap_width);
-    let mut rows = 0usize;
-    while stream.next_row().is_some() {
-        rows += 1;
-    }
-    rows
+    static COUNTS: [std::sync::OnceLock<usize>; HELP_MAX_WIDTH as usize] =
+        [const { std::sync::OnceLock::new() }; HELP_MAX_WIDTH as usize];
+    // Layout bounds every catalog width below HELP_MAX_WIDTH; the catalog is static.
+    *COUNTS[usize::from(wrap_width)].get_or_init(|| {
+        let mut stream = RowStream::new(wrap_width);
+        let mut rows = 0;
+        while stream.next_row().is_some() {
+            rows += 1;
+        }
+        rows
+    })
 }
 
 /// Shared overlay geometry for a viewport-sized area. Below
@@ -382,6 +387,7 @@ fn layout(viewport: Rect) -> HelpLayout {
             tiny: true,
             popup: viewport,
             catalog: Rect::default(),
+            scrollbar: None,
             footer: Rect {
                 x: viewport.x,
                 y: viewport.y.saturating_add(height.saturating_sub(1)),
@@ -404,6 +410,7 @@ fn layout(viewport: Rect) -> HelpLayout {
         width: popup_w - 2,
         height: popup_h - 3,
     };
+    let (catalog, scrollbar) = crate::chrome::scroll_rows(catalog);
     let footer = Rect {
         x: popup.x + 1,
         y: popup.y + popup_h - 2,
@@ -414,6 +421,7 @@ fn layout(viewport: Rect) -> HelpLayout {
         tiny: false,
         popup,
         catalog,
+        scrollbar,
         footer,
     }
 }
@@ -422,6 +430,7 @@ struct HelpLayout {
     tiny: bool,
     popup: Rect,
     catalog: Rect,
+    scrollbar: Option<Rect>,
     footer: Rect,
 }
 
@@ -440,7 +449,7 @@ pub(crate) fn scroll_limit(width: u16, height: u16) -> usize {
     if layout.tiny {
         return 0;
     }
-    total_rows(layout.catalog.width).saturating_sub(page_size(width, height))
+    total_rows(layout.catalog.width).saturating_sub(usize::from(layout.catalog.height))
 }
 
 /// Renders the help overlay: clears the dialog area, streams the wrapped
@@ -455,11 +464,11 @@ pub(crate) fn draw(
     theme: &Theme,
     icons: IconMode,
     commands: &mut Vec<CommandHit>,
-) {
+) -> Option<Scrollbar> {
     let layout = layout(viewport);
     if layout.tiny {
         draw_too_small(frame, layout.popup, layout.footer, theme, commands);
-        return;
+        return None;
     }
 
     frame.render_widget(Clear, layout.popup);
@@ -467,6 +476,21 @@ pub(crate) fn draw(
         ui::dialog_block("Help", crate::theme::ChromeIcon::Help, theme, icons),
         layout.popup,
     );
+
+    let total = total_rows(layout.catalog.width);
+    let scroll = scroll.min(total.saturating_sub(usize::from(layout.catalog.height)));
+    let scrollbar = layout.scrollbar.map(|track| {
+        Scrollbar::new(
+            track,
+            Axis::Rows,
+            scroll,
+            usize::from(layout.catalog.height),
+            total,
+        )
+    });
+    if let Some(bar) = scrollbar {
+        ui::draw_scrollbar(frame, bar.track, Axis::Rows, Some(bar), true, theme, icons);
+    }
 
     let buf = frame.buffer_mut();
     draw_footer(buf, layout.footer, theme, commands);
@@ -478,14 +502,9 @@ pub(crate) fn draw(
     let desc_style = Style::default().fg(theme.muted);
 
     let mut stream = RowStream::new(layout.catalog.width);
-    let scroll = if scroll == 0 {
-        0
-    } else {
-        scroll.min(total_rows(layout.catalog.width).saturating_sub(layout.catalog.height as usize))
-    };
     for _ in 0..scroll {
         if stream.next_row().is_none() {
-            return;
+            return scrollbar;
         }
     }
     for row_y in layout.catalog.top()..layout.catalog.bottom() {
@@ -516,6 +535,7 @@ pub(crate) fn draw(
             );
         }
     }
+    scrollbar
 }
 
 /// Draws the visible static return chips and appends a [`CommandHit`] with
@@ -674,7 +694,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let viewport = frame.area();
-                    draw(
+                    let _ = draw(
                         frame,
                         viewport,
                         offset,

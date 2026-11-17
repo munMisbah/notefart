@@ -12,7 +12,9 @@ mod highlight;
 mod input;
 mod layout;
 mod probe;
+mod scrollbar;
 mod search;
+mod session;
 mod shortcuts;
 mod syntax;
 mod terminal;
@@ -36,6 +38,7 @@ const HELP: &str = concat!(
     "  --clipboard auto|internal|system     Clipboard backend for copy and paste\n",
     "  --config PATH                        Preferences file (default: user config)\n",
     "  --no-config                          Ignore saved preferences\n",
+    "  --no-session                       Disable session restore and snapshots\n",
     "  --save-config                        Save merged preferences and exit\n",
     "  --probe                             Input diagnostics, no editor options\n",
     "  --help                              Show this help\n",
@@ -43,6 +46,11 @@ const HELP: &str = concat!(
     "Preferences: $XDG_CONFIG_HOME/notefart/config.toml (or $HOME/.config/notefart/config.toml).\n",
     "Precedence: built-ins < user file < CLI flags. --save-config cannot be combined with\n",
     "--no-config or an initial path; --probe rejects editor and preference options.\n\n",
+    "Plain naf restores buffers from the previous normal exit. Ctrl+Q saves that session,\n",
+    "not the source files. --no-session or a FILE/FOLDER argument uses separate editing\n",
+    "with Save/Discard/Cancel on quit. Session snapshots are private, not encrypted.\n",
+    "The explorer starts visible without a path or with FOLDER, hidden with FILE.\n",
+    "Ctrl+B shows or hides the explorer, including in a restored session.\n\n",
     "UTF-8 with LF/CRLF and optional BOM; Linux terminal required.\n",
 );
 
@@ -56,6 +64,7 @@ enum Command {
         overrides: config::CliOverrides,
         source: config::Source,
         save_config: bool,
+        no_session: bool,
     },
 }
 
@@ -91,6 +100,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, &'sta
     let mut explicit_config: Option<PathBuf> = None;
     let mut no_config = false;
     let mut save_config = false;
+    let mut no_session = false;
     let mut path = None;
     let mut probe = false;
     let mut editor_option = false;
@@ -104,6 +114,11 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, &'sta
         }
         if arg == "--probe" {
             probe = true;
+            continue;
+        }
+        if arg == "--no-session" {
+            no_session = true;
+            editor_option = true;
             continue;
         }
         if arg == "--no-config" {
@@ -203,6 +218,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, &'sta
         overrides,
         source,
         save_config,
+        no_session,
     })
 }
 
@@ -246,6 +262,7 @@ fn main() -> ExitCode {
             overrides,
             source,
             save_config,
+            no_session,
         } => {
             let env = config::Env::from_process();
             if save_config {
@@ -264,7 +281,10 @@ fn main() -> ExitCode {
                 }
             } else {
                 match config::resolve(&source, &env, &overrides) {
-                    Ok(options) => report_io(app::run(path, options)),
+                    Ok(options) => {
+                        let session_enabled = path.is_none() && !no_session;
+                        report_io(app::run(path, options, session_enabled))
+                    }
                     Err(error) => {
                         eprintln!("naf: {}", error.to_string().escape_default());
                         ExitCode::FAILURE
@@ -314,6 +334,7 @@ mod tests {
             overrides,
             source,
             save_config,
+            ..
         } = a
         else {
             panic!("expected editor command");
@@ -366,6 +387,7 @@ mod tests {
         assert!(parse(&["--probe", "--save-config"]).is_err());
         assert!(parse(&["--probe", "--config", "a.toml"]).is_err());
         assert!(parse(&["--probe", "--no-config"]).is_err());
+        assert!(parse(&["--probe", "--no-session"]).is_err());
         assert!(parse(&["--probe", "--clipboard", "internal"]).is_err());
         assert!(parse(&["--clipboard", "bogus"]).is_err());
         assert_eq!(parse(&["--probe"]).unwrap(), Command::Probe);

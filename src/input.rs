@@ -29,6 +29,17 @@
 //! - OSC sequences (OSC 52 clipboard reads, color queries, etc.).
 //! - Legacy non-SGR mouse tracking (X10 / normal mouse mode).
 //! - SIGWINCH parser (window resize is queried via ioctl on terminal timeout).
+//!
+//! # Control-string idle warning
+//!
+//! `ESC ]` / `ESC P` / `ESC ^` / `ESC _` / `ESC X` are simultaneously legacy `Alt`+key
+//! encodings and OSC/DCS/PM/APC/SOS openers. The decoder always keeps draining to `BEL`
+//! or ST; it never turns an unfinished payload into a shortcut. If that drain (or a bare
+//! SS3 prefix `ESC O`) still holds input after the caller's idle delay, it yields
+//! [`InputEvent::ControlSequencePending`] exactly once so the UI can offer `Ctrl+G`
+//! recovery. Once the parser is safe again, [`InputEvent::ControlSequenceResumed`] is
+//! emitted only for a warning that was actually announced. `BEL` inside a control string
+//! remains a terminator, not an executed key.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -56,6 +67,12 @@ pub enum InputEvent {
     Terminal(Event),
     /// A bracketed paste that was rejected because it exceeded 1 MiB or contained invalid UTF-8.
     PasteRejected,
+    /// An unsupported control string (OSC/DCS/PM/APC/SOS) or bare SS3 prefix is still
+    /// holding input after the idle delay. Carries no payload; emitted once per episode.
+    ControlSequencePending,
+    /// The decoder finished draining the control string or SS3 prefix and is safe again.
+    /// Emitted only if [`InputEvent::ControlSequencePending`] was announced first.
+    ControlSequenceResumed,
 }
 
 /// Linux single-threaded bounded input reader.
@@ -83,6 +100,10 @@ impl Input {
     /// - Returns `Ok(Some(event))` when an event is ready.
     /// - Returns `Ok(None)` on timeout or `EINTR`.
     /// - Returns `Err(UnexpectedEof)` on stdin EOF/hangup.
+    ///
+    /// On idle timeout the decoder flushes a lone `ESC` or announces
+    /// [`InputEvent::ControlSequencePending`] when an unfinished control string or bare
+    /// SS3 prefix is still holding input.
     pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<InputEvent>> {
         // 1. Check if the decoder already has an event ready to yield from previously buffered bytes.
         if let Some(event) = self.decoder.next_event() {
@@ -106,7 +127,7 @@ impl Input {
             Err(err) => Err(io::Error::from(err)),
             Ok(0) => {
                 // Timeout elapsed with no new data.
-                // Flush pending lone Escape key if present after idle.
+                // Flush a lone Escape or warn once about an unfinished control string.
                 if self.last_read.elapsed() >= Duration::from_millis(30) {
                     Ok(self.decoder.flush_escape())
                 } else {
@@ -154,6 +175,7 @@ pub(crate) struct StreamingDecoder {
     discarding_overlong_csi: bool,
     discarding_string: bool,
     string_escape: bool,
+    pending_announced: bool,
 }
 
 impl StreamingDecoder {
@@ -168,6 +190,7 @@ impl StreamingDecoder {
             discarding_overlong_csi: false,
             discarding_string: false,
             string_escape: false,
+            pending_announced: false,
         }
     }
 
@@ -180,10 +203,14 @@ impl StreamingDecoder {
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// Flushes any pending lone escape character after an idle timeout.
+    /// Flushes idle-held input: a lone `ESC`, or an announced-once warning for a control
+    /// string / bare SS3 prefix that is still swallowing bytes.
     pub(crate) fn flush_escape(&mut self) -> Option<InputEvent> {
         if self.in_paste {
             return None;
+        }
+        if self.discarding_string {
+            return self.announce_pending();
         }
         if self.cursor < self.buffer.len() {
             let remaining = &self.buffer[self.cursor..];
@@ -195,13 +222,38 @@ impl StreamingDecoder {
                     KeyModifiers::NONE,
                 ))));
             }
+            if remaining == b"\x1bO" {
+                // Bare SS3 prefix (for example legacy Alt+Shift+O) is holding input.
+                return self.announce_pending();
+            }
         }
         None
+    }
+
+    /// Emits [`InputEvent::ControlSequencePending`] at most once per trapped episode.
+    fn announce_pending(&mut self) -> Option<InputEvent> {
+        if self.pending_announced {
+            return None;
+        }
+        self.pending_announced = true;
+        Some(InputEvent::ControlSequencePending)
+    }
+
+    /// True while the buffered bytes cannot make progress without more terminal input.
+    fn holds_input(&self) -> bool {
+        if self.discarding_string {
+            return true;
+        }
+        self.buffer.get(self.cursor..) == Some(&b"\x1bO"[..])
     }
 
     /// Parses and produces the next available input event from buffered bytes.
     pub(crate) fn next_event(&mut self) -> Option<InputEvent> {
         loop {
+            if self.pending_announced && !self.holds_input() {
+                self.pending_announced = false;
+                return Some(InputEvent::ControlSequenceResumed);
+            }
             if self.discarding_string {
                 while self.cursor < self.buffer.len() {
                     let byte = self.buffer[self.cursor];
@@ -218,6 +270,9 @@ impl StreamingDecoder {
                     self.cursor = 0;
                     return None;
                 }
+                // The terminator was consumed; re-enter the loop so an announced
+                // pending warning is resumed before buffered bytes are decoded.
+                continue;
             }
             if self.discarding_overlong_csi {
                 while self.cursor < self.buffer.len() {
@@ -511,6 +566,14 @@ impl StreamingDecoder {
                 return EscapeParseResult::Incomplete;
             }
             let c = self.buffer[self.cursor + 2];
+            if c == 0x1b {
+                // A new escape begins where the SS3 parameter byte belongs. Drop the dangling
+                // prefix without consuming the new ESC so the next sequence (for example the
+                // bracketed-paste opener `\x1b[200~`) is parsed from its own first byte instead
+                // of being decoded as keyboard input.
+                self.cursor += 2;
+                return EscapeParseResult::Discarded;
+            }
             self.cursor += 3;
             if let Some(event) = parse_ss3(c) {
                 EscapeParseResult::Event(event)
@@ -1372,6 +1435,7 @@ mod tests {
         for prefix in [
             b"\x1b[".to_vec(),
             [b"\x1b[".as_slice(), &[b'9'; 80]].concat(),
+            b"\x1bO".to_vec(),
         ] {
             let mut decoder = StreamingDecoder::new();
             decoder.feed(&prefix);
@@ -1381,18 +1445,55 @@ mod tests {
                 decoder.next_event(),
                 Some(InputEvent::Terminal(Event::Paste("safe\x11".into())))
             );
+            assert_eq!(decoder.next_event(), None);
         }
+    }
+
+    #[test]
+    fn dangling_ss3_prefix_does_not_swallow_a_following_escape() {
+        let mut decoder = StreamingDecoder::new();
+        decoder.feed(b"\x1bO");
+        assert_eq!(decoder.next_event(), None);
+
+        // The new ESC must be parsed from its own first byte: the double escape emits one Esc
+        // instead of the pair being consumed as an unknown SS3 sequence.
+        decoder.feed(b"\x1b\x1b");
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            ))))
+        );
+        assert_eq!(decoder.next_event(), None);
     }
 
     #[test]
     fn osc_payload_is_discarded_through_bel_or_fragmented_st() {
         for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
             let mut decoder = StreamingDecoder::new();
-            for fragment in [b"\x1b]10;".as_slice(), b"rgb:ffff\x11", terminator] {
-                decoder.feed(fragment);
-                assert_eq!(decoder.next_event(), None);
-                assert_eq!(decoder.flush_escape(), None);
-            }
+            decoder.feed(b"\x1b]10;");
+            assert_eq!(decoder.next_event(), None);
+            // Idle warning is announced exactly once while the string holds input.
+            assert_eq!(
+                decoder.flush_escape(),
+                Some(InputEvent::ControlSequencePending)
+            );
+            assert_eq!(decoder.flush_escape(), None);
+
+            // Payload continues to be swallowed, including embedded shortcut bytes.
+            decoder.feed(b"rgb:ffff\x11");
+            assert_eq!(decoder.next_event(), None);
+            assert_eq!(decoder.flush_escape(), None);
+
+            decoder.feed(terminator);
+            assert_eq!(
+                decoder.next_event(),
+                Some(InputEvent::ControlSequenceResumed)
+            );
+            assert_eq!(decoder.next_event(), None);
+            assert_eq!(decoder.flush_escape(), None);
+
             decoder.feed(b"a");
             assert_eq!(
                 decoder.next_event(),
@@ -1402,6 +1503,105 @@ mod tests {
                 ))))
             );
         }
+    }
+
+    #[test]
+    fn complete_control_string_without_idle_emits_no_pending_or_resume() {
+        let mut decoder = StreamingDecoder::new();
+        decoder.feed(b"\x1b]10;");
+        assert_eq!(decoder.next_event(), None);
+        decoder.feed(b"rgb:ffff");
+        assert_eq!(decoder.next_event(), None);
+        decoder.feed(b"\x1b\\");
+        assert_eq!(decoder.next_event(), None);
+        decoder.feed(b"a");
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE
+            ))))
+        );
+        assert_eq!(decoder.next_event(), None);
+    }
+
+    #[test]
+    fn ctrl_g_terminates_pending_string_without_executing_payload() {
+        let mut decoder = StreamingDecoder::new();
+        // OSC opener is byte-identical to legacy Alt+]; payload embeds Ctrl+Q and a paste opener.
+        decoder.feed(b"\x1b]0;title\x11\x1b[200~");
+        assert_eq!(decoder.next_event(), None);
+        assert_eq!(
+            decoder.flush_escape(),
+            Some(InputEvent::ControlSequencePending)
+        );
+        assert_eq!(decoder.next_event(), None);
+
+        // Ctrl+G (BEL) ends the string and clears the warning; nothing from the payload ran.
+        decoder.feed(b"\x07");
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::ControlSequenceResumed)
+        );
+        assert_eq!(decoder.next_event(), None);
+
+        // A real Ctrl+G after the terminator is decoded normally.
+        decoder.feed(b"\x07");
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL
+            ))))
+        );
+    }
+
+    #[test]
+    fn bare_ss3_idle_announces_pending_and_resumes_before_following_key() {
+        let mut decoder = StreamingDecoder::new();
+        // Legacy Alt+Shift+O is a bare SS3 prefix.
+        decoder.feed(b"\x1bO");
+        assert_eq!(decoder.next_event(), None);
+        assert_eq!(
+            decoder.flush_escape(),
+            Some(InputEvent::ControlSequencePending)
+        );
+        assert_eq!(decoder.flush_escape(), None);
+
+        decoder.feed(b"P");
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::ControlSequenceResumed)
+        );
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::F(1),
+                KeyModifiers::NONE
+            ))))
+        );
+    }
+
+    #[test]
+    fn pending_ss3_resynchronizes_to_new_escape_without_swallowing_paste() {
+        let mut decoder = StreamingDecoder::new();
+        decoder.feed(b"\x1bO");
+        assert_eq!(decoder.next_event(), None);
+        assert_eq!(
+            decoder.flush_escape(),
+            Some(InputEvent::ControlSequencePending)
+        );
+
+        decoder.feed(b"\x1b[200~safe\x11\x1b[201~");
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::ControlSequenceResumed)
+        );
+        assert_eq!(
+            decoder.next_event(),
+            Some(InputEvent::Terminal(Event::Paste("safe\x11".into())))
+        );
+        assert_eq!(decoder.next_event(), None);
     }
 
     #[test]

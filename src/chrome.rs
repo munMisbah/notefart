@@ -20,6 +20,8 @@ pub(crate) struct PaneAreas {
     pub tabs: Rect,
     pub gutter: Rect,
     pub text: Rect,
+    pub vertical_scrollbar: Option<Rect>,
+    pub horizontal_scrollbar: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +29,7 @@ pub(crate) struct SidebarAreas {
     pub panel: Option<Rect>,
     pub parent: Option<Rect>,
     pub rows: Option<Rect>,
+    pub scrollbar: Option<Rect>,
     pub divider: Option<Rect>,
     pub editor: Rect,
 }
@@ -107,21 +110,45 @@ pub(crate) fn pane_min_width(lines: usize) -> u16 {
 pub(crate) fn pane_areas(panel: Rect, lines: usize) -> PaneAreas {
     let inside = inner(panel);
     let tabs = Rect::new(inside.x, inside.y, inside.width, inside.height.min(1));
-    let y = inside.y + tabs.height;
-    let height = inside.height.saturating_sub(tabs.height);
+    let text_offset = tabs.height + u16::from(inside.height >= 3);
+    let y = inside.y + text_offset;
+    let height = inside.height.saturating_sub(text_offset);
     let gutter_width = u16::try_from(line_digits(lines) + 1)
         .unwrap_or(u16::MAX)
         .min(inside.width);
+    let body_width = inside.width - gutter_width;
+    // Each active rail needs two cells after reserving the other axis.
+    let horizontal = height >= 2 && body_width >= 2 && (height == 2 || body_width >= 3);
+    let text_height = height - u16::from(horizontal);
+    let vertical = text_height >= 2 && body_width >= 2;
+    let text_width = body_width - u16::from(vertical);
     PaneAreas {
         tabs,
-        gutter: Rect::new(inside.x, y, gutter_width, height),
-        text: Rect::new(
-            inside.x + gutter_width,
+        gutter: Rect::new(inside.x, y, gutter_width, text_height),
+        text: Rect::new(inside.x + gutter_width, y, text_width, text_height),
+        vertical_scrollbar: vertical.then_some(Rect::new(
+            inside.x + gutter_width + text_width,
             y,
-            inside.width - gutter_width,
-            height,
-        ),
+            1,
+            text_height,
+        )),
+        horizontal_scrollbar: horizontal.then_some(Rect::new(
+            inside.x + gutter_width,
+            y + text_height,
+            text_width,
+            1,
+        )),
     }
+}
+
+/// Reserve a vertical rail when there is room for a thumb, travel, and a content column.
+pub(crate) fn scroll_rows(area: Rect) -> (Rect, Option<Rect>) {
+    let area = bounded(area);
+    if area.width < 2 || area.height < 2 {
+        return (area, None);
+    }
+    let rows = Rect::new(area.x, area.y, area.width - 1, area.height);
+    (rows, Some(Rect::new(rows.right(), rows.y, 1, rows.height)))
 }
 
 pub(crate) fn sidebar(
@@ -161,6 +188,7 @@ pub(crate) fn sidebar(
             panel: None,
             parent: None,
             rows: None,
+            scrollbar: None,
             divider: None,
             editor: body,
         }
@@ -169,7 +197,7 @@ pub(crate) fn sidebar(
         let inside = inner(panel);
         let parent_height = inside.height.min(1);
         let parent = Some(Rect::new(inside.x, inside.y, inside.width, parent_height));
-        let rows = Some(Rect::new(
+        let (rows, scrollbar) = scroll_rows(Rect::new(
             inside.x,
             inside.y + parent_height,
             inside.width,
@@ -178,7 +206,8 @@ pub(crate) fn sidebar(
         SidebarAreas {
             panel: Some(panel),
             parent,
-            rows,
+            rows: Some(rows),
+            scrollbar,
             divider: Some(Rect::new(body.x + width, body.y, 1, body.height)),
             editor: Rect::new(
                 body.x + width + 1,
@@ -225,16 +254,34 @@ mod tests {
 
     #[test]
     fn minimum_panels_keep_text_outside_all_borders_and_tabs() {
-        for lines in [1, 9, 10, 1000, usize::MAX] {
-            let panel = Rect::new(5, 7, pane_min_width(lines), MIN_PANE_HEIGHT);
-            let areas = pane_areas(panel, lines);
-            assert!(!areas.text.is_empty());
-            assert!(areas.text.x > panel.x);
-            assert!(areas.text.right() < panel.right());
-            assert!(areas.text.y > areas.tabs.y);
-            assert!(areas.text.bottom() < panel.bottom());
-            assert!(areas.text.intersection(areas.gutter).is_empty());
-            assert!(areas.text.intersection(areas.tabs).is_empty());
+        for lines in [1, 9, 10, 1000, 1_000_000, usize::MAX] {
+            for height in [
+                MIN_PANE_HEIGHT,
+                MIN_PANE_HEIGHT + 1,
+                MIN_PANE_HEIGHT + 2,
+                12,
+            ] {
+                let panel = Rect::new(5, 7, pane_min_width(lines), height);
+                let areas = pane_areas(panel, lines);
+                assert!(!areas.text.is_empty());
+                assert!(areas.text.x > panel.x);
+                assert!(areas.text.right() < panel.right());
+                let gap = u16::from(height > MIN_PANE_HEIGHT);
+                assert_eq!(areas.text.y, areas.tabs.bottom() + gap);
+                assert!(areas.text.bottom() < panel.bottom());
+                assert!(areas.text.intersection(areas.gutter).is_empty());
+                assert!(areas.text.intersection(areas.tabs).is_empty());
+                for track in [areas.vertical_scrollbar, areas.horizontal_scrollbar]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert_eq!(track.intersection(inner(panel)), track);
+                    assert!(track.width.max(track.height) >= 2);
+                    for content in [areas.tabs, areas.text, areas.gutter] {
+                        assert!(track.intersection(content).is_empty());
+                    }
+                }
+            }
         }
     }
 
@@ -274,6 +321,13 @@ mod tests {
         assert_eq!(rows.y, parent.bottom());
         assert!(rows.bottom() < panel.bottom());
         assert!(parent.intersection(rows).is_empty());
+        let rail = wide.scrollbar.unwrap();
+        assert!(rail.intersection(rows).is_empty());
+        assert!(rail.intersection(parent).is_empty());
+        assert_eq!(rail.intersection(inner(panel)), rail);
+        let tiny = sidebar(Rect::new(0, 0, 100, MIN_PANE_HEIGHT), 28, 12, (12, 4), true);
+        assert_eq!(tiny.rows.unwrap().height, 1);
+        assert!(tiny.scrollbar.is_none());
         let collapsed = sidebar(Rect::new(0, 3, 80, 7), 28, 12, minimum, true);
         assert!(collapsed.panel.is_some());
         assert!(collapsed.editor.width >= 12);

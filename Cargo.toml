@@ -19,6 +19,8 @@ rustix = { version = "1.1.6", features = ["event", "fs", "stdio", "termios", "pr
 tempfile = "3.27.0"
 blake3 = { version = "1.8.7", features = ["pure"] }
 xattr = "1.7.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.145"
 
 # User preferences file parsing (serde-free DeTable/DeValue API).
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse"] }

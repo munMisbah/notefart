@@ -31,10 +31,15 @@
 //!    Immediately before atomic replacement, the target path is re-verified via `symlink_metadata`
 //!    and `fstat` on an open file descriptor (`O_NOFOLLOW`) to ensure baseline dev/inode, mtime,
 //!    size, and BLAKE3 content hash have not diverged.
+//!    The temporary *name* is re-verified against the descriptor that received the buffer as well:
+//!    `persist` renames by pathname, so an entry recreated in the same shared directory would
+//!    otherwise be installed in place of the buffer.
 //! 7. **Durability and Post-Persist Sync**:
 //!    The temporary file is flushed and fsynced before `persist`. Once atomically renamed into place,
-//!    the parent directory is fsynced. If the directory fsync fails, `FileError::Durability` is
-//!    reported so the caller retains the document dirty state despite the on-disk file replacement.
+//!    the destination must name the very inode that was written, and the parent directory is
+//!    fsynced. If the directory fsync fails, `FileError::Durability` is reported so the caller
+//!    retains the document dirty state despite the on-disk file replacement. A destination that
+//!    names a different inode reports `FileError::Substituted` for the same reason.
 //!
 //! # Note on Concurrent Writer Race (POSIX Limitation)
 //!
@@ -61,7 +66,7 @@ use xattr::FileExt;
 pub const MAX_LOAD_SIZE: usize = 64 * 1024 * 1024;
 
 /// Line ending format detected or requested for a document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Newline {
     /// Unix line feed (`\n`).
     Lf,
@@ -73,7 +78,7 @@ pub enum Newline {
 }
 
 /// File encoding and formatting properties.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileFormat {
     /// Whether the file contains a UTF-8 Byte Order Mark (`0xEF, 0xBB, 0xBF`).
     pub bom: bool,
@@ -94,7 +99,7 @@ impl Default for FileFormat {
 ///
 /// Stores file identity (device and inode), modification timestamps, permissions,
 /// ownership, size, and BLAKE3 content hash. Callers cannot edit its internal fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiskState {
     dev: u64,
     ino: u64,
@@ -142,6 +147,9 @@ pub enum FileError {
     /// The file was successfully written and replaced on disk, but syncing the parent directory
     /// failed, leaving durability on persistent media uncertain.
     Durability(io::Error),
+    /// The temporary file or the destination stopped naming the object that received the buffer.
+    /// The document must stay dirty because the on-disk content may differ from this save.
+    Substituted(String),
 }
 
 impl fmt::Display for FileError {
@@ -157,6 +165,7 @@ impl fmt::Display for FileError {
                     "durability uncertainty: file persisted but directory sync failed: {err}"
                 )
             }
+            Self::Substituted(msg) => write!(f, "integrity: {msg}"),
         }
     }
 }
@@ -165,7 +174,7 @@ impl std::error::Error for FileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) | Self::Durability(err) => Some(err),
-            Self::Unsupported(_) | Self::Conflict | Self::Exists => None,
+            Self::Unsupported(_) | Self::Conflict | Self::Exists | Self::Substituted(_) => None,
         }
     }
 }
@@ -597,6 +606,15 @@ pub fn save(
         validate_security_metadata(path, stamp)?;
     }
 
+    // Persist renames the temporary *name*; the descriptor that received the buffer proves
+    // nothing about the entry sitting under that name. A shared parent directory lets another
+    // process unlink and recreate it, so refuse to rename before confirming the binding.
+    if !names_same_object(temp.path(), &rustix::fs::fstat(temp.as_file())?)? {
+        return Err(FileError::Substituted(
+            "temporary file was replaced before the atomic replace; buffer not saved".to_string(),
+        ));
+    }
+
     // Atomic persist
     let persisted_file = if !target_exists && !overwrite {
         // Persist with no-clobber semantics: a racing creation returns FileError::Exists
@@ -616,6 +634,17 @@ pub fn save(
         }
     };
 
+    // The rename itself is unconditional, so the entry installed may still have been swapped in
+    // after the binding check. The destination must name the very inode this save wrote, or the
+    // caller would record a checkpoint for content that is not on disk.
+    let final_stat = rustix::fs::fstat(&persisted_file)?;
+    if !names_same_object(path, &final_stat)? {
+        return Err(FileError::Substituted(
+            "destination does not name the saved file; verify the file on disk before retrying"
+                .to_string(),
+        ));
+    }
+
     // Post-persist durability: fsync parent directory via fd
     let sync_dir_res = (|| -> io::Result<()> {
         let dir_fd = rustix::fs::open(
@@ -630,7 +659,6 @@ pub fn save(
     if let Err(err) = sync_dir_res {
         return Err(FileError::Durability(err));
     }
-    let final_stat = rustix::fs::fstat(&persisted_file)?;
 
     Ok(DiskState {
         dev: final_stat.st_dev as u64,
@@ -766,6 +794,28 @@ fn validate_security_metadata(path: &Path, copied: &SecurityStamp) -> Result<(),
         return Err(FileError::Conflict);
     }
     Ok(())
+}
+
+/// Returns whether the directory entry at `path` names exactly the object `expected` describes:
+/// a regular file with one link, opened without following a symlink.
+///
+/// Atomic replacement renames a *name*, so the open descriptor alone cannot prove what will be
+/// installed or what the destination ended up naming.
+fn names_same_object(path: &Path, expected: &rustix::fs::Stat) -> Result<bool, FileError> {
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NOCTTY,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::LOOP) => return Ok(false),
+        Err(error) => return Err(FileError::Io(error.into())),
+    };
+    let metadata = File::from(fd).metadata()?;
+    Ok(metadata.is_file()
+        && metadata.nlink() == 1
+        && metadata.dev() == expected.st_dev as u64
+        && metadata.ino() == expected.st_ino as u64)
 }
 
 /// Preserves permissions (mode), ownership (uid/gid), and extended attributes / POSIX ACLs
@@ -1543,5 +1593,41 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn substituted_temp_name_no_longer_names_the_written_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix(".notefart_tmp_")
+            .permissions(fs::Permissions::from_mode(0o600))
+            .tempfile_in(directory.path())
+            .unwrap();
+        let written = rustix::fs::fstat(temp.as_file()).unwrap();
+        assert!(names_same_object(temp.path(), &written).unwrap());
+
+        // A process with write access to the directory unlinks the temporary name and puts its
+        // own file there; the descriptor holding the buffer is untouched.
+        let name = temp.path().to_path_buf();
+        fs::remove_file(&name).unwrap();
+        fs::write(&name, b"SUBSTITUTED\n").unwrap();
+        assert!(!names_same_object(&name, &written).unwrap());
+
+        // The same swap performed with a symlink never opens through it.
+        fs::remove_file(&name).unwrap();
+        let decoy = directory.path().join("decoy.txt");
+        fs::write(&decoy, b"DECOY\n").unwrap();
+        std::os::unix::fs::symlink(&decoy, &name).unwrap();
+        assert!(!names_same_object(&name, &written).unwrap());
+    }
+
+    #[test]
+    fn save_still_binds_temp_and_destination_on_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bound.txt");
+        let saved = save(&path, "payload\n", FileFormat::default(), None, false).unwrap();
+        let on_disk = fs::metadata(&path).unwrap();
+        assert_eq!((saved.dev, saved.ino), (on_disk.dev(), on_disk.ino()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "payload\n");
     }
 }

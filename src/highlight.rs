@@ -55,7 +55,6 @@ pub struct LineTokens {
 pub struct Progress {
     pub changed: bool,
     pub pending: bool,
-    pub warning: Option<String>,
 }
 
 struct Checkpoint {
@@ -79,6 +78,7 @@ struct Entry {
     recent_bytes: usize,
     targets: Vec<Range<usize>>,
     blocked: Option<usize>,
+    warning: Option<String>,
 }
 
 pub struct Highlighter {
@@ -229,7 +229,6 @@ impl Highlighter {
             return Progress {
                 changed,
                 pending: false,
-                warning: None,
             };
         }
 
@@ -239,7 +238,6 @@ impl Highlighter {
             return Progress {
                 changed,
                 pending: false,
-                warning: None,
             };
         };
 
@@ -247,7 +245,6 @@ impl Highlighter {
             return Progress {
                 changed,
                 pending: true,
-                warning: None,
             };
         }
 
@@ -255,7 +252,6 @@ impl Highlighter {
 
         let mut worked = 0usize;
         let slice_started = Instant::now();
-        let mut warning = None;
 
         while let Some(m) = missing {
             if worked >= budget || (worked > 0 && slice_started.elapsed() >= HIGHLIGHT_TIME_SLICE) {
@@ -273,7 +269,7 @@ impl Highlighter {
                     body_bytes
                 );
                 block_entry(entry, line, false, &mut changed);
-                warning = Some(message);
+                entry.warning = Some(message);
                 changed = true;
                 missing = earliest_missing_from(&entry.rows, &entry.targets, 0, line);
                 break;
@@ -330,7 +326,7 @@ impl Highlighter {
                 Err(err) => {
                     let message = format!("parser stopped at line {}: {}", line + 1, err);
                     block_entry(entry, line, true, &mut changed);
-                    warning = Some(message);
+                    entry.warning = Some(message);
                     changed = true;
                     missing = earliest_missing_from(&entry.rows, &entry.targets, 0, line);
                     break;
@@ -341,7 +337,6 @@ impl Highlighter {
         Progress {
             changed,
             pending: missing.is_some(),
-            warning,
         }
     }
 
@@ -349,6 +344,12 @@ impl Highlighter {
         self.entries
             .get(&key)
             .map_or(&[], |entry| entry.rows.as_slice())
+    }
+
+    pub fn warning(&self, key: u64) -> Option<&str> {
+        self.entries
+            .get(&key)
+            .and_then(|entry| entry.warning.as_deref())
     }
 
     pub fn forget(&mut self, key: u64) {
@@ -498,6 +499,7 @@ fn new_entry(
         recent_bytes: 0,
         targets: Vec::new(),
         blocked: None,
+        warning: None,
     }
 }
 
@@ -526,6 +528,9 @@ fn reset_entry(
     entry.line_count = line_count;
     entry.cursor = 0;
     entry.blocked = None;
+    if entry.warning.take().is_some() {
+        *changed = true;
+    }
     entry.checkpoints.clear();
     entry.scope_stack = ScopeStack::new();
     entry.parse_state = language.map(|idx| {
@@ -601,6 +606,9 @@ fn invalidate_from(entry: &mut Entry, from: usize, changed: &mut bool) {
     }
     if entry.blocked.is_some_and(|blocked| from <= blocked) {
         entry.blocked = None;
+        if entry.warning.take().is_some() {
+            *changed = true;
+        }
     }
 }
 
@@ -830,7 +838,6 @@ mod tests {
         let mut result = Progress {
             changed: false,
             pending: true,
-            warning: None,
         };
         loop {
             steps += 1;
@@ -838,7 +845,6 @@ mod tests {
             let prog = hl.update(key, doc, path, visible, budget);
             result.changed |= prog.changed;
             result.pending = prog.pending;
-            result.warning = result.warning.or(prog.warning);
             if !result.pending {
                 return (result, steps);
             }
@@ -881,7 +887,7 @@ mod tests {
             drain_updates(&mut hl, 1, &doc, Some(Path::new("main.rs")), &[0..10], 200);
         assert!(progress.changed);
         assert!(!progress.pending);
-        assert!(progress.warning.is_none());
+        assert!(hl.warning(1).is_none());
 
         let lines = hl.lines(1);
         assert_eq!(lines.len(), doc.line_count());
@@ -909,7 +915,7 @@ mod tests {
         let idle = hl.update(1, &doc, Some(Path::new("main.rs")), &[0..10], 200);
         assert!(!idle.changed);
         assert!(!idle.pending);
-        assert!(idle.warning.is_none());
+        assert!(hl.warning(1).is_none());
     }
 
     #[test]
@@ -932,7 +938,7 @@ mod tests {
             200,
         );
         assert!(!py_prog.pending);
-        assert!(py_prog.warning.is_none());
+        assert!(hl.warning(1).is_none());
         let py_lines = hl.lines(1);
         assert_eq!(token_for(py_lines, &py_doc, "note"), Token::Comment);
         assert_eq!(token_for(py_lines, &py_doc, "class "), Token::Keyword);
@@ -953,7 +959,7 @@ mod tests {
             200,
         );
         assert!(!json_prog.pending);
-        assert!(json_prog.warning.is_none());
+        assert!(hl.warning(2).is_none());
         let json_lines = hl.lines(2);
         assert_eq!(token_for(json_lines, &json_doc, "notefart"), Token::String);
         assert_eq!(token_for(json_lines, &json_doc, "123"), Token::Number);
@@ -972,13 +978,13 @@ mod tests {
             200,
         );
         assert!(!plain_prog.pending);
-        assert!(plain_prog.warning.is_none());
+        assert!(hl.warning(1).is_none());
         assert!(hl.lines(1).iter().all(|row| row.spans.is_empty()));
 
         let shebang_doc = Document::new("#!/usr/bin/env python3\ndef greet():\n    return 7\n");
         let (shebang_prog, _) = drain_updates(&mut hl, 2, &shebang_doc, None, &[0..5], 200);
         assert!(!shebang_prog.pending);
-        assert!(shebang_prog.warning.is_none());
+        assert!(hl.warning(2).is_none());
         let lines = hl.lines(2);
         assert_eq!(token_for(lines, &shebang_doc, "def "), Token::Keyword);
         assert_eq!(token_for(lines, &shebang_doc, "greet"), Token::Function);
@@ -1154,14 +1160,14 @@ mod tests {
     }
 
     #[test]
-    fn long_line_pauses_with_single_warning_and_recovers_when_shortened() {
+    fn long_line_warning_persists_and_recovers_when_shortened() {
         let exact_16k = format!("let ok = \"{}\";\n", "a".repeat(MAX_LINE_BYTES - 12));
         assert_eq!(exact_16k.len() - 1, MAX_LINE_BYTES);
         let boundary_doc = Document::new(&format!("{exact_16k}fn after_exact() {{}}\n"));
         let mut hl = Highlighter::new();
         let path = Some(Path::new("bound.rs"));
         let (boundary_prog, _) = drain_updates(&mut hl, 1, &boundary_doc, path, &[0..3], 200);
-        assert!(boundary_prog.warning.is_none());
+        assert!(hl.warning(1).is_none());
         assert!(!boundary_prog.pending);
         assert_eq!(
             token_for(hl.lines(1), &boundary_doc, "fn after_exact"),
@@ -1174,33 +1180,33 @@ mod tests {
         let mut doc = Document::new(&source);
 
         let (p1, _) = drain_updates(&mut hl, 2, &doc, path, &[0..4], 200);
-        assert!(p1.warning.is_some());
+        assert!(hl.warning(2).is_some());
         assert!(!p1.pending);
         assert!(p1.changed);
         assert_eq!(token_for(hl.lines(2), &doc, "fn before"), Token::Keyword);
         assert_eq!(token_for(hl.lines(2), &doc, "fn after"), Token::Plain);
         assert_eq!(token_for(hl.lines(2), &doc, "9"), Token::Plain);
 
-        // Subsequent idle updates must not repeat/re-allocate warning or loop pending.
+        // Idle updates retain the same cached warning without reallocation.
         let p2 = hl.update(2, &doc, path, &[0..4], 200);
-        assert!(p2.warning.is_none());
+        assert!(hl.warning(2).is_some());
         assert!(!p2.pending);
         assert!(!p2.changed);
 
-        // Scrolling completely past the long line does not re-warn or spin pending.
+        // Scrolling past the barrier keeps the warning without spinning.
         let p_past = hl.update(2, &doc, path, &[2..4], 200);
-        assert!(p_past.warning.is_none());
+        assert!(hl.warning(2).is_some());
         assert!(!p_past.pending);
         assert!(p_past.changed);
         assert!(hl.lines(2).is_empty());
         let p_past_idle = hl.update(2, &doc, path, &[2..4], 200);
-        assert!(p_past_idle.warning.is_none());
+        assert!(hl.warning(2).is_some());
         assert!(!p_past_idle.pending);
         assert!(!p_past_idle.changed);
 
         // Scroll back to 0..4 before fixing line 1.
         let (p_back, _) = drain_updates(&mut hl, 2, &doc, path, &[0..4], 200);
-        assert!(p_back.warning.is_none());
+        assert!(hl.warning(2).is_some());
         assert!(!p_back.pending);
         assert!(p_back.changed);
         // Shortening the long line clears the barrier and restores downstream highlighting.
@@ -1208,11 +1214,54 @@ mod tests {
         let end = doc.line_end(1);
         doc.replace(start..end, "let small = 1;").unwrap();
         let (p3, _) = drain_updates(&mut hl, 2, &doc, path, &[0..4], 200);
-        assert!(p3.warning.is_none());
+        assert!(hl.warning(2).is_none());
         assert!(!p3.pending);
         assert!(p3.changed);
         assert_eq!(token_for(hl.lines(2), &doc, "fn after"), Token::Keyword);
         assert_eq!(token_for(hl.lines(2), &doc, "9"), Token::Number);
+    }
+
+    #[test]
+    fn cached_warning_survives_idle_views_and_clears_on_invalidation() {
+        let mut doc = Document::new(&format!(
+            "{}\nfn later() {{}}\n",
+            "x".repeat(MAX_LINE_BYTES + 1)
+        ));
+        let other = Document::new("fn other() {}\n");
+        let mut hl = Highlighter::new();
+        let path = Some(Path::new("blocked.rs"));
+        let (first, _) = drain_updates(&mut hl, 11, &doc, path, &[1..2], 200);
+        assert!(first.changed);
+        assert!(hl.lines(11).is_empty());
+        let warning_ptr = hl.warning(11).unwrap().as_ptr();
+
+        let idle = hl.update(11, &doc, path, &[1..2], 200);
+        assert!(!idle.changed && !idle.pending);
+        assert_eq!(hl.warning(11).unwrap().as_ptr(), warning_ptr);
+        drain_updates(&mut hl, 12, &other, path, &[0..1], 200);
+        let switched = hl.update(11, &doc, path, &[], 200);
+        assert!(!switched.pending);
+        assert_eq!(hl.warning(11).unwrap().as_ptr(), warning_ptr);
+
+        let later = doc.line_start(1);
+        doc.replace(later..later + 2, "pub fn").unwrap();
+        hl.update(11, &doc, path, &[1..2], 0);
+        assert_eq!(hl.warning(11).unwrap().as_ptr(), warning_ptr);
+
+        let reset = hl.update(11, &doc, Some(Path::new("blocked.txt")), &[1..2], 0);
+        assert!(reset.changed);
+        assert!(hl.warning(11).is_none());
+        let (blocked_again, _) = drain_updates(&mut hl, 11, &doc, path, &[1..2], 200);
+        assert!(blocked_again.changed);
+        assert!(hl.warning(11).is_some());
+
+        let end = doc.line_end(0);
+        doc.replace(0..end, "let short = 1;").unwrap();
+        let invalidated = hl.update(11, &doc, path, &[1..2], 0);
+        assert!(invalidated.changed && invalidated.pending);
+        assert!(hl.warning(11).is_none());
+        drain_updates(&mut hl, 11, &doc, path, &[1..2], 200);
+        assert_eq!(token_for(hl.lines(11), &doc, "fn later"), Token::Keyword);
     }
 
     #[test]
@@ -1235,7 +1284,7 @@ mod tests {
 
         let (p_done, _) = drain_updates(&mut hl, 7, &doc, path, &[10..20, 500..520], 200);
         assert!(!p_done.pending);
-        assert!(p_done.warning.is_none());
+        assert!(hl.warning(7).is_none());
 
         // Only the two visible windows (10..20 and 500..520) are cached; middle 20..500 is NOT cached.
         let lines = hl.lines(7);
@@ -1365,16 +1414,16 @@ mod tests {
         let path = Some(Path::new("barrier.rs"));
 
         let (p1, _) = drain_updates(&mut hl, 9, &doc, path, &[2..6, 15..20], 200);
-        assert!(p1.warning.is_some());
+        assert!(hl.warning(9).is_some());
         assert!(!p1.pending);
         assert!(p1.changed);
         assert_eq!(hl.lines(9).len(), 4);
         assert_eq!(hl.lines(9)[0].line, 2);
         assert_eq!(hl.lines(9)[3].line, 5);
 
-        // Idle and scrolling past barrier do not re-warn or loop pending.
+        // Scrolling past the barrier retains the warning without looping.
         let p2 = hl.update(9, &doc, path, &[15..20], 200);
-        assert!(p2.warning.is_none());
+        assert!(hl.warning(9).is_some());
         assert!(!p2.pending);
         assert!(p2.changed);
         assert!(hl.lines(9).is_empty());
@@ -1384,7 +1433,7 @@ mod tests {
         let end = doc.line_end(10);
         doc.replace(start..end, "let ok = 1;").unwrap();
         let (p3, _) = drain_updates(&mut hl, 9, &doc, path, &[2..6, 15..20], 200);
-        assert!(p3.warning.is_none());
+        assert!(hl.warning(9).is_none());
         assert!(!p3.pending);
         assert!(p3.changed);
         assert_eq!(hl.lines(9).len(), 9);
@@ -1560,11 +1609,12 @@ mod tests {
             .replace(l10_start..l10_end, long_line.trim_end_matches('\n'))
             .unwrap();
         let (blocked, _) = drain_updates(&mut hl, 2, &barrier_doc, rs_path, &[0..18], 200);
-        assert!(blocked.warning.is_some());
+        assert!(hl.warning(2).is_some());
         assert!(!blocked.pending);
         assert_eq!(hl.lines(2).len(), 10);
         assert_eq!(hl.recent_len(2), 0);
         hl.forget(2);
+        assert!(hl.warning(2).is_none());
         assert_eq!(hl.recent_len(2), 0);
         assert_eq!(hl.recent_bytes(2), 0);
     }

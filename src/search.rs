@@ -16,7 +16,7 @@
 //! buffer is allocated, and no list of match ranges is retained.
 
 use std::fmt;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 use crate::document::{Document, EditError};
 
@@ -56,6 +56,15 @@ impl From<EditError> for SearchError {
     fn from(error: EditError) -> Self {
         Self::Edit(error)
     }
+}
+
+/// Bounded prefix of accepted match start offsets for a [`Query`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchIndex {
+    /// Sorted Unicode scalar start offsets of accepted matches, at most `limit`.
+    pub starts: Vec<usize>,
+    /// Whether at least one additional valid match exists beyond the prefix.
+    pub has_more: bool,
 }
 
 /// A compiled literal, case-sensitive needle.
@@ -126,12 +135,51 @@ impl Query {
         }
     }
 
+    /// Enumerates up to `limit` valid match starts in ascending scalar order.
+    ///
+    /// Performs a single streaming pass over `doc` from the start, including
+    /// overlapping matches whose endpoints are both grapheme-cluster boundaries.
+    /// Scanning stops once an additional valid match beyond `limit` is found,
+    /// reporting `has_more = true`.
+    pub fn match_index(&self, doc: &Document, limit: usize) -> MatchIndex {
+        let mut starts = Vec::new();
+        let mut has_more = false;
+        self.scan_forward(doc, 0, |range| {
+            if starts.len() == limit {
+                has_more = true;
+                ControlFlow::Break(())
+            } else {
+                if starts.is_empty() {
+                    starts.reserve_exact(limit.min(doc.len_chars()));
+                }
+                starts.push(range.start);
+                ControlFlow::Continue(())
+            }
+        });
+        MatchIndex { starts, has_more }
+    }
+
     /// First accepted match starting at or after `from`, without wrapping.
     fn find_forward(&self, doc: &Document, from: usize) -> Option<Range<usize>> {
+        let mut found = None;
+        self.scan_forward(doc, from, |range| {
+            found = Some(range);
+            ControlFlow::Break(())
+        });
+        found
+    }
+
+    /// Streams accepted matches starting at or after `from` in ascending order.
+    fn scan_forward(
+        &self,
+        doc: &Document,
+        from: usize,
+        mut on_match: impl FnMut(Range<usize>) -> ControlFlow<()>,
+    ) {
         let len = doc.len_chars();
         let width = self.pattern.len();
         if width == 0 || width > len || from > len {
-            return None;
+            return;
         }
 
         let mut matched = 0usize;
@@ -146,12 +194,14 @@ impl Query {
                 let start = from + offset + 1 - width;
                 matched = self.failure[matched - 1];
                 let end = start + width;
-                if doc.is_grapheme_boundary(start) && doc.is_grapheme_boundary(end) {
-                    return Some(start..end);
+                if doc.is_grapheme_boundary(start)
+                    && doc.is_grapheme_boundary(end)
+                    && on_match(start..end).is_break()
+                {
+                    return;
                 }
             }
         }
-        None
     }
 
     /// Greatest accepted match start at or before `from`, without wrapping.
@@ -577,6 +627,229 @@ mod tests {
 
             let mut empty = document("");
             assert_eq!(replace_all(&mut empty, &query("a"), "b"), Ok(0));
+        }
+    }
+
+    mod match_index {
+        use super::*;
+
+        #[test]
+        fn empty_no_match_and_short_document() {
+            assert_eq!(
+                query("a").match_index(&document(""), 10),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("abc").match_index(&document("ab"), 10),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("zz").match_index(&document("abcdef"), 10),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+        }
+
+        #[test]
+        fn limit_zero_and_exact_vs_truncated_prefix() {
+            let doc = document("ababab");
+            let q = query("ab");
+
+            assert_eq!(
+                q.match_index(&doc, 0),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: true,
+                }
+            );
+            assert_eq!(
+                q.match_index(&document("xyz"), 0),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                q.match_index(&doc, 2),
+                MatchIndex {
+                    starts: vec![0, 2],
+                    has_more: true,
+                }
+            );
+            assert_eq!(
+                q.match_index(&doc, 3),
+                MatchIndex {
+                    starts: vec![0, 2, 4],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                q.match_index(&doc, 4),
+                MatchIndex {
+                    starts: vec![0, 2, 4],
+                    has_more: false,
+                }
+            );
+
+            let exact_100 = document(&"x".repeat(100));
+            assert_eq!(
+                query("x").match_index(&exact_100, 100),
+                MatchIndex {
+                    starts: (0..100).collect(),
+                    has_more: false,
+                }
+            );
+
+            let over_100 = document(&"x".repeat(105));
+            assert_eq!(
+                query("x").match_index(&over_100, 100),
+                MatchIndex {
+                    starts: (0..100).collect(),
+                    has_more: true,
+                }
+            );
+        }
+
+        #[test]
+        fn overlapping_matches_respect_limit_and_grapheme_endpoints() {
+            let doc = document("aaaa");
+            let q = query("aa");
+            assert_eq!(
+                q.match_index(&doc, 2),
+                MatchIndex {
+                    starts: vec![0, 1],
+                    has_more: true,
+                }
+            );
+            assert_eq!(
+                q.match_index(&doc, 3),
+                MatchIndex {
+                    starts: vec![0, 1, 2],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("aba").match_index(&document("ababa"), 10),
+                MatchIndex {
+                    starts: vec![0, 2],
+                    has_more: false,
+                }
+            );
+
+            let combining_tail = document("aaaa\u{301}");
+            assert_eq!(
+                q.match_index(&combining_tail, 10),
+                MatchIndex {
+                    starts: vec![0, 1],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                q.match_index(&combining_tail, 1),
+                MatchIndex {
+                    starts: vec![0],
+                    has_more: true,
+                }
+            );
+
+            let combining_mid = document("aa\u{301}aa");
+            assert_eq!(
+                q.match_index(&combining_mid, 10),
+                MatchIndex {
+                    starts: vec![3],
+                    has_more: false,
+                }
+            );
+
+            let only_invalid = document("aa\u{301}");
+            assert_eq!(
+                q.match_index(&only_invalid, 0),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+        }
+
+        #[test]
+        fn unicode_scalar_offsets_zwj_cjk_and_crlf() {
+            let mixed = document("中aa🌍aa");
+            assert_eq!(
+                query("aa").match_index(&mixed, 10),
+                MatchIndex {
+                    starts: vec![1, 4],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("中a").match_index(&mixed, 10),
+                MatchIndex {
+                    starts: vec![0],
+                    has_more: false,
+                }
+            );
+
+            let zwj = document("👨\u{200d}👩\u{200d}👧 👩");
+            assert_eq!(
+                query("👩").match_index(&zwj, 10),
+                MatchIndex {
+                    starts: vec![6],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("👨\u{200d}👩\u{200d}👧").match_index(&zwj, 10),
+                MatchIndex {
+                    starts: vec![0],
+                    has_more: false,
+                }
+            );
+
+            let crlf = document("a\r\nb\r\n");
+            assert_eq!(
+                query("\r").match_index(&crlf, 10),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("\n").match_index(&crlf, 10),
+                MatchIndex {
+                    starts: vec![],
+                    has_more: false,
+                }
+            );
+            assert_eq!(
+                query("\r\n").match_index(&crlf, 10),
+                MatchIndex {
+                    starts: vec![1, 4],
+                    has_more: false,
+                }
+            );
+        }
+
+        #[test]
+        fn matches_next_forward_enumeration() {
+            let doc = document("e\u{301}e a\r\nb 👨\u{200d}👩\u{200d}👧 👩 中e");
+            let q = query("e");
+            assert_eq!(
+                q.match_index(&doc, 10),
+                MatchIndex {
+                    starts: vec![2, 18],
+                    has_more: false,
+                }
+            );
+            assert_eq!(q.next(&doc, 0, false), Some(2..3));
+            assert_eq!(q.next(&doc, 3, false), Some(18..19));
         }
     }
 }

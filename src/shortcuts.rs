@@ -33,7 +33,10 @@ pub(crate) const SECTIONS: &[Section] = &[
                 "Ctrl+W",
                 "Close this view; protect changes on the last view.",
             ),
-            ("Ctrl+Q", "Quit; check each dirty document once."),
+            (
+                "Ctrl+Q",
+                "Save the session and quit; separate editing checks dirty documents.",
+            ),
         ],
     },
     Section {
@@ -57,7 +60,14 @@ pub(crate) const SECTIONS: &[Section] = &[
                 "Ctrl+Z / Ctrl+Y",
                 "Undo or redo the shared document history.",
             ),
-            ("Tab", "Insert spaces to the next four-column tab stop."),
+            (
+                "Tab",
+                "Insert to the next four-column stop, or indent a multiline selection.",
+            ),
+            (
+                "Shift+Tab",
+                "Dedent the current or selected lines: one leading tab or up to four spaces.",
+            ),
             (
                 "Backspace / Delete",
                 "Delete the previous or next grapheme.",
@@ -74,10 +84,20 @@ pub(crate) const SECTIONS: &[Section] = &[
         bindings: &[
             (
                 "Ctrl+F / Ctrl+R",
-                "Open Find or Replace for the active document.",
+                "Open Find or Replace; single-line editor selection up to 4096 bytes prefills Find.",
             ),
-            ("Enter / F3", "Find the next literal match, wrapping once."),
-            ("Shift+F3", "Find the previous match, wrapping once."),
+            (
+                "Enter / F3",
+                "Find the next literal match, wrapping once and marking (wrapped).",
+            ),
+            (
+                "Shift+F3",
+                "Find the previous match, wrapping once and marking (wrapped).",
+            ),
+            (
+                "Match count",
+                "Shows current position and total up to 100+ (>100 if past 100); navigation stays uncapped.",
+            ),
             ("F6", "In Replace: replace the validated current match."),
             (
                 "F7",
@@ -113,7 +133,7 @@ pub(crate) const SECTIONS: &[Section] = &[
             ),
             (
                 "Alt+Shift+Left/Right",
-                "Move the nearest left/right divider by two columns.",
+                "Resize the explorer by two columns when focused, or the nearest left/right split when editing.",
             ),
             (
                 "Alt+Shift+Up/Down",
@@ -122,6 +142,10 @@ pub(crate) const SECTIONS: &[Section] = &[
             (
                 "Divider drag",
                 "Resize a pane or the explorer within layout minimums.",
+            ),
+            (
+                "Scrollbar track / thumb",
+                "Page or drag the editor, explorer, or Help viewport without changing selection.",
             ),
             (
                 "Small terminals",
@@ -156,6 +180,28 @@ pub(crate) const SECTIONS: &[Section] = &[
                 "Open a file, toggle a directory, or use the parent row.",
             ),
             ("F5", "Refresh the tree or retry an unavailable explorer."),
+            (
+                "Alt+Shift+Left/Right",
+                "Resize the explorer by two columns while focused and visible.",
+            ),
+        ],
+    },
+    Section {
+        title: "Confirmation dialogs",
+        bindings: &[
+            (
+                "Tab / Right / Down",
+                "Move button focus forward (starts on Cancel).",
+            ),
+            (
+                "Shift+Tab / Left / Up",
+                "Move button focus backward, wrapping around.",
+            ),
+            ("Enter / Space", "Activate the focused confirmation button."),
+            (
+                "Letters / Esc / F1",
+                "Use shown button mnemonics, cancel with Esc, or open Help with F1.",
+            ),
         ],
     },
     Section {
@@ -208,6 +254,14 @@ pub(crate) const SECTIONS: &[Section] = &[
             (
                 "Ctrl+H",
                 "Backspace on terminals, not Replace. Use Ctrl+R for Replace.",
+            ),
+            (
+                "Session",
+                "Plain naf restores buffers on launch and saves them on normal quit; not encrypted.",
+            ),
+            (
+                "--no-session",
+                "Separate editing without snapshots; file/folder arguments also stay separate.",
             ),
             (
                 "Recovery",

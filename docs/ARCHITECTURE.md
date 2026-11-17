@@ -2,7 +2,7 @@
 
 Status: editor hybrid panel + tab, registry dokumen/history bersama dan split dua orientasi sudah berjalan. Redesign bergaya superfile menyediakan frame penuh, ikon file dan chrome responsif; field editable serta bantuan F1 tetap tersedia. Validasi penggunaan harian dan matriks dukungan lebih luas masih terbuka.
 
-Nama produk/package Cargo tetap Notefart/`notefart`; satu-satunya target executable adalah `naf`, dideklarasikan melalui `[[bin]]` dengan entry point `src/main.rs`. Tanpa argumen masuk editor kosong; argumen path diteruskan ke startup editor yang sama. Nama binary tidak menentukan direktori konfigurasi: namespace preferensi tetap `notefart`. Tidak ada alias executable lama.
+Nama produk/package Cargo tetap Notefart/`notefart`; satu-satunya target executable adalah `naf`, dideklarasikan melalui `[[bin]]` dengan entry point `src/main.rs`. Tanpa path memulihkan sesi default; `--no-session` atau argumen file/folder memakai editing terpisah tanpa I/O snapshot. Nama binary tidak menentukan direktori konfigurasi: namespace preferensi tetap `notefart`. Tidak ada alias executable lama.
 
 ## Prinsip
 
@@ -27,6 +27,7 @@ Nama produk/package Cargo tetap Notefart/`notefart`; satu-satunya target executa
 | `highlight` | Deteksi syntax, cache viewport, parse/scope checkpoints, invalidasi generation |
 | `theme` | Palet semantik precomputed, degradasi warna dan pemetaan ikon |
 | `config` | Preferensi TOML pengguna berbatas, resolusi lokasi XDG/HOME dan penyimpanan atomik eksplisit sebelum TUI |
+| `session` | Lock sesi default, metadata snapshot berbatas, payload Rope streaming, checksum dan penyimpanan atomik |
 | `clipboard` | Pilihan internal/Wayland/X11, copy/paste eksplisit, transport helper berbatas tanpa shell atau I/O render |
 | `input` | Decoder keyboard/mouse/bracketed paste berbatas |
 | `field` | String field, caret/anchor byte UTF-8, boundary grapheme, revision dan replacement berbatas |
@@ -79,6 +80,7 @@ Gunakan satu event loop sebagai pemilik state pada awal implementasi. Pekerjaan 
 - Resumption dan transisi chunk membentuk konteks `GraphemeCursor` dari slice baris utuh, bukan suffix terpotong. Pre-context dipasok tepat sampai offset yang diminta agar pairing regional indicator, combining dan ZWJ konsisten. Seek dingin/lookbehind Unicode panjang tetap dapat mahal; ini bukan indeks seluruh dokumen atau kuota CPU/RAM.
 - Usulan awal memakai scroll horizontal tanpa soft wrap untuk mengurangi kompleksitas koordinat; soft wrap belum diputuskan.
 - Bracketed paste masuk sebagai satu transaksi undo, bukan deretan shortcut.
+- Navigasi kata dan double-click mengelompokkan grapheme berdasarkan karakter pertamanya: alphanumeric/underscore, whitespace, atau punctuation. Pemindaian memakai iterator char Rope berurutan dan memeriksa boundary grapheme hanya saat kelas berubah; scalar di dalam combining/Prepend/ZWJ tidak menjadi batas kata. Ctrl+Left/Right menghitung arah yang diperlukan saja, termasuk whitespace lintas baris, tanpa menyalin teks atau membuat indeks tambahan.
 
 ## I/O dan clipboard
 
@@ -167,8 +169,8 @@ Loop memeriksa signal dan ukuran terminal saat idle/pasca-poll. Snapshot geometr
 - Hasil Find membawa pane/view/document ID, generation, query dan range; F6 memvalidasi semuanya terhadap seleksi. Pindah view/panel menginvalidasi hasil stale. Query literal case-sensitive, wrap sekali, field 4096 byte.
 - `Highlighter` meminjam SyntaxSet immutable process-wide dari `syntax::load()` (`LazyLock`), dengan ParseState/ScopeStack terpisah per dokumen. `lines()` hanya berisi union viewport terlihat. Baris yang baru keluar viewport dipindah tanpa clone span ke FIFO recent, maksimum 512 baris dan 2 MiB payload per dokumen; gap besar antarpanel tidak ditokenisasi untuk mengisi cache.
 - Checkpoint parse/scope tiap 128 baris, budget 200 baris dan slice kooperatif 4 ms per update. Render tidak menjalankan parser; event loop melukis frame pertama sebelum cold highlight dan tidak menjalankan beberapa slice sebelum frame/input yang sama. Idle 16 ms melanjutkan pekerjaan pending, lalu kembali ke poll normal. Baris >16 KiB/error parser memberi warning satu kali dan menghentikan propagasi; satu operasi regex tidak dapat dipotong oleh slice.
-- `theme` memilih palet precomputed sekali; RGB Dark/Light dan xterm-256 diuji kontrasnya. ANSI16/Terminal/default colors tetap bergantung palet terminal; mono mempertahankan reverse/bold/marker. Tidak ada deteksi/pemasangan font otomatis.
-- `file_io` tetap memisahkan LF dalam memori dari BOM/LF/CRLF disk. Save sinkron memakai tempfile satu direktori, baseline hash/identitas, metadata copy + pemeriksaan ulang, fsync, atomic persist dan directory fsync. Final-check→rename race tidak dieliminasi.
+- `theme` memilih palet precomputed sekali; kontras pasangan seleksi/fokus RGB Dark/Light dan xterm-256 diuji. Canvas memakai `Color::Reset` pada semua palet, sehingga kontras foreground terhadap latar terminal tidak diketahui aplikasi. ANSI16/Terminal/default colors tetap bergantung palet terminal; mono mempertahankan reverse/bold/marker. Tidak ada deteksi/pemasangan font otomatis.
+- `file_io` tetap memisahkan LF dalam memori dari BOM/LF/CRLF disk. Save sinkron memakai tempfile satu direktori, baseline hash/identitas, metadata copy + pemeriksaan ulang, fsync, atomic persist dan directory fsync. Persist mengganti nama, bukan descriptor: nama temporary diikat ulang ke dev/inode/nlink descriptor penulis sebelum rename dan direktori tujuan diverifikasi menunjuk inode yang sama sesudahnya; ketidakcocokan menjadi `FileError::Substituted`. Celah check→rename pada direktori yang dapat ditulis proses lain tidak dieliminasi.
 - Batas file/paste bukan batas seluruh RSS/history/clipboard. Filesystem sinkron dapat menahan UI. Pada akhir batch tahap 1, recovery, clipboard eksternal dan konfigurasi persisten belum tersedia; clipboard/preferensi kini ditambahkan terpisah, recovery tetap belum tersedia. `examples/` tetap evaluasi terpisah.
 
 ## Keputusan shared-view tahap 3
@@ -189,14 +191,59 @@ Loop memeriksa signal dan ukuran terminal saat idle/pasca-poll. Snapshot geometr
 - `help` menelusuri katalog statis secara streaming tanpa daftar seluruh baris di heap. Wrapping/layout yang sama menentukan draw, scroll limit dan ukuran page; offset lama di-clamp ketika ukuran berubah. `shortcuts::SECTIONS` juga dipakai oleh `--help`.
 - `Screen` membawa path, format dan dirty sebagai metadata terpisah dari pesan operasi. Buffer status dipakai ulang, metadata menyusut pada ruang sempit dan error diprioritaskan. Aksi konfirmasi memakai `ChoiceKind`/KeyEvent statis, bukan parsing nama file atau status menjadi command.
 
+## Kontrak integrasi P1
+
+Kontrak implementasi batch P1; bukti fungsional dan batas validasi ada di [ROADMAP](ROADMAP.md#hasil-p1-aksesibilitas-dan-pencarian):
+
+- Aplikasi memiliki fokus tombol per modal konfirmasi, sehingga prompt baru selalu Cancel dan suspend/return F1 mempertahankan fokus. Renderer menerima indeks fokus serta target path pinjaman; guard input dan renderer memakai perhitungan ukuran yang sama.
+- `Query::match_index(document, limit)` menghasilkan awal match scalar terurut dan flag `has_more`, termasuk match overlapping yang valid pada kedua batas grapheme. Penyimpanan hanya prefix berbatas; tidak menyalin dokumen atau menyimpan semua range.
+- Cache pencarian aplikasi mengikat compiled query dan indeks pada document ID/revisi/query; reload menginvalidasi cache secara eksplisit karena mengganti `Document` dapat memakai ulang nomor revisi. Feedback dibuat saat aksi Find, dipinjam renderer, dan tidak ditampilkan jika konteks dokumen/view/seleksi sudah stale. Find menavigasi start match overlapping pada kedua arah; replacement/undo tetap memakai kontraknya sendiri dan navigasi tidak dibatasi prefix.
+- `Theme` menjadi satu-satunya pemilik resolusi warna konfigurasi/CLI/environment. Sesudah bootstrap dan sebelum terminal editor masuk, backend Crossterm diizinkan mengeluarkan warna tema agar tidak menerapkan `NO_COLOR` kedua kali. Auto tetap menghormati `NO_COLOR`; None memakai token `Reset` dan reverse/marker, sedangkan override eksplisit tidak dibatalkan backend. Regresi output backend mengisolasi tiap kasus dalam subprocess, bukan memutasi environment/flag global suite paralel.
+- Kepemilikan batch: renderer/helper/tab/katalog shortcut di `ui`/`shortcuts`, enumerasi match di `search`, state/action serta seluruh caller lintas modul di `app`, kebijakan output backend di `terminal`. Bukti terminal/font, client tmux, SSH loopback dan penggunaan panjang menutup tahap 4 pada matriks Linux teruji yang disetujui pengguna, bukan platform atau client fisik universal.
+
+## Kontrak indent/dedent blok
+
+Kontrak indentasi telah terimplementasi dan lulus tes serta alur TUI terarah; [bukti dan batas](ROADMAP.md#hasil-indent-dan-dedent-blok):
+
+- Tab tanpa seleksi multibaris tetap menyisipkan spasi sampai tab stop empat kolom, termasuk mengganti seleksi satu baris seperti sebelumnya. Tab dengan seleksi yang melintasi newline menambah empat spasi pada awal setiap baris yang tersentuh, termasuk baris kosong.
+- Shift+Tab (`BackTab`, atau Tab dengan modifier Shift) mengurangi indentasi baris aktif atau baris terpilih: satu tab awal, atau hingga empat spasi ASCII awal. Kombinasi spasi lalu tab hanya menghapus prefix spasi; karakter non-indentasi tidak dihapus. Endpoint penghapusan tetap boundary grapheme.
+- Range seleksi bersifat setengah-terbuka: baris berikutnya tidak ikut jika endpoint tepat pada awalnya. Arah seleksi dan posisi logis cursor/anchor dipetakan melalui tiap perubahan prefix; operasi tidak mengganti isi seleksi dengan spasi atau meruntuhkan seluruh posisi view ke ujung blok.
+- Seluruh prefix dalam satu perintah merupakan satu transaksi/history checkpoint. Undo/redo tetap mengikuti aturan cursor command yang sudah ada, tetapi memulihkan seluruh batch, termasuk tab versus spasi asli; shared view dan anchor viewport menerima pemetaan tiap prefix. No-op dedent tidak membuat dirty/revisi/history baru atau membuang redo.
+- `Document::indent_lines(range, dedent)` menerima offset scalar/grapheme seperti `replace`, memvalidasi sebelum mutasi, menyimpan metadata prefix ringkas dan tidak menyalin isi blok/dokumen. `last_change()` menyediakan pemetaan transaksi tunggal atau batch yang meminjam metadata history; jalur replace tunggal tidak menambah alokasi batch.
+- Workspace memakai kebijakan view eksplisit: mengikuti cursor edit, memetakan cursor sambil menghapus seleksi, atau mempertahankan seleksi. Semua caller bool lama dimigrasikan tanpa shim; aplikasi memakai kebijakan mempertahankan seleksi untuk indent/dedent.
+- Read-only tetap menolak edit tanpa mutasi. Routing modal, field dan explorer diproses sebelum shortcut editor; Tab/Shift+Tab pada dialog tetap navigasi fokus, bukan indentasi dokumen. Mutasi menginvalidasi hasil Find/hit mouse dan memicu highlighting melalui jalur edit yang sama.
+
+
 ## Geometry frame dan chrome responsif
 
-- `chrome` dipakai langsung oleh `ui`, `app` dan `workspace`; minimum panel tidak diduplikasi. Outer panel mencakup frame; inner membagi tab, gutter dan teks. `Geometry.sidebar_panel` adalah kartu luar, `sidebar_parent` hit parent yang aktif, dan `sidebar` hanya baris tree di bawahnya. Parent tetap dialokasikan di `/`, tetapi hit-nya tidak diterbitkan.
+- `chrome` dipakai langsung oleh `ui`, `app` dan `workspace`; minimum panel tidak diduplikasi. Outer panel mencakup frame; inner membagi tab, gutter, teks dan jalur scrollbar editor. `Geometry.sidebar_panel` adalah kartu luar, `sidebar_parent` hit parent yang aktif, dan `sidebar` hanya baris tree di bawahnya. Parent tetap dialokasikan di `/`, tetapi hit-nya tidak diterbitkan.
 - Minimum panel max(12, digit gutter + 5) kolom ×4 baris. Chrome penuh dipilih bila lebar ≥40, tinggi ≥18 dan body setinggi terminal dikurangi **7 baris** masih memuat tree. Header 3 baris, status 3 baris, helper tanpa frame 1 baris; tidak ada baris kosong antara header/body/dock. Compact tetap header satu baris dan dock satu–dua baris.
+- `chrome::pane_areas` menyisakan satu baris kosong antara tab dan gutter/teks bila tinggi panel minimal 5; pada minimum 4 baris gap dihilangkan. Renderer menerbitkan `text_area` tersebut ke `Geometry`, sehingga cursor, mouse, page/scroll dan viewport mengikuti offset yang sama. Klik gap hanya memfokuskan panel, tidak memindahkan cursor dokumen.
 - Preflight split memakai body compact maksimum, bukan menganggap dekorasi normal wajib. Split baru dapat menurunkan chrome global menjadi compact agar seluruh panel tetap terlihat. Collapse sementara tidak mengubah tree/ratio.
-- Border hanya memfokuskan panel; tab/gutter/teks memiliki hit masing-masing. Gutter tetap memetakan baris melalui layout teks. Wheel memakai kartu di bawah pointer tanpa mengganti fokus; page/scroll memakai tinggi inner text, bukan outer frame.
-- Gap explorer/split satu sel tetap dapat di-drag di seluruh panjangnya; grip hanya petunjuk visual. Kedua gap vertikal global dihapus, tanpa menggabungkan/menghapus frame panel.
-- `theme.canvas` adalah satu-satunya background dasar; token `surface`/`raised` dihapus beserta caller-nya. Seleksi/fokus kontrol tetap semantik. Ikon chrome/kategori memakai slot profil tetap dan modifier bold; Nerd memakai Material Design solid. Judul memakai span pinjaman dan helper memakai tabel keycap/label/KeyEvent statis, bukan string gabungan setiap frame. Font tidak dipasang aplikasi.
+- Border biasa hanya memfokuskan panel; baris border bawah subtree atas menjadi hit resize Rows. Tab/gutter/teks memiliki hit masing-masing. Gutter tetap memetakan baris melalui layout teks. Wheel memakai kartu di bawah pointer tanpa mengganti fokus; page/scroll memakai tinggi inner text, bukan outer frame.
+- Gap explorer dan split Columns tetap satu kolom. Pada Rows, `PaneRect` tidak overlap: panel bawah dimulai tepat setelah border bawah panel atas, tanpa baris kosong tambahan. Minimum tinggi adalah `h1 + h2`; span anak berjumlah `parent.height`. `Divider.area` hanya menumpang border bawah subtree atas; resize memakai offset satu baris dari koordinat hit ke span pertama.
+- Renderer divider split hanya menghias gap Columns; Rows tidak menulis glyph tambahan pada border atau celah. `Divider.area` Rows tetap diterbitkan untuk input meskipun indikator visual dihapus. Frame tidak disatukan atau diberi junction antar-panel; judul memakai `Block::title` biasa, tanpa clipping khusus shared border.
+- `theme.canvas` adalah background default terminal (`Color::Reset`) di semua palet, bukan RGB solid; token `surface`/`raised` tetap tidak ada. Tab aktif, seleksi dan prefix field fokus memakai pasangan `selection`/`fg` yang sama agar ikon, badge dan close tidak kehilangan kontras. Ikon chrome/kategori memakai slot profil tetap dan modifier bold; Nerd memakai Material Design solid. Judul memakai span pinjaman dan helper memakai tabel keycap/label/KeyEvent statis, bukan string gabungan setiap frame. Font tidak dipasang aplikasi.
+
+### Scrollbar editor
+
+- `chrome::pane_areas` mencadangkan satu row horizontal dan satu kolom vertikal di dalam frame, independen dari overflow agar geometri tidak berubah saat scroll. Horizontal hanya jika body menyisakan minimal satu row teks; vertikal hanya jika tinggi teks minimal dua row. Setiap track harus memiliki minimal dua sel sepanjang sumbunya setelah alokasi sumbu lain; jika tidak muat, track disembunyikan, bukan menerbitkan thumb nol sel. Minimum panel tetap; track tidak menimpa tab, gutter, teks, border atau divider.
+- Modul `scrollbar` menghitung thumb, page dan pemetaan drag dalam sel terminal. Batas vertikal adalah `line_count - text_height` yang disaturasi; wheel/autoscroll memakai batas yang sama. Batas horizontal memakai maksimum lebar render baris yang terlihat ditambah satu sel caret EOL, bukan byte/scalar atau lebar seluruh dokumen.
+- `Tab.horizontal_width` menyimpan pekerjaan turunan per view dengan key revisi teks/top/tinggi viewport. Perubahan lebar memakai hasil yang sama tetapi tetap menormalisasi `left_cell` terhadap lebar teks baru, termasuk pane nonaktif. `LineWidthCursor` melanjutkan posisi scalar/byte/kolom pada boundary grapheme memakai scanner yang sama dengan renderer; pengukuran tidak membuat string escape tampilan atau menyalin dokumen. Cache bukan history/snapshot dan dikosongkan pada reload, restore dan split baru.
+- Aplikasi mengerjakan pengukuran round-robin pada pane terlihat dalam budget kooperatif dua milidetik per update; pekerjaan pending memakai idle tick 16 ms. Budget bukan preemption atau SLA untuk satu grapheme besar. Renderer menerima metadata hasil, menolak extent yang key-nya stale, dan menampilkan `?` pada track horizontal sebelum hasil tersedia; tidak menerbitkan thumb/hit palsu.
+- Klik track melakukan page scroll. Press/no-motion mempertahankan offset awal; setelah gerakan pertama, drag tetap terikat skala awal tetapi kembali ke sel endpoint meng-clamp tepat ke 0/maksimum, termasuk thumb yang terkuantisasi. Scrollbar hanya mengubah viewport pane asal, tanpa fokus, cursor, anchor, preferred column, teks, dirty atau history. Capture memeriksa view ID/revisi/text rect; perubahan konteks membatalkan drag stale. Klik setelah viewport bergerak menunggu redraw.
+- Rail memakai token muted dan thumb fg/accent + bold, semuanya dengan background terminal `Reset`. ASCII memakai `-`/`|`/`#`, profil Unicode/Nerd memakai garis tipis/tebal. Track non-overflow tidak interaktif; scrollbar explorer, help dan field tidak termasuk kontrak ini.
+
+### Scrollbar Explorer dan F1
+
+- `chrome::scroll_rows` mencadangkan satu kolom di kanan konten bila panjang rail minimal dua sel dan masih tersisa kolom teks. `SidebarAreas.rows`/`Geometry.sidebar` mengecualikan rail; parent row dan divider Explorer tetap terpisah. Sidebar satu row tidak menerbitkan rail atau thumb nol.
+- `HelpLayout.catalog` mengecualikan rail sebelum wrapping. Draw, page dan limit memakai lebar katalog yang sama; footer Esc/F1 tetap memakai lebar inner penuh. Jumlah row katalog statis dimemoisasi per lebar runtime dengan slot `OnceLock`; perubahan scroll tidak menghitung ulang seluruh katalog atau menyalinnya ke heap.
+- `Geometry.sidebar_scrollbar` dan `help_scrollbar` membawa hit yang benar-benar digambar. Field bantuan dihapus ketika modal berganti/tutup atau viewport terlalu kecil; metadata sidebar dihapus ketika panel tersembunyi. `help::draw` mengembalikan geometri scrollbar ke caller, bukan mengubah state aplikasi.
+- `ScrollbarTarget` menyatukan capture editor, Explorer dan Help dengan satu jalur start/drag/scroll. Selain guard editor yang sudah ada, capture memeriksa jumlah row/visibility Explorer atau viewport/modal Help, lalu track dan maksimum yang masih sama. Semua key membatalkan capture scrollbar; drag milik modal tidak diteruskan ke editor/Explorer di belakangnya.
+- Explorer hanya mengubah `top`, bukan pilihan entry, root, fokus, panel tujuan atau dokumen. Help hanya mengubah offset katalog dan tidak menyentuh modal yang ditangguhkan, nilai/seleksi field atau fokus tombol. Navigasi keyboard dan resize tetap boleh mengikuti pilihan/caret seperti sebelumnya.
+- Page, wheel dan drag memakai rentang penuh viewport; press/no-motion dan endpoint terkuantisasi mengikuti primitive editor. Rendering memakai rail/thumb dan token background `Reset` yang sama, tanpa konvensi warna atau algoritme drag kedua. Tidak menambahkan scrollbar horizontal Explorer, indikator overflow field, hover atau runtime switcher.
+
+
 
 
 ## Transisi browser folder
@@ -215,3 +262,26 @@ Loop memeriksa signal dan ukuran terminal saat idle/pasca-poll. Snapshot geometr
 - Backend regex-fancy diganti sepenuhnya oleh Oniguruma. Tradeoff native/compiler C dan notice distribusi dinyatakan pada dependency di atas. Tidak ditambah thread parser, salinan seluruh dokumen, atau special-case mematikan highlight Markdown.
 - Profil `dev` memakai opt-level 1, mempertahankan debug information/assertions; `test` eksplisit opt-level 0. Ini mengurangi biaya hitungan sel/render pada `cargo run` tanpa memaksa pengguna beralih ke release; kompilasi dev pertama lebih mahal.
 - Hasil perbandingan input tetap, CPU proses dan PTY tercatat di [ROADMAP.md](ROADMAP.md). Gap vertikal luar dihapus tanpa menghilangkan frame/minimum editor.
+
+## Keputusan session restore otomatis
+
+Disetujui pengguna dan tersedia; bukti fungsional Linux/tmux dicatat di [ROADMAP.md](ROADMAP.md#hasil-session-restore-otomatis). Verifikasi keamanan terpisah tidak dianggap lolos hanya karena build/TUI berhasil.
+
+- `naf` tanpa path memulihkan sesi pengguna dan menyimpannya saat Ctrl+Q. Startup tanpa path selalu menampilkan explorer, mengalahkan visibility snapshot lama tanpa mengubah root/lebar atau state editing. `--no-session` menonaktifkan seluruh pembacaan/penulisan snapshot; tanpa path explorer juga tampil. Launch file/folder tetap terpisah dan tidak mengubah sesi default: file memulai dengan explorer tersembunyi, folder menampilkannya. Ctrl+B men-toggle visibility selama aplikasi berjalan; format snapshot tidak berubah.
+- Snapshot menyimpan teks satu kali per dokumen, baseline disk asli, format/read-only/dirty, tab per panel, view lokal, active tab/panel, tree/ratio split serta root/visibility/fokus/lebar explorer. Undo/redo dimulai ulang setelah restore; dokumen shared tetap satu buffer/history. Buffer dipulihkan persis, bukan di-reload otomatis dari disk; baseline asli menjaga dialog konflik saat Save jika sumber berubah/hilang.
+- Modul `session` memiliki I/O snapshot dan lock; workspace memiliki ekspor/impor serta invariant state; layout memiliki validasi topologi. Rendering tidak melakukan I/O sesi. Teks Rope dialirkan per chunk, bukan dikumpulkan menjadi String seluruh dokumen.
+- Lokasi default `$XDG_STATE_HOME/notefart/session.naf`, atau `$HOME/.local/state/notefart/session.naf`; base harus absolut. Direktori privat 0700, file 0600 dan exclusive nonblocking lock mencegah dua sesi default saling menimpa. Snapshot bukan enkripsi atau secure erase.
+- Format v1: magic/version, panjang metadata JSON berbatas, payload UTF-8 per dokumen dan checksum BLAKE3. Path disimpan sebagai byte Unix agar nama non-UTF-8 tetap utuh. Simpan melalui tempfile satu direktori, fsync, atomic replacement dan directory sync. Snapshot rusak/versi asing gagal jelas sebelum TUI tanpa diganti sesi kosong; `--no-session` tetap dapat dipakai.
+- Batas snapshot: metadata 4 MiB, teks 64 MiB/dokumen, total file 256 MiB, 1024 dokumen, 256 panel dan 4096 view. Penolakan simpan mempertahankan editor/buffer; bukan pemotongan diam-diam atau janji CPU/RSS. Error sebelum persist mempertahankan snapshot lama; sesudah replace, kegagalan directory sync berarti durability tidak pasti dan editor tetap terbuka.
+- Serde 1.0.229 (sudah transitif) menjadi dependency langsung dan serde_json 1.0.145 ditambahkan untuk metadata bertipe; versi dipin ke versi yang diverifikasi, bukan klaim terbaru. Keduanya MIT OR Apache-2.0 dengan MSRV 1.56/1.61, sesuai toolchain terpin. Teks tidak diserialisasi sebagai JSON. Metadata resmi: [serde](https://crates.io/api/v1/crates/serde/1.0.229), [serde_json](https://crates.io/api/v1/crates/serde_json/1.0.145).
+- Lockfile juga menambahkan memchr 2.8.3 (Unlicense OR MIT, MSRV 1.61), transitif melalui serde_json; [metadata resmi](https://crates.io/api/v1/crates/memchr/2.8.3). Audit dependency historis sebelum perubahan lockfile ini tidak dianggap mencakup dependency baru.
+
+
+## Kontrak perbaikan AGY P0
+
+- Status foreground membawa level eksplisit Info/Success/Warning/Error; renderer tidak menebak severity dari prefix string. Warning highlight disimpan pada cache dokumen dan dibaca sebagai note terpisah, bukan menimpa hasil aksi pengguna pada idle tick.
+- Input path, caret/selection dan continuation Save/Close/Quit dipertahankan ketika Open/Save As gagal agar path dapat diperbaiki dan dicoba lagi. Overwrite/Conflict tetap transisi eksplisit, bukan bypass guard.
+- Pesan dan aksi Choices memakai perhitungan fit yang sama pada renderer/controller. Jika seluruh warning dan tombol tidak muat, hanya Resize/Esc yang aktif; mnemonic destruktif tidak boleh bekerja secara tersembunyi.
+- Discard tetap berlaku segera per dokumen. Cancel pada konfirmasi berikutnya tidak membatalkan keputusan sebelumnya; pesan harus menyatakan hal ini. Ini bukan transaksi discard massal baru.
+- Legacy Alt+] dan pembuka OSC memakai byte yang sama. Tidak menambah timeout yang menjadikan payload control string belum selesai sebagai shortcut. Decoder mempertahankan drain BEL/ST; bila input tertahan setelah idle, tampilkan hint pemulihan Ctrl+G (BEL) dan bersihkan hint setelah parser aman kembali. Pengujian jalur keamanan dikerjakan model ATMO pilihan pengguna.
+- Startup explorer yang telah dipilih pengguna tetap: tanpa path/folder tampil, argumen file hidden, Ctrl+B toggle; visibility snapshot tidak mengalahkan kebijakan startup. Saran fitur tambahan AGY tetap draft, bukan perluasan scope batch ini.

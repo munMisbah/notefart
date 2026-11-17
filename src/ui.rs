@@ -12,6 +12,7 @@ use crate::document::Document;
 use crate::explorer::{EntryKind, Explorer};
 use crate::highlight::{LineTokens, Token, TokenSpan};
 use crate::layout::{Axis, Divider, Layout, PaneMinimum, SplitTree};
+use crate::scrollbar::{MeasuredWidth, Scrollbar};
 use crate::theme::{self, ChromeIcon, IconKind, IconMode, Theme};
 use ratatui::{
     Frame,
@@ -20,7 +21,7 @@ use ratatui::{
     style::{Modifier, Style},
     symbols::border,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -61,6 +62,9 @@ pub struct PaneGeometry {
     pub area: Rect,
     pub text_area: Rect,
     pub tabs: Vec<TabHit>,
+    pub vertical_scrollbar: Option<Scrollbar>,
+    pub horizontal_scrollbar: Option<Scrollbar>,
+    pub horizontal_track: Option<Rect>,
     pub previous_tab: Option<Rect>,
     pub next_tab: Option<Rect>,
 }
@@ -85,12 +89,22 @@ pub(crate) enum ChoiceKind {
     Conflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
 #[derive(Debug, Default)]
 pub struct Geometry {
     pub panes: Vec<PaneGeometry>,
     pub sidebar: Option<Rect>,
     pub sidebar_parent: Option<Rect>,
     pub sidebar_panel: Option<Rect>,
+    pub sidebar_scrollbar: Option<Scrollbar>,
+    pub help_scrollbar: Option<Scrollbar>,
     pub explorer_divider: Option<Rect>,
     pub splits: Vec<Divider>,
     pub collapsed: bool,
@@ -118,11 +132,14 @@ pub enum Dialog<'a> {
         title: &'a str,
         lines: &'a [&'a str],
         kind: ChoiceKind,
+        target: Option<&'a Path>,
+        focused: usize,
     },
     Search {
         query: FieldView<'a>,
         replacement: Option<FieldView<'a>>,
         replacement_focus: bool,
+        feedback: Option<&'a str>,
     },
     Help {
         scroll: usize,
@@ -137,6 +154,7 @@ pub struct PaneScreen<'a> {
     pub selection: Option<Range<usize>>,
     pub top_line: usize,
     pub left_cell: usize,
+    pub horizontal_extent: Option<MeasuredWidth>,
     pub read_only: bool,
     pub tabs: &'a [TabCaption<'a>],
     pub highlights: &'a [LineTokens],
@@ -164,6 +182,8 @@ pub struct Screen<'a> {
     pub tree: &'a SplitTree,
     pub title: &'a str,
     pub status: &'a str,
+    pub(crate) status_level: StatusLevel,
+    pub(crate) highlight_warning: Option<&'a str>,
     pub active_path: Option<&'a Path>,
     pub format: FileFormat,
     pub dirty: bool,
@@ -182,6 +202,8 @@ impl fmt::Debug for Screen<'_> {
             .field("active_pane", &self.active_pane)
             .field("title", &self.title)
             .field("status", &self.status)
+            .field("status_level", &self.status_level)
+            .field("highlight_warning", &self.highlight_warning)
             .field("dialog", &self.dialog)
             .field("has_explorer", &self.explorer.is_some())
             .field("sidebar_width", &self.sidebar_width)
@@ -371,37 +393,29 @@ fn fill_row(buf: &mut Buffer, rect: Rect, style: Style) {
     }
 }
 
-fn wrapped_line_rows(line: &str, max_width: usize) -> usize {
-    if max_width == 0 {
-        return 1;
-    }
-    if UnicodeWidthStr::width(line) <= max_width {
-        return 1;
-    }
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for word in line.split_whitespace() {
-        let ww = UnicodeWidthStr::width(word).max(1);
-        if col == 0 {
-            if ww <= max_width {
-                col = ww;
-            } else {
-                rows += (ww - 1) / max_width;
-                col = ((ww - 1) % max_width) + 1;
-            }
-        } else if col + 1 + ww <= max_width {
-            col += 1 + ww;
-        } else {
-            rows += 1;
-            if ww <= max_width {
-                col = ww;
-            } else {
-                rows += (ww - 1) / max_width;
-                col = ((ww - 1) % max_width) + 1;
-            }
+fn wrap_choice_line(
+    line: &str,
+    max_width: usize,
+    mut emit: impl FnMut(&str, usize, usize),
+) -> usize {
+    let (mut row, mut col) = (0usize, 0usize);
+    for grapheme in line.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if width == 0 || width > max_width || max_width == 0 {
+            return usize::MAX;
         }
+        if col + width > max_width {
+            row += 1;
+            col = 0;
+        }
+        emit(grapheme, row, col);
+        col += width;
     }
-    rows
+    row + 1
+}
+
+fn wrapped_line_rows(line: &str, max_width: usize) -> usize {
+    wrap_choice_line(line, max_width, |_, _, _| {})
 }
 
 fn clear_geometry(geometry: &mut Geometry) {
@@ -410,28 +424,15 @@ fn clear_geometry(geometry: &mut Geometry) {
     geometry.sidebar_parent = None;
     geometry.sidebar_panel = None;
     geometry.explorer_divider = None;
+    geometry.sidebar_scrollbar = None;
+    geometry.help_scrollbar = None;
     geometry.splits.clear();
     geometry.collapsed = false;
     geometry.field_pool.append(&mut geometry.fields);
     geometry.commands.clear();
 }
 
-fn divider_touches_rect(div: &Divider, rect: Rect) -> bool {
-    match div.axis {
-        Axis::Columns => {
-            (rect.right() == div.area.x || div.area.right() == rect.x)
-                && rect.y < div.area.bottom()
-                && div.area.y < rect.bottom()
-        }
-        Axis::Rows => {
-            (rect.bottom() == div.area.y || div.area.bottom() == rect.y)
-                && rect.x < div.area.right()
-                && div.area.x < rect.right()
-        }
-    }
-}
-
-fn draw_split_dividers(
+fn draw_column_dividers(
     frame: &mut Frame,
     splits: &[Divider],
     active_pane_area: Option<Rect>,
@@ -447,48 +448,29 @@ fn draw_split_dividers(
     } else {
         "┊"
     };
-    let row_sym = if model.icons == IconMode::Ascii {
-        "."
-    } else {
-        "⋯"
-    };
     let inactive_style = Style::default().bg(theme.canvas).fg(theme.border);
     let active_style = Style::default().bg(theme.canvas).fg(theme.accent);
 
-    for div in splits {
+    for div in splits.iter().filter(|d| d.axis == Axis::Columns) {
         if div.area.is_empty() {
             continue;
         }
         let touches_active = !model.explorer_focused
-            && active_pane_area.is_some_and(|rect| divider_touches_rect(div, rect));
+            && active_pane_area.is_some_and(|rect| {
+                (rect.right() == div.area.x || div.area.right() == rect.x)
+                    && rect.y < div.area.bottom()
+                    && div.area.y < rect.bottom()
+            });
         let style = if touches_active {
             active_style
         } else {
             inactive_style
         };
-        fill_row(
-            buf,
-            div.area,
-            Style::default().bg(theme.canvas).fg(theme.border),
-        );
-        match div.axis {
-            Axis::Columns => {
-                let mid_y = div.area.y + div.area.height / 2;
-                if mid_y < div.area.bottom() {
-                    for x in div.area.left()..div.area.right() {
-                        buf[(x, mid_y)].set_symbol(col_sym).set_style(style);
-                    }
-                }
-            }
-            Axis::Rows => {
-                let mid_x = div.area.x + div.area.width / 2;
-                if mid_x < div.area.right() {
-                    for y in div.area.top()..div.area.bottom() {
-                        buf[(mid_x, y)].set_symbol(row_sym).set_style(style);
-                    }
-                }
-            }
-        }
+        fill_row(buf, div.area, inactive_style);
+        let mid_y = div.area.y + div.area.height / 2;
+        buf[(div.area.x, mid_y)]
+            .set_symbol(col_sym)
+            .set_style(style);
     }
 }
 
@@ -498,6 +480,8 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
     geometry.sidebar_parent = None;
     geometry.sidebar_panel = None;
     geometry.explorer_divider = None;
+    geometry.sidebar_scrollbar = None;
+    geometry.help_scrollbar = None;
     geometry.splits.clear();
     geometry.collapsed = false;
     geometry.mins_scratch.clear();
@@ -576,6 +560,26 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
         model.explorer,
     ) {
         draw_sidebar(frame, panel, parent, rows, div, explorer, model);
+        geometry.sidebar_scrollbar = sidebar_areas.scrollbar.map(|track| {
+            Scrollbar::new(
+                track,
+                Axis::Rows,
+                explorer.top(),
+                usize::from(rows.height),
+                explorer.rows().len(),
+            )
+        });
+        if let Some(bar) = geometry.sidebar_scrollbar {
+            draw_scrollbar(
+                frame,
+                bar.track,
+                Axis::Rows,
+                Some(bar),
+                model.explorer_focused,
+                model.theme,
+                model.icons,
+            );
+        }
         geometry.sidebar_panel = Some(panel);
         geometry.sidebar_parent = if explorer.parent_path().is_some() {
             Some(parent)
@@ -610,6 +614,30 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
         let total_lines = pane.document.line_count().max(1);
         let areas = chrome::pane_areas(pr, total_lines);
         pg.text_area = areas.text;
+        pg.vertical_scrollbar = areas.vertical_scrollbar.map(|track| {
+            Scrollbar::new(
+                track,
+                Axis::Rows,
+                pane.top_line,
+                usize::from(areas.text.height),
+                total_lines,
+            )
+        });
+        pg.horizontal_track = areas.horizontal_scrollbar;
+        pg.horizontal_scrollbar = areas.horizontal_scrollbar.and_then(|track| {
+            let width = pane.horizontal_extent?.for_view(
+                pane.document.revision(),
+                pane.top_line,
+                areas.text.height,
+            )?;
+            Some(Scrollbar::new(
+                track,
+                Axis::Columns,
+                pane.left_cell,
+                usize::from(areas.text.width),
+                width,
+            ))
+        });
 
         draw_pane_card(frame, pr, pane_focused, model.theme, model.icons);
 
@@ -636,6 +664,28 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
             line_digits,
             total_lines,
         );
+        if let Some(bar) = pg.vertical_scrollbar {
+            draw_scrollbar(
+                frame,
+                bar.track,
+                Axis::Rows,
+                Some(bar),
+                pane_focused,
+                model.theme,
+                model.icons,
+            );
+        }
+        if let Some(track) = pg.horizontal_track {
+            draw_scrollbar(
+                frame,
+                track,
+                Axis::Columns,
+                pg.horizontal_scrollbar,
+                pane_focused,
+                model.theme,
+                model.icons,
+            );
+        }
 
         if is_active_pane {
             active_text_area = Some(areas.text);
@@ -649,7 +699,7 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
         .splits
         .extend_from_slice(&geometry.layout_scratch.dividers);
 
-    draw_split_dividers(frame, &geometry.splits, active_pane_area, model);
+    draw_column_dividers(frame, &geometry.splits, active_pane_area, model);
     draw_dock(
         frame,
         regions.dock,
@@ -681,6 +731,15 @@ fn render_safe_exit_notice(frame: &mut Frame, area: Rect, model: &Screen<'_>, no
     fill_row(buf, area, Style::default().bg(theme.canvas).fg(theme.fg));
 
     let mid_y = area.y + area.height / 2;
+    let notice = if UnicodeWidthStr::width(notice) <= area.width as usize {
+        notice
+    } else if area.width >= 6 {
+        "Ctrl+Q"
+    } else if area.width >= 2 {
+        "^Q"
+    } else {
+        "Q"
+    };
     let fitted = fit_str_with_ellipsis_mode(notice, area.width as usize, model.icons);
     let fitted_width = UnicodeWidthStr::width(fitted.as_ref()) as u16;
     let start_x = area.x + (area.width.saturating_sub(fitted_width)) / 2;
@@ -758,6 +817,7 @@ fn draw_header(frame: &mut Frame, area: Rect, framed: bool, model: &Screen<'_>) 
     } else {
         let buf = frame.buffer_mut();
         let base_style = Style::default().bg(theme.canvas).fg(theme.fg);
+        fill_row(buf, area, base_style);
 
         let clean_title = sanitize_ui_cow(model.title);
         let title_display = if clean_title.is_empty() {
@@ -1009,15 +1069,7 @@ fn draw_sidebar(
         } else {
             " "
         };
-        let marker_style = if is_selected && model.explorer_focused {
-            if theme.selection == theme.canvas {
-                row_style
-            } else {
-                row_style.fg(theme.accent)
-            }
-        } else {
-            row_style
-        };
+        let marker_style = row_style;
         buf[(cur_x, y)]
             .set_symbol(focus_marker)
             .set_style(marker_style);
@@ -1089,10 +1141,11 @@ fn draw_sidebar(
                 let ix = cur_x + written;
                 if ix + 2 <= right {
                     let issue_style = if is_selected {
-                        row_style.fg(theme.warning).add_modifier(Modifier::BOLD)
+                        row_style.add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                             .bg(theme.canvas)
+                            .fg(theme.warning)
                             .add_modifier(Modifier::BOLD)
                     };
                     write_clipped_str(buf, ix, y, 2, " !", issue_style);
@@ -1117,12 +1170,14 @@ fn draw_pane_card(
     } else {
         border::ROUNDED
     };
-    let editor_icon = theme::chrome_icon(theme::ChromeIcon::Editor, icons);
-    let (border_style, title_style, title_text) = if pane_focused {
+    let mut border_style = Style::default().bg(theme.canvas).fg(if pane_focused {
+        theme.accent
+    } else {
+        theme.border
+    });
+    let (title_style, title_text) = if pane_focused {
+        border_style = border_style.add_modifier(Modifier::BOLD);
         (
-            Style::default()
-                .bg(theme.canvas)
-                .add_modifier(Modifier::BOLD),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -1133,18 +1188,18 @@ fn draw_pane_card(
             },
         )
     } else {
-        (
-            Style::default().bg(theme.canvas).fg(theme.border),
-            Style::default().fg(theme.muted),
-            "Editor",
-        )
+        (Style::default().fg(theme.muted), "Editor")
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border_set)
         .border_style(border_style)
         .style(Style::default().bg(theme.canvas).fg(theme.fg))
-        .title(icon_title(editor_icon, title_text, title_style));
+        .title(icon_title(
+            theme::chrome_icon(theme::ChromeIcon::Editor, icons),
+            title_text,
+            title_style,
+        ));
     frame.render_widget(block, area);
 }
 
@@ -1243,32 +1298,19 @@ fn render_one_tab(
         height: 1,
     };
 
-    let reverse_cues = theme.uses_reverse_cues();
     let active_mod = if pane_focused {
-        if reverse_cues {
-            Modifier::BOLD | Modifier::REVERSED
-        } else {
-            Modifier::BOLD
-        }
-    } else if reverse_cues {
-        Modifier::REVERSED
+        Modifier::BOLD
     } else {
         Modifier::empty()
     };
 
     let base_style = if tab.active {
-        Style::default()
-            .bg(theme.canvas)
-            .fg(theme.fg)
-            .add_modifier(active_mod)
+        theme.selection_style().add_modifier(active_mod)
     } else {
         Style::default().bg(theme.canvas).fg(theme.muted)
     };
     let dirty_style = if tab.active {
-        Style::default()
-            .bg(theme.canvas)
-            .fg(theme.warning)
-            .add_modifier(active_mod)
+        base_style.add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .bg(theme.canvas)
@@ -1276,24 +1318,11 @@ fn render_one_tab(
             .add_modifier(Modifier::BOLD)
     };
     let ro_style = if tab.active {
-        let mut s = Style::default().bg(theme.canvas).fg(theme.warning);
-        if reverse_cues {
-            s = s.add_modifier(Modifier::REVERSED);
-        }
-        s
+        base_style
     } else {
         Style::default().bg(theme.canvas).fg(theme.warning)
     };
-    let mut close_style = if tab.active {
-        let mut s = Style::default().bg(theme.canvas).fg(theme.fg);
-        if reverse_cues {
-            s = s.add_modifier(Modifier::REVERSED);
-        }
-        s
-    } else {
-        Style::default().bg(theme.canvas).fg(theme.muted)
-    };
-    close_style = close_style.add_modifier(Modifier::BOLD);
+    let close_style = base_style.add_modifier(Modifier::BOLD);
 
     for cx in x..x + width {
         buf[(cx, y)].set_symbol(" ").set_style(base_style);
@@ -1346,14 +1375,7 @@ fn render_one_tab(
         let icon_w = UnicodeWidthStr::width(file_icon);
         let show_icon = content_w >= icon_w + dirty_w + ro_w + 3;
 
-        let icon_style = if tab.active && !reverse_cues {
-            Style::default()
-                .bg(theme.canvas)
-                .fg(theme::icon_color(tab_path, IconKind::File, theme))
-                .add_modifier(active_mod | Modifier::BOLD)
-        } else {
-            base_style.add_modifier(Modifier::BOLD)
-        };
+        let icon_style = base_style.add_modifier(Modifier::BOLD);
 
         let icon_reserve = if show_icon { icon_w + 1 } else { 0 };
         let label_budget = content_w.saturating_sub(dirty_w + ro_w + icon_reserve);
@@ -1580,33 +1602,10 @@ fn draw_tab_bar(
         }
     }
 
-    (prev_rect, next_rect)
-}
-
-fn is_error_status(s: &str) -> bool {
-    s.starts_with("Error")
-        || s.starts_with("Err:")
-        || s.starts_with('!')
-        || s.starts_with("Save failed")
-        || s.starts_with("Open failed")
-        || s.starts_with("Reload failed")
-        || s.starts_with("Copy failed")
-        || s.starts_with("Cut failed")
-        || s.starts_with("Paste failed")
-        || s.starts_with("Path input rejected")
-        || s.starts_with("Replace failed")
-        || s.starts_with("Search failed")
-}
-
-fn is_warning_status(s: &str) -> bool {
-    s.starts_with("Warn")
-        || s.starts_with("Read-only")
-        || s.starts_with("Highlight")
-        || s.starts_with("Resize")
-}
-
-fn is_success_status(s: &str) -> bool {
-    s == "Saved" || s.starts_with("Saved ") || s.starts_with("Opened") || s.starts_with("Replaced")
+    (
+        prev_rect.filter(|_| start > 0),
+        next_rect.filter(|_| end + 1 < tabs.len()),
+    )
 }
 
 fn draw_status(
@@ -1624,17 +1623,14 @@ fn draw_status(
     let base = Style::default().bg(theme.canvas).fg(theme.fg);
     fill_row(buf, area, base);
     let clean_status = sanitize_ui_cow(model.status);
-    let error = is_error_status(clean_status.as_ref());
-    let warning = is_warning_status(clean_status.as_ref());
+    let error = model.status_level == StatusLevel::Error;
+    let warning = model.status_level == StatusLevel::Warning;
     let critical = error || warning;
-    let operation_style = if error {
-        base.fg(theme.error).add_modifier(Modifier::BOLD)
-    } else if warning {
-        base.fg(theme.warning).add_modifier(Modifier::BOLD)
-    } else if is_success_status(clean_status.as_ref()) {
-        base.fg(theme.success)
-    } else {
-        base
+    let operation_style = match model.status_level {
+        StatusLevel::Error => base.fg(theme.error).add_modifier(Modifier::BOLD),
+        StatusLevel::Warning => base.fg(theme.warning).add_modifier(Modifier::BOLD),
+        StatusLevel::Success => base.fg(theme.success),
+        StatusLevel::Info => base,
     };
     let width = area.width.saturating_sub(2) as usize;
     let message_width = UnicodeWidthStr::width(clean_status.as_ref()) + if error { 2 } else { 0 };
@@ -1696,7 +1692,29 @@ fn draw_status(
     );
     x += used;
     remaining = remaining.saturating_sub(used as usize);
-    if !error && !warning && remaining >= 6 {
+    if let Some(note) = model.highlight_warning.filter(|_| remaining >= 10) {
+        let clean_note = sanitize_ui_cow(note);
+        let full_width = UnicodeWidthStr::width(clean_note.as_ref()) + 3;
+        let note = if full_width <= remaining {
+            clean_note.as_ref()
+        } else {
+            "[Plain]"
+        };
+        x += write_clipped_str(buf, x, area.y, 3, " | ", base.fg(theme.muted));
+        remaining = remaining.saturating_sub(3);
+        let used = write_elided(
+            buf,
+            x,
+            area.y,
+            remaining,
+            note,
+            base.fg(theme.warning),
+            model.icons,
+        );
+        x += used;
+        remaining = remaining.saturating_sub(used as usize);
+    }
+    if model.highlight_warning.is_none() && !error && !warning && remaining >= 6 {
         if let Some(path) = model.active_path {
             x += write_clipped_str(buf, x, area.y, 3, " | ", base.fg(theme.muted));
             remaining = remaining.saturating_sub(3);
@@ -1767,15 +1785,23 @@ const EXPLORER_HELPER_ACTIONS: &[HelperAction] = &[
 const EDITOR_HELPER_ACTIONS: &[HelperAction] = &[
     helper_action("[F1]", "Help", KeyCode::F(1), KeyModifiers::NONE),
     helper_action(
-        "[Ctrl+O]",
-        "Open",
-        KeyCode::Char('o'),
+        "[Ctrl+Q]",
+        "Quit",
+        KeyCode::Char('q'),
         KeyModifiers::CONTROL,
     ),
+    helper_action("[F2]", "Files", KeyCode::F(2), KeyModifiers::NONE),
+    helper_action("[F10]", "Pane", KeyCode::F(10), KeyModifiers::NONE),
     helper_action(
         "[Ctrl+S]",
         "Save",
         KeyCode::Char('s'),
+        KeyModifiers::CONTROL,
+    ),
+    helper_action(
+        "[Ctrl+O]",
+        "Open",
+        KeyCode::Char('o'),
         KeyModifiers::CONTROL,
     ),
     helper_action(
@@ -1790,15 +1816,52 @@ const EDITOR_HELPER_ACTIONS: &[HelperAction] = &[
         KeyCode::Char('r'),
         KeyModifiers::CONTROL,
     ),
-    helper_action(
-        "[Ctrl+Q]",
-        "Quit",
-        KeyCode::Char('q'),
-        KeyModifiers::CONTROL,
-    ),
-    helper_action("[F2]", "Files", KeyCode::F(2), KeyModifiers::NONE),
-    helper_action("[F10]", "Pane", KeyCode::F(10), KeyModifiers::NONE),
 ];
+
+const MORE_HELP_ACTION: HelperAction =
+    helper_action("[F1]", "All", KeyCode::F(1), KeyModifiers::NONE);
+
+fn helper_group_width(action: &HelperAction) -> u16 {
+    UnicodeWidthStr::width(action.keycap) as u16 + 1 + UnicodeWidthStr::width(action.label) as u16
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_helper_chip(
+    buf: &mut Buffer,
+    cur_x: &mut u16,
+    y: u16,
+    first: &mut bool,
+    sep: &str,
+    sep_w: u16,
+    action: &HelperAction,
+    key_style: Style,
+    label_style: Style,
+    sep_style: Style,
+    commands: &mut Vec<CommandHit>,
+) {
+    if !*first {
+        write_clipped_str(buf, *cur_x, y, sep_w as usize, sep, sep_style);
+        *cur_x += sep_w;
+    }
+
+    let key_w = UnicodeWidthStr::width(action.keycap) as u16;
+    let label_w = UnicodeWidthStr::width(action.label) as u16;
+    let group_w = key_w + 1 + label_w;
+    let chip_x = *cur_x;
+
+    write_clipped_str(buf, *cur_x, y, key_w as usize, action.keycap, key_style);
+    *cur_x += key_w;
+    buf[(*cur_x, y)].set_symbol(" ").set_style(label_style);
+    *cur_x += 1;
+    write_clipped_str(buf, *cur_x, y, label_w as usize, action.label, label_style);
+    *cur_x += label_w;
+
+    commands.push(CommandHit {
+        area: Rect::new(chip_x, y, group_w, 1),
+        key: action.key,
+    });
+    *first = false;
+}
 
 fn draw_helper(
     frame: &mut Frame,
@@ -1852,43 +1915,42 @@ fn draw_helper(
 
     let max_right = area.right().saturating_sub(1);
     let mut cur_x = area.x + 1;
+    let avail = max_right.saturating_sub(cur_x);
+    if avail == 0 {
+        return;
+    }
+
+    let total_width = actions.iter().enumerate().fold(0u16, |acc, (idx, action)| {
+        let gw = helper_group_width(action);
+        acc.saturating_add(if idx == 0 { gw } else { sep_w + gw })
+    });
+    let all_fit = total_width <= avail;
     let mut first = true;
 
     for action in actions {
-        let key_w = UnicodeWidthStr::width(action.keycap) as u16;
-        let label_w = UnicodeWidthStr::width(action.label) as u16;
-        let group_w = key_w + 1 + label_w;
-
+        let action = if !all_fit && action.key.code == KeyCode::F(1) {
+            &MORE_HELP_ACTION
+        } else {
+            action
+        };
+        let group_w = helper_group_width(action);
         let needed = if first { group_w } else { sep_w + group_w };
         if needed > max_right.saturating_sub(cur_x) {
             break;
         }
-
-        if !first {
-            write_clipped_str(buf, cur_x, area.y, sep_w as usize, sep, sep_style);
-            cur_x += sep_w;
-        }
-
-        let chip_x = cur_x;
-        write_clipped_str(buf, cur_x, area.y, key_w as usize, action.keycap, key_style);
-        cur_x += key_w;
-        buf[(cur_x, area.y)].set_symbol(" ").set_style(label_style);
-        cur_x += 1;
-        write_clipped_str(
+        draw_helper_chip(
             buf,
-            cur_x,
+            &mut cur_x,
             area.y,
-            label_w as usize,
-            action.label,
+            &mut first,
+            sep,
+            sep_w,
+            action,
+            key_style,
             label_style,
+            sep_style,
+            commands,
         );
-        cur_x += label_w;
-
-        commands.push(CommandHit {
-            area: Rect::new(chip_x, area.y, group_w, 1),
-            key: action.key,
-        });
-        first = false;
     }
 }
 
@@ -1950,13 +2012,15 @@ fn draw_commands<'a>(
     area: Rect,
     actions: impl IntoIterator<Item = (&'a str, KeyEvent)>,
     style: Style,
+    focused: Option<usize>,
+    focused_style: Style,
     hits: &mut Vec<CommandHit>,
 ) {
     if area.is_empty() {
         return;
     }
     let (mut x, mut y) = (area.x, area.y);
-    for (label, key) in actions {
+    for (idx, (label, key)) in actions.into_iter().enumerate() {
         let width = UnicodeWidthStr::width(label) as u16;
         if width > area.width {
             continue;
@@ -1968,12 +2032,53 @@ fn draw_commands<'a>(
         if y >= area.bottom() {
             break;
         }
-        write_clipped_str(buf, x, y, width as usize, label, style);
+        let item_style = if focused == Some(idx) {
+            focused_style
+        } else {
+            style
+        };
+        write_clipped_str(buf, x, y, width as usize, label, item_style);
         hits.push(CommandHit {
             area: Rect::new(x, y, width, 1),
             key,
         });
         x = x.saturating_add(width).saturating_add(1);
+    }
+}
+
+pub(crate) fn draw_scrollbar(
+    frame: &mut Frame,
+    track: Rect,
+    axis: Axis,
+    bar: Option<Scrollbar>,
+    focused: bool,
+    theme: &Theme,
+    icons: IconMode,
+) {
+    let ascii = matches!(icons, IconMode::Ascii);
+    let (rail, thumb) = match (axis, ascii) {
+        (Axis::Columns, true) => ("-", "#"),
+        (Axis::Rows, true) => ("|", "#"),
+        (Axis::Columns, false) => ("─", "━"),
+        (Axis::Rows, false) => ("│", "┃"),
+    };
+    let rail_style = Style::default().fg(theme.muted).bg(theme.canvas);
+    let thumb_style = Style::default()
+        .fg(if focused { theme.accent } else { theme.fg })
+        .bg(theme.canvas)
+        .add_modifier(Modifier::BOLD);
+    let buf = frame.buffer_mut();
+    for y in track.top()..track.bottom() {
+        for x in track.left()..track.right() {
+            let is_thumb =
+                bar.is_some_and(|bar| bar.max_offset > 0 && bar.thumb.contains((x, y).into()));
+            buf[(x, y)]
+                .set_symbol(if is_thumb { thumb } else { rail })
+                .set_style(if is_thumb { thumb_style } else { rail_style });
+        }
+    }
+    if bar.is_none() {
+        buf.set_stringn(track.x, track.y, "?", usize::from(track.width), rail_style);
     }
 }
 
@@ -2242,8 +2347,10 @@ fn draw_dialog(
 ) {
     geometry.commands.clear();
     geometry.field_pool.append(&mut geometry.fields);
+    geometry.help_scrollbar = None;
     if let Dialog::Help { scroll } = dialog {
-        crate::help::draw(frame, area, *scroll, theme, icons, &mut geometry.commands);
+        geometry.help_scrollbar =
+            crate::help::draw(frame, area, *scroll, theme, icons, &mut geometry.commands);
         return;
     }
     if area.is_empty() {
@@ -2254,7 +2361,16 @@ fn draw_dialog(
     } else {
         MIN_DIALOG_SIZE
     };
-    if area.width < min_size.0 || area.height < min_size.1 {
+    let choices_too_small = match dialog {
+        Dialog::Choices {
+            kind,
+            lines,
+            target,
+            ..
+        } => !choices_fit(area, *kind, lines, *target),
+        _ => false,
+    };
+    if area.width < min_size.0 || area.height < min_size.1 || choices_too_small {
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new("Resize!\nEsc back")
@@ -2312,6 +2428,8 @@ fn draw_dialog(
                     .iter()
                     .map(|&(label, code)| (label, KeyEvent::new(code, KeyModifiers::NONE))),
                 button_style,
+                None,
+                button_style,
                 &mut geometry.commands,
             );
         }
@@ -2319,6 +2437,7 @@ fn draw_dialog(
             query,
             replacement,
             replacement_focus,
+            feedback,
         } => {
             let actions: &[(&str, KeyCode, KeyModifiers)] = if replacement.is_some() {
                 &[
@@ -2355,6 +2474,18 @@ fn draw_dialog(
                 ),
                 rect,
             );
+            if let Some(feedback) = feedback {
+                let clean_feedback = sanitize_ui_cow(feedback);
+                write_middle_elided(
+                    frame.buffer_mut(),
+                    rect.x + 2,
+                    rect.y + 1,
+                    inner_width as usize,
+                    clean_feedback.as_ref(),
+                    Style::default().fg(theme.fg).bg(theme.canvas),
+                    icons,
+                );
+            }
             let query_focused = replacement.is_none() || !*replacement_focus;
             let y = rect.y + 2;
             let mut cursor = draw_field(
@@ -2400,19 +2531,29 @@ fn draw_dialog(
                     .iter()
                     .map(|&(label, code, modifiers)| (label, KeyEvent::new(code, modifiers))),
                 button_style,
+                None,
+                button_style,
                 &mut geometry.commands,
             );
         }
-        Dialog::Choices { title, lines, kind } => {
+        Dialog::Choices {
+            title,
+            lines,
+            kind,
+            target,
+            focused,
+        } => {
             let actions = kind.actions();
             let rows = command_rows(actions.iter().map(|action| action.0), inner_width);
+            let target_rows = u16::from(target.is_some());
             let message_rows = lines
                 .iter()
                 .map(|line| wrapped_line_rows(sanitize_ui_cow(line).as_ref(), inner_width as usize))
-                .sum::<usize>()
+                .fold(0usize, usize::saturating_add)
                 .min(u16::MAX as usize) as u16;
+            let content_rows = message_rows.saturating_add(target_rows);
             let height = rows
-                .saturating_add(message_rows)
+                .saturating_add(content_rows)
                 .saturating_add(5)
                 .min(area.height);
             let rect = centered_dialog(area, width, height);
@@ -2430,8 +2571,27 @@ fn draw_dialog(
             let visible_rows = rows.min(height.saturating_sub(2));
             let command_y = rect.bottom() - 1 - visible_rows;
             let mut y = rect.y + 1;
-            if command_y.saturating_sub(y) > message_rows {
+            if command_y.saturating_sub(y) > content_rows {
                 y += 1;
+            }
+            if let Some(target_path) = target {
+                if command_y.saturating_sub(y) > 0 {
+                    let raw = target_path.to_string_lossy();
+                    let clean_target = sanitize_ui_cow(raw.as_ref());
+                    write_middle_elided(
+                        frame.buffer_mut(),
+                        rect.x + 2,
+                        y,
+                        inner_width as usize,
+                        clean_target.as_ref(),
+                        Style::default()
+                            .fg(theme.accent)
+                            .bg(theme.canvas)
+                            .add_modifier(Modifier::BOLD),
+                        icons,
+                    );
+                    y += 1;
+                }
             }
             for line in *lines {
                 let available = command_y.saturating_sub(y);
@@ -2439,16 +2599,23 @@ fn draw_dialog(
                     break;
                 }
                 let clean_line = sanitize_ui_cow(line);
-                let height = wrapped_line_rows(clean_line.as_ref(), inner_width as usize)
-                    .min(available as usize) as u16;
-                frame.render_widget(
-                    Paragraph::new(clean_line.as_ref())
-                        .style(Style::default().fg(theme.fg).bg(theme.canvas))
-                        .wrap(Wrap { trim: true }),
-                    Rect::new(rect.x + 2, y, inner_width, height),
-                );
+                let height = wrap_choice_line(
+                    clean_line.as_ref(),
+                    inner_width as usize,
+                    |text, row, col| {
+                        write_clipped_str(
+                            frame.buffer_mut(),
+                            rect.x + 2 + col as u16,
+                            y + row as u16,
+                            inner_width as usize - col,
+                            text,
+                            Style::default().fg(theme.fg).bg(theme.canvas),
+                        );
+                    },
+                ) as u16;
                 y += height;
             }
+            let focused_idx = (*focused < actions.len()).then_some(*focused);
             draw_commands(
                 frame.buffer_mut(),
                 Rect::new(rect.x + 2, command_y, inner_width, visible_rows),
@@ -2456,6 +2623,8 @@ fn draw_dialog(
                     .iter()
                     .map(|&(label, code)| (label, KeyEvent::new(code, KeyModifiers::NONE))),
                 button_style,
+                focused_idx,
+                theme.focus_style(),
                 &mut geometry.commands,
             );
         }
@@ -2488,8 +2657,50 @@ fn command_rows<'a>(labels: impl IntoIterator<Item = &'a str>, width: u16) -> u1
     rows
 }
 
+pub(crate) fn choices_fit(
+    area: Rect,
+    kind: ChoiceKind,
+    lines: &[&str],
+    target: Option<&Path>,
+) -> bool {
+    if area.width < MIN_DIALOG_SIZE.0 || area.height < MIN_DIALOG_SIZE.1 {
+        return false;
+    }
+    let width = area.width.saturating_sub(2).max(20).min(80).min(area.width);
+    let inner_width = width.saturating_sub(4);
+    let actions = kind.actions();
+    if actions
+        .iter()
+        .any(|(label, _)| UnicodeWidthStr::width(*label) > inner_width as usize)
+    {
+        return false;
+    }
+    let rows = command_rows(actions.iter().map(|action| action.0), inner_width) as usize;
+    let target_rows = usize::from(target.is_some());
+    let message_rows = lines
+        .iter()
+        .map(|line| wrapped_line_rows(sanitize_ui_cow(line).as_ref(), inner_width as usize))
+        .fold(0usize, usize::saturating_add);
+    rows.saturating_add(message_rows)
+        .saturating_add(target_rows)
+        .saturating_add(2)
+        <= area.height as usize
+}
+
 impl ChoiceKind {
-    fn actions(self) -> &'static [(&'static str, KeyCode)] {
+    pub(crate) fn message_lines(self) -> &'static [&'static str] {
+        match self {
+            Self::Unsaved => &[
+                "Save changes before closing this document?",
+                "Discard closes this document immediately.",
+                "Cancel does not undo earlier discards.",
+            ],
+            Self::Overwrite => &["Target exists. Replace its contents?"],
+            Self::Conflict => &["File changed outside Notefart. Choose how to continue."],
+        }
+    }
+
+    pub(crate) fn actions(self) -> &'static [(&'static str, KeyCode)] {
         match self {
             Self::Unsaved => &[
                 ("S Save", KeyCode::Char('s')),
@@ -2509,6 +2720,14 @@ impl ChoiceKind {
                 ("C Cancel", KeyCode::Char('c')),
                 ("F1 Help", KeyCode::F(1)),
             ],
+        }
+    }
+
+    pub(crate) fn cancel_index(self) -> usize {
+        match self {
+            Self::Unsaved => 2,
+            Self::Overwrite => 1,
+            Self::Conflict => 3,
         }
     }
 }
@@ -2585,6 +2804,7 @@ mod tests {
         Terminal,
         backend::{Backend, TestBackend},
         layout::Position,
+        style::Color,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -2647,6 +2867,7 @@ mod tests {
             read_only: false,
             tabs,
             highlights,
+            horizontal_extent: None,
         }
     }
 
@@ -2673,6 +2894,8 @@ mod tests {
                 tree: &tree,
                 title: "[Q] not an action",
                 status: "[Q] not an action",
+                status_level: StatusLevel::Info,
+                highlight_warning: None,
                 active_path: None,
                 format: FileFormat::default(),
                 dirty: false,
@@ -2680,6 +2903,8 @@ mod tests {
                     title: "[Q] not an action",
                     lines: &["[Q] not an action"],
                     kind,
+                    target: None,
+                    focused: kind.cancel_index(),
                 }),
                 explorer: None,
                 sidebar_width: 0,
@@ -2689,6 +2914,15 @@ mod tests {
             };
             for (width, height) in [(20, 6), (80, 24)] {
                 let (_, geometry) = render_screen(width, height, &screen);
+                if !choices_fit(
+                    Rect::new(0, 0, width, height),
+                    kind,
+                    &["[Q] not an action"],
+                    None,
+                ) {
+                    assert!(geometry.commands.is_empty());
+                    continue;
+                }
                 for &key in expected {
                     assert!(
                         geometry
@@ -2710,6 +2944,148 @@ mod tests {
                         hit.area
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn choices_require_complete_messages_and_commands() {
+        let doc = Document::new("text");
+        let tabs = base_tabs();
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let tree = SplitTree::new(1);
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
+        let lines = ["abcdefghijklmnopqrstuvwxyz0123456789"];
+        for kind in [
+            ChoiceKind::Unsaved,
+            ChoiceKind::Overwrite,
+            ChoiceKind::Conflict,
+        ] {
+            for (width, height) in [(20, 6), (24, 8), (40, 10), (80, 24)] {
+                let mut screen =
+                    status_screen(&panes, &tree, &theme, "ready", None, IconMode::Ascii);
+                screen.dialog = Some(Dialog::Choices {
+                    title: "Choice",
+                    lines: &lines,
+                    kind,
+                    target: None,
+                    focused: kind.cancel_index(),
+                });
+                let (terminal, geometry) = render_screen(width, height, &screen);
+                if !choices_fit(Rect::new(0, 0, width, height), kind, &lines, None) {
+                    assert!(geometry.commands.is_empty());
+                    continue;
+                }
+                assert_eq!(geometry.commands.len(), kind.actions().len());
+                let buffer = terminal.backend().buffer();
+                let command_y = geometry
+                    .commands
+                    .iter()
+                    .map(|hit| hit.area.y)
+                    .min()
+                    .unwrap();
+                let content: String = (0..command_y)
+                    .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                    .collect();
+                let mut chars = content.chars();
+                for expected in lines[0].chars() {
+                    assert!(
+                        chars.any(|c| c == expected),
+                        "missing {expected:?} in {content:?}"
+                    );
+                }
+            }
+        }
+        assert!(!choices_fit(
+            Rect::new(0, 0, 20, 6),
+            ChoiceKind::Unsaved,
+            ChoiceKind::Unsaved.message_lines(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn status_level_and_highlight_note_are_independent() {
+        let doc = Document::new("text");
+        let tabs = base_tabs();
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let tree = SplitTree::new(1);
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = Theme::new(kind, ColorMode::Truecolor);
+            let mut screen = status_screen(&panes, &tree, &theme, "Saved", None, IconMode::Ascii);
+            screen.status_level = StatusLevel::Error;
+            screen.highlight_warning = Some("Highlight reason");
+            let (terminal, _) = render_screen(120, 24, &screen);
+            let row = status_row_text(&terminal, 120, 24);
+            assert!(row.contains("Saved") && row.contains("Highlight reason"));
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(4, status_row_y(120, 24))].fg, theme.error);
+            screen.highlight_warning =
+                Some("A long highlighting warning that does not fit beside the operation");
+            let (terminal, _) = render_screen(60, 14, &screen);
+            let row = status_row_text(&terminal, 60, 14);
+            assert!(row.contains("Saved") && row.contains("[Plain]"), "{row}");
+            screen.status_level = StatusLevel::Info;
+            screen.highlight_warning = None;
+            let (terminal, _) = render_screen(120, 24, &screen);
+            assert_eq!(
+                terminal.backend().buffer()[(2, status_row_y(120, 24))].fg,
+                theme.fg
+            );
+        }
+    }
+
+    #[test]
+    fn compact_canvas_active_border_and_exit_notice_are_explicit() {
+        let doc = Document::new("text");
+        let tabs = base_tabs();
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let tree = SplitTree::new(1);
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            for mode in [ColorMode::Truecolor, ColorMode::Ansi256] {
+                let theme = Theme::new(kind, mode);
+                let screen = status_screen(&panes, &tree, &theme, "ready", None, IconMode::Ascii);
+                let (terminal, geometry) = render_screen(38, 16, &screen);
+                let buffer = terminal.backend().buffer();
+                for x in 0..38 {
+                    assert_eq!(buffer[(x, 0)].bg, Color::Reset);
+                }
+                let pane = geometry.pane(1).unwrap().area;
+                assert_eq!(buffer[(pane.x, pane.y + 1)].fg, theme.accent);
+                for width in [2, 3, 5, 6, 10] {
+                    let (terminal, _) = render_screen(width, 2, &screen);
+                    let row = row_text(terminal.backend().buffer(), Rect::new(0, 1, width, 1), 0);
+                    assert!(
+                        row.contains("^Q") || row.contains("Ctrl+Q"),
+                        "{width}: {row}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn selected_explorer_marker_uses_readable_selection_foreground() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("note.txt"), "text").unwrap();
+        let explorer = Explorer::new(dir.path().to_path_buf()).unwrap();
+        let doc = Document::new("text");
+        let tabs = base_tabs();
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let tree = SplitTree::new(1);
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            for mode in [ColorMode::Truecolor, ColorMode::Ansi256] {
+                let theme = Theme::new(kind, mode);
+                let mut screen =
+                    status_screen(&panes, &tree, &theme, "ready", None, IconMode::Ascii);
+                screen.explorer = Some(&explorer);
+                screen.sidebar_width = 24;
+                screen.explorer_focused = true;
+                let (terminal, geometry) = render_screen(80, 24, &screen);
+                let rows = geometry.sidebar.unwrap();
+                let marker = &terminal.backend().buffer()[(rows.x, rows.y)];
+                assert_eq!(marker.symbol(), ">");
+                assert_eq!(marker.fg, theme.fg);
+                assert_eq!(marker.bg, theme.selection);
             }
         }
     }
@@ -2751,6 +3127,8 @@ mod tests {
             tree,
             title: "note.txt",
             status,
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path,
             format: FileFormat::default(),
             dirty: false,
@@ -2791,7 +3169,7 @@ mod tests {
         let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
         let panes = [single_pane(&doc, &tabs, &[])];
         let status = "Paste failed: clipboard returned invalid UTF-8; previous content preserved";
-        let screen = status_screen(
+        let mut screen = status_screen(
             &panes,
             &tree,
             &theme,
@@ -2799,6 +3177,7 @@ mod tests {
             Some(Path::new("/home/example/notes/report.txt")),
             IconMode::Unicode,
         );
+        screen.status_level = StatusLevel::Error;
         let term = render_screen(120, 24, &screen).0;
         let row = status_row_text(&term, 120, 24);
         // The whole reason fits; it is neither cut at half the row nor
@@ -2830,7 +3209,7 @@ mod tests {
         let panes = [single_pane(&doc, &tabs, &[])];
         let middle = "m".repeat(96);
         let status = format!("Save failed: /data/{middle}/paper.tex: No space left on device");
-        let screen = status_screen(
+        let mut screen = status_screen(
             &panes,
             &tree,
             &theme,
@@ -2838,6 +3217,7 @@ mod tests {
             Some(Path::new("/tmp/notes/report.txt")),
             IconMode::Unicode,
         );
+        screen.status_level = StatusLevel::Error;
         let term = render_screen(120, 24, &screen).0;
         let row = status_row_text(&term, 120, 24);
         assert!(row.contains("Save failed:"), "row: {row}");
@@ -2864,7 +3244,7 @@ mod tests {
             "Highlight: pattern '{}' flooded the visible pane so it cannot be shown in full",
             "w".repeat(90)
         );
-        let screen = status_screen(
+        let mut screen = status_screen(
             &panes,
             &tree,
             &theme,
@@ -2872,6 +3252,7 @@ mod tests {
             Some(Path::new("/home/example/notes/report.txt")),
             IconMode::Unicode,
         );
+        screen.status_level = StatusLevel::Warning;
         let term = render_screen(120, 24, &screen).0;
         let row = status_row_text(&term, 120, 24);
         assert!(row.contains("Highlight:"), "row: {row}");
@@ -2933,7 +3314,8 @@ mod tests {
         let hostile = "Saved café-\u{202e}日本語🦀.rs\x07";
         for icons in [IconMode::Ascii, IconMode::Unicode, IconMode::Nerd] {
             for width in [12u16, 20, 40] {
-                let err_screen = status_screen(&panes, &tree, &theme, &long_error, None, icons);
+                let mut err_screen = status_screen(&panes, &tree, &theme, &long_error, None, icons);
+                err_screen.status_level = StatusLevel::Error;
                 let err_row = status_row_text(&render_screen(width, 8, &err_screen).0, width, 8);
                 if width >= 40 {
                     assert!(err_row.contains("Save failed:"), "row: {err_row}");
@@ -3033,6 +3415,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3089,6 +3473,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3198,6 +3584,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs1,
                 highlights: &highlights,
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 2,
@@ -3210,6 +3597,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs2,
                 highlights: &highlights,
+                horizontal_extent: None,
             },
         ];
         let screen = Screen {
@@ -3218,6 +3606,8 @@ mod tests {
             tree: &tree,
             title: "far.txt",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3362,6 +3752,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs1,
                 highlights: &[],
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 2,
@@ -3374,6 +3765,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs2,
                 highlights: &[],
+                horizontal_extent: None,
             },
         ];
         let screen = Screen {
@@ -3382,6 +3774,8 @@ mod tests {
             tree: &tree,
             title: "wide.txt",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3449,7 +3843,7 @@ mod tests {
                 id: 100,
                 label: "alpha.rs",
                 dirty: true,
-                read_only: false,
+                read_only: true,
                 active: true,
             },
             TabCaption {
@@ -3467,6 +3861,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3494,6 +3890,16 @@ mod tests {
         let has_star_in_body =
             (t0.body.left()..t0.body.right()).any(|x| buf_fit[(x, t0.body.y)].symbol() == "*");
         assert!(has_star_in_body);
+        assert!(row_text(buf_fit, t0.body, 0).contains("[RO]"));
+        for x in t0.body.x..t0.close.right() {
+            let cell = &buf_fit[(x, t0.body.y)];
+            assert_eq!(cell.bg, theme.selection);
+            assert_eq!(cell.fg, theme.fg);
+        }
+        let inactive = pg_fit.tabs[1];
+        for x in inactive.body.x..inactive.close.right() {
+            assert_eq!(buf_fit[(x, inactive.body.y)].bg, Color::Reset);
+        }
 
         let many_labels = [
             "one.rs", "two.rs", "three.rs", "four.rs", "five.rs", "six.rs",
@@ -3517,6 +3923,8 @@ mod tests {
                 tree: &tree,
                 title: "/ws",
                 status: "ok",
+                status_level: StatusLevel::Info,
+                highlight_warning: None,
                 active_path: None,
                 format: FileFormat::default(),
                 dirty: false,
@@ -3529,9 +3937,19 @@ mod tests {
             };
             let (term_ov, geom_ov) = render_screen(48, 12, &screen_ov);
             let pg_ov = geom_ov.pane(1).expect("pane 1 overflow");
-            let prev = pg_ov.previous_tab.expect("previous_tab overflow button");
-            let next = pg_ov.next_tab.expect("next_tab overflow button");
-            assert!(!rects_overlap(prev, next));
+            if active_pos == 0 {
+                assert_eq!(pg_ov.previous_tab, None);
+            } else {
+                assert!(pg_ov.previous_tab.is_some());
+            }
+            if active_pos + 1 == tabs.len() {
+                assert_eq!(pg_ov.next_tab, None);
+            } else {
+                assert!(pg_ov.next_tab.is_some());
+            }
+            if let (Some(prev), Some(next)) = (pg_ov.previous_tab, pg_ov.next_tab) {
+                assert!(!rects_overlap(prev, next));
+            }
             let expected_active_id = tabs[active_pos].id;
             assert!(
                 pg_ov.tabs.iter().any(|h| h.id == expected_active_id),
@@ -3541,10 +3959,14 @@ mod tests {
             for hit in &pg_ov.tabs {
                 assert!(tabs.iter().any(|t| t.id == hit.id));
                 assert!(!rects_overlap(hit.body, hit.close));
-                assert!(!rects_overlap(hit.body, prev));
-                assert!(!rects_overlap(hit.close, prev));
-                assert!(!rects_overlap(hit.body, next));
-                assert!(!rects_overlap(hit.close, next));
+                if let Some(prev) = pg_ov.previous_tab {
+                    assert!(!rects_overlap(hit.body, prev));
+                    assert!(!rects_overlap(hit.close, prev));
+                }
+                if let Some(next) = pg_ov.next_tab {
+                    assert!(!rects_overlap(hit.body, next));
+                    assert!(!rects_overlap(hit.close, next));
+                }
                 assert_eq!(buf_ov[(hit.close.x, hit.close.y)].symbol(), "x");
             }
         }
@@ -3570,6 +3992,8 @@ mod tests {
             tree: &tree,
             title: "root",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3590,7 +4014,11 @@ mod tests {
             .expect("explorer divider visible on 80x20");
         let pg = geom_wide.pane(1).expect("pane 1");
         assert_eq!(sb_panel.width, 28);
-        assert_eq!(sb.width, 26);
+        let rail = geom_wide.sidebar_scrollbar.expect("sidebar rail").track;
+        assert_eq!(sb.right(), rail.x);
+        assert_eq!(rail.right(), sb_panel.right() - 1);
+        assert_eq!(rail.y, sb.y);
+        assert_eq!(rail.height, sb.height);
         let parent = geom_wide
             .sidebar_parent
             .expect("sidebar_parent visible on 80x20");
@@ -3648,6 +4076,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3664,6 +4094,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3724,6 +4156,8 @@ mod tests {
                 tree: &tree,
                 title: "a",
                 status: "b",
+                status_level: StatusLevel::Info,
+                highlight_warning: None,
                 active_path: None,
                 format: FileFormat::default(),
                 dirty: false,
@@ -3748,6 +4182,8 @@ mod tests {
             tree: &tree,
             title: "a",
             status: "b",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3763,6 +4199,7 @@ mod tests {
                     selection: None,
                 }),
                 replacement_focus: true,
+                feedback: None,
             }),
             explorer: None,
             sidebar_width: 0,
@@ -3786,6 +4223,8 @@ mod tests {
             tree: &tree,
             title: "a",
             status: "b",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3801,6 +4240,7 @@ mod tests {
                     selection: None,
                 }),
                 replacement_focus: false,
+                feedback: None,
             }),
             explorer: None,
             sidebar_width: 0,
@@ -3908,6 +4348,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs1,
                 highlights: &shared_hl,
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 2,
@@ -3920,6 +4361,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs2,
                 highlights: &shared_hl,
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 3,
@@ -3932,6 +4374,7 @@ mod tests {
                 read_only: true,
                 tabs: &tabs3,
                 highlights: &[],
+                horizontal_extent: None,
             },
         ];
 
@@ -3942,6 +4385,8 @@ mod tests {
             tree: &tree,
             title: "/repo",
             status: "Ready",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -3952,7 +4397,7 @@ mod tests {
             theme: &theme,
             icons: IconMode::Unicode,
         };
-        let (mut term1, geom1) = render_screen(80, 20, &screen_p1);
+        let (mut term1, geom1) = render_screen(80, 24, &screen_p1);
         assert!(!geom1.collapsed);
         assert_eq!(geom1.panes.len(), 3);
         assert_eq!(geom1.splits.len(), 2);
@@ -3964,9 +4409,18 @@ mod tests {
         assert!(!rects_overlap(pg1.area, pg3.area));
         assert!(!rects_overlap(pg2.area, pg3.area));
         for div in &geom1.splits {
-            assert!(!rects_overlap(div.area, pg1.area));
-            assert!(!rects_overlap(div.area, pg2.area));
-            assert!(!rects_overlap(div.area, pg3.area));
+            for pane in [pg1, pg2, pg3] {
+                assert!(!rects_overlap(div.area, pane.text_area));
+                for tab in &pane.tabs {
+                    assert!(!rects_overlap(div.area, tab.body));
+                    assert!(!rects_overlap(div.area, tab.close));
+                }
+                if div.axis == Axis::Columns {
+                    assert!(!rects_overlap(div.area, pane.area));
+                } else if rects_overlap(div.area, pane.area) {
+                    assert_eq!(div.area.bottom(), pane.area.bottom());
+                }
+            }
         }
         assert_eq!(pg1.tabs[0].id, 11);
         assert_eq!(
@@ -4006,7 +4460,7 @@ mod tests {
             icons: IconMode::Ascii,
             ..screen_p1
         };
-        let (mut term3, geom3) = render_screen(80, 20, &screen_p3);
+        let (mut term3, geom3) = render_screen(80, 24, &screen_p3);
         let pg3_new = geom3.pane(3).unwrap();
         let cur3 = term3.backend_mut().get_cursor_position().unwrap();
         assert_eq!(
@@ -4065,6 +4519,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs1,
                 highlights: &[],
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 2,
@@ -4077,6 +4532,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs2,
                 highlights: &[],
+                horizontal_extent: None,
             },
         ];
         let screen = Screen {
@@ -4085,6 +4541,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4159,6 +4617,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs1,
                 highlights: &[],
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 2,
@@ -4171,6 +4630,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs2,
                 highlights: &[],
+                horizontal_extent: None,
             },
         ];
 
@@ -4181,6 +4641,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4256,6 +4718,7 @@ mod tests {
                 read_only: false,
                 tabs: &tabs3,
                 highlights: &[],
+                horizontal_extent: None,
             },
         ];
         let screen3 = Screen {
@@ -4264,6 +4727,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4292,6 +4757,7 @@ mod tests {
                 selection: self.selection.clone(),
                 top_line: self.top_line,
                 left_cell: self.left_cell,
+                horizontal_extent: self.horizontal_extent,
                 read_only: self.read_only,
                 tabs: self.tabs,
                 highlights: self.highlights,
@@ -4340,6 +4806,7 @@ mod tests {
                 read_only: false,
                 tabs: &two_tabs,
                 highlights: &[],
+                horizontal_extent: None,
             },
             PaneScreen {
                 id: 2,
@@ -4352,6 +4819,7 @@ mod tests {
                 read_only: false,
                 tabs: &one_tab,
                 highlights: &[],
+                horizontal_extent: None,
             },
         ];
         let mut geom = Geometry::default();
@@ -4361,6 +4829,8 @@ mod tests {
             tree: &tree,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4388,6 +4858,7 @@ mod tests {
             read_only: false,
             tabs: &one_tab,
             highlights: &[],
+            horizontal_extent: None,
         }];
         let screen1 = Screen {
             panes: &panes1,
@@ -4395,6 +4866,8 @@ mod tests {
             tree: &tree1,
             title: "/ws",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4413,7 +4886,7 @@ mod tests {
         assert!(geom.splits.is_empty());
     }
     #[test]
-    fn explorer_divider_uses_the_configured_canvas_instead_of_terminal_default() {
+    fn explorer_divider_preserves_terminal_background() {
         let dir = TempDir::new().unwrap();
         let explorer = Explorer::new(dir.path().to_path_buf()).unwrap();
         let doc = Document::new("content");
@@ -4428,6 +4901,8 @@ mod tests {
                 tree: &tree,
                 title: "workspace",
                 status: "ready",
+                status_level: StatusLevel::Info,
+                highlight_warning: None,
                 active_path: None,
                 format: FileFormat::default(),
                 dirty: false,
@@ -4442,7 +4917,116 @@ mod tests {
             let buffer = terminal.backend().buffer();
             let gap = geometry.explorer_divider.unwrap();
             for y in gap.top()..gap.bottom() {
-                assert_eq!(buffer[(gap.x, y)].bg, theme.canvas);
+                assert_eq!(buffer[(gap.x, y)].bg, Color::Reset);
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_panels_keep_complete_borders_without_horizontal_decoration() {
+        let doc = Document::new("one\ntwo");
+        let tabs: [TabCaption<'_>; 4] = std::array::from_fn(|i| TabCaption {
+            id: i as u64 + 1,
+            label: "note.txt",
+            dirty: false,
+            read_only: false,
+            active: true,
+        });
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
+        for (top_columns, bottom_columns) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut tree = SplitTree::new(1);
+            tree.split(1, 2, Axis::Rows).unwrap();
+            if top_columns {
+                tree.split(1, 3, Axis::Columns).unwrap();
+            }
+            if bottom_columns {
+                tree.split(2, 4, Axis::Columns).unwrap();
+            }
+            let ids = tree.panes();
+            if top_columns {
+                let mins: Vec<_> = ids
+                    .iter()
+                    .map(|&id| PaneMinimum {
+                        id,
+                        width: chrome::pane_min_width(doc.line_count()),
+                        height: MIN_PANE_HEIGHT,
+                    })
+                    .collect();
+                let mut layout = Layout::default();
+                tree.layout(Rect::new(0, 0, 60, 24), 1, &mins, &mut layout);
+                let column = *layout
+                    .dividers
+                    .iter()
+                    .find(|d| d.axis == Axis::Columns)
+                    .unwrap();
+                assert!(tree.resize(&column, 29));
+            }
+            let panes: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let mut pane = single_pane(&doc, &tabs[id as usize - 1..id as usize], &[]);
+                    pane.id = id;
+                    pane
+                })
+                .collect();
+            for width in [12, 25, 60] {
+                if width < 25 && (top_columns || bottom_columns) {
+                    continue;
+                }
+                for icons in [IconMode::Ascii, IconMode::Unicode, IconMode::Nerd] {
+                    for &active in &ids {
+                        let mut screen = status_screen(&panes, &tree, &theme, "ready", None, icons);
+                        screen.active_pane = active;
+                        let (terminal, geometry) = render_screen(width, 24, &screen);
+                        let top = geometry.pane(1).unwrap();
+                        let bottom = geometry.pane(2).unwrap();
+                        let divider = &geometry.splits[0];
+                        assert_eq!(top.area.bottom(), bottom.area.y);
+                        assert_eq!(divider.area.bottom(), bottom.area.y);
+                        for pane in &geometry.panes {
+                            assert!(!rects_overlap(divider.area, pane.text_area));
+                            for tab in &pane.tabs {
+                                assert!(!rects_overlap(divider.area, tab.body));
+                                assert!(!rects_overlap(divider.area, tab.close));
+                            }
+                        }
+                        let buffer = terminal.backend().buffer();
+                        for x in divider.area.left()..divider.area.right() {
+                            let owner = geometry
+                                .panes
+                                .iter()
+                                .find(|pane| pane.area.contains(Position::new(x, divider.area.y)));
+                            let expected = match owner {
+                                Some(pane) if x == pane.area.x => {
+                                    if icons == IconMode::Ascii {
+                                        "+"
+                                    } else {
+                                        "╰"
+                                    }
+                                }
+                                Some(pane) if x + 1 == pane.area.right() => {
+                                    if icons == IconMode::Ascii { "+" } else { "╯" }
+                                }
+                                Some(_) => {
+                                    if icons == IconMode::Ascii {
+                                        "-"
+                                    } else {
+                                        "─"
+                                    }
+                                }
+                                None => " ",
+                            };
+                            if let Some(pane) = owner {
+                                assert_eq!(pane.area.bottom() - 1, divider.area.y);
+                            }
+                            let cell = &buffer[(x, divider.area.y)];
+                            assert_eq!(cell.symbol(), expected);
+                            assert_eq!(cell.bg, Color::Reset);
+                        }
+                    }
+                }
             }
         }
     }
@@ -4466,6 +5050,8 @@ mod tests {
             tree: &tree,
             title: "/workspace",
             status: "ready",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4520,6 +5106,8 @@ mod tests {
             tree: &tree,
             title: "repo",
             status: "ok",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4537,7 +5125,10 @@ mod tests {
         let pg = geom.pane(1).expect("pane 1");
 
         assert_eq!(panel.width, 20);
-        assert_eq!(rows.width, panel.width - 2);
+        let rail = geom.sidebar_scrollbar.expect("sidebar rail").track;
+        assert!(rows.intersection(rail).is_empty());
+        assert_eq!(rows.right(), rail.x);
+        assert_eq!(rail.right(), panel.right() - 1);
         let parent = geom.sidebar_parent.expect("sidebar_parent visible");
         assert_eq!(parent.width, panel.width - 2);
         assert_eq!(parent.x, panel.x + 1);
@@ -4566,6 +5157,8 @@ mod tests {
             tree: &tree,
             title: "/repo",
             status: "Ln 1, Col 1",
+            status_level: StatusLevel::Info,
+            highlight_warning: None,
             active_path: None,
             format: FileFormat::default(),
             dirty: false,
@@ -4590,5 +5183,251 @@ mod tests {
         let pg = geom_compact.pane(1).expect("pane 1 in compact");
         assert_eq!(pg.area.y, 1); // 1-row header
         assert!(!pg.text_area.is_empty());
+    }
+
+    #[test]
+    fn helper_80_columns_keeps_essential_click_targets_visible() {
+        let doc = Document::new("hello\n");
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
+        let tabs = base_tabs();
+        let tree = SplitTree::new(1);
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let screen = status_screen(&panes, &tree, &theme, "ready", None, IconMode::Unicode);
+
+        let (term_80, geom_80) = render_screen(80, 24, &screen);
+        let buf_80 = term_80.backend().buffer();
+        for key in [
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        ] {
+            assert!(
+                geom_80.commands.iter().any(|cmd| cmd.key == key),
+                "missing helper hit for {key:?}"
+            );
+        }
+        for (idx, cmd) in geom_80.commands.iter().enumerate() {
+            assert_eq!(cmd.area.height, 1);
+            assert!(cmd.area.width > 0);
+            assert_eq!(cmd.area.intersection(Rect::new(0, 23, 80, 1)), cmd.area);
+            let text = row_text(buf_80, cmd.area, 0);
+            assert!(!text.contains('·'), "separator leaked into hit: {text:?}");
+            for other in &geom_80.commands[idx + 1..] {
+                assert!(!rects_overlap(cmd.area, other.area));
+            }
+        }
+
+        let (_, geom_120) = render_screen(120, 24, &screen);
+        for ch in ['o', 'f', 'r'] {
+            assert!(geom_120.commands.iter().any(|cmd| {
+                cmd.key == KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+                    && cmd.area.intersection(Rect::new(0, 23, 120, 1)) == cmd.area
+            }));
+        }
+    }
+
+    #[test]
+    fn tab_overflow_disabled_arrow_renders_muted_without_hit() {
+        let doc = Document::new("hello");
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
+        let tree = SplitTree::new(1);
+        let labels = [
+            "one.rs", "two.rs", "three.rs", "four.rs", "five.rs", "six.rs",
+        ];
+
+        for (active_pos, expect_prev, expect_next) in [
+            (0usize, false, true),
+            (3usize, true, true),
+            (5usize, true, false),
+        ] {
+            let tabs: Vec<TabCaption<'_>> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, label)| TabCaption {
+                    id: 100 + i as u64,
+                    label,
+                    dirty: false,
+                    read_only: false,
+                    active: i == active_pos,
+                })
+                .collect();
+            let panes = [single_pane(&doc, &tabs, &[])];
+            let screen = status_screen(&panes, &tree, &theme, "ok", None, IconMode::Unicode);
+            let (term, geom) = render_screen(48, 12, &screen);
+            let pg = geom.pane(1).expect("pane 1");
+            let buf = term.backend().buffer();
+            let tab_y = pg.area.y + 1;
+
+            assert_eq!(pg.previous_tab.is_some(), expect_prev);
+            assert_eq!(pg.next_tab.is_some(), expect_next);
+
+            let left_arrow_x = pg.area.x + 1;
+            let right_arrow_x = pg.area.right() - 4;
+            assert_eq!(
+                buf[(left_arrow_x + 1, tab_y)].fg,
+                if expect_prev {
+                    theme.accent
+                } else {
+                    theme.muted
+                }
+            );
+            assert_eq!(
+                buf[(right_arrow_x + 1, tab_y)].fg,
+                if expect_next {
+                    theme.accent
+                } else {
+                    theme.muted
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn choices_focus_highlight_and_target_context_guard() {
+        assert_eq!(ChoiceKind::Unsaved.cancel_index(), 2);
+        assert_eq!(ChoiceKind::Overwrite.cancel_index(), 1);
+        assert_eq!(ChoiceKind::Conflict.cancel_index(), 3);
+
+        let doc = Document::new("text");
+        let tabs = base_tabs();
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let tree = SplitTree::new(1);
+        let target = Path::new("/very/long/nested/directory/with/\x1b[31msecret.rs");
+
+        for mode in [ColorMode::Truecolor, ColorMode::None] {
+            let theme = Theme::new(ThemeKind::Dark, mode);
+            let mut screen = status_screen(&panes, &tree, &theme, "ready", None, IconMode::Unicode);
+            let focused_idx = ChoiceKind::Unsaved.cancel_index();
+            screen.dialog = Some(Dialog::Choices {
+                title: "Confirm",
+                lines: ChoiceKind::Unsaved.message_lines(),
+                kind: ChoiceKind::Unsaved,
+                target: Some(target),
+                focused: focused_idx,
+            });
+            let (term, geom) = render_screen(60, 14, &screen);
+            let buf = term.backend().buffer();
+            let focused_hit = geom.commands[focused_idx];
+            for x in focused_hit.area.left()..focused_hit.area.right() {
+                let cell = &buf[(x, focused_hit.area.y)];
+                if mode == ColorMode::None {
+                    assert!(cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD));
+                } else {
+                    assert_eq!(cell.bg, theme.selection);
+                }
+            }
+            let unfocused_hit = geom.commands[0];
+            let unfocused_cell = &buf[(unfocused_hit.area.x, unfocused_hit.area.y)];
+            if mode == ColorMode::None {
+                assert!(!unfocused_cell.modifier.contains(Modifier::REVERSED));
+            } else {
+                assert_ne!(unfocused_cell.bg, theme.selection);
+            }
+
+            let all_text: String = (0..14)
+                .flat_map(|y| (0..60).map(move |x| buf[(x, y)].symbol()))
+                .collect();
+            assert!(!all_text.contains('\x1b'));
+            assert!(all_text.contains("secret.rs"));
+        }
+
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
+        let lines = ChoiceKind::Overwrite.message_lines();
+        let min_without_target = (6..20u16)
+            .find(|&h| choices_fit(Rect::new(0, 0, 24, h), ChoiceKind::Overwrite, lines, None))
+            .expect("overwrite fits at some height without target");
+        let small_area = Rect::new(0, 0, 24, min_without_target);
+        assert!(!choices_fit(
+            small_area,
+            ChoiceKind::Overwrite,
+            lines,
+            Some(Path::new("Untitled"))
+        ));
+        let mut screen = status_screen(&panes, &tree, &theme, "ready", None, IconMode::Ascii);
+        screen.dialog = Some(Dialog::Choices {
+            title: "Overwrite",
+            lines,
+            kind: ChoiceKind::Overwrite,
+            target: Some(Path::new("Untitled")),
+            focused: ChoiceKind::Overwrite.cancel_index(),
+        });
+        let (term_small, geom_small) = render_screen(24, min_without_target, &screen);
+        assert!(geom_small.commands.is_empty());
+        let small_frame = term_small.backend().buffer();
+        let small_buf: String = (0..min_without_target)
+            .flat_map(|y| (0..24).map(move |x| small_frame[(x, y)].symbol()))
+            .collect();
+        assert!(small_buf.contains("Resize!"));
+
+        let (term_fit, geom_fit) = render_screen(24, min_without_target + 1, &screen);
+        assert_eq!(
+            geom_fit.commands.len(),
+            ChoiceKind::Overwrite.actions().len()
+        );
+        let fit_frame = term_fit.backend().buffer();
+        let fit_buf: String = (0..min_without_target + 1)
+            .flat_map(|y| (0..24).map(move |x| fit_frame[(x, y)].symbol()))
+            .collect();
+        assert!(fit_buf.contains("Untitled"));
+    }
+
+    #[test]
+    fn search_feedback_renders_before_field_without_enlarging_dialog() {
+        let doc = Document::new("abc");
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::Truecolor);
+        let tabs = base_tabs();
+        let tree = SplitTree::new(1);
+        let panes = [single_pane(&doc, &tabs, &[])];
+
+        let mut find_screen = status_screen(&panes, &tree, &theme, "ok", None, IconMode::Ascii);
+        find_screen.dialog = Some(Dialog::Search {
+            query: FieldView {
+                text: "abc",
+                cursor: 3,
+                selection: None,
+            },
+            replacement: None,
+            replacement_focus: false,
+            feedback: Some("Match 3 of 12 (wrapped)"),
+        });
+        let (mut term_find, _) = render_screen(40, 10, &find_screen);
+        let find_cursor = term_find.backend_mut().get_cursor_position().unwrap();
+        let feedback_row = row_text(
+            term_find.backend().buffer(),
+            Rect::new(0, find_cursor.y - 1, 40, 1),
+            0,
+        );
+        assert!(
+            feedback_row.contains("Match 3 of 12 (wrapped)"),
+            "expected feedback above Find field, got {feedback_row:?}"
+        );
+
+        let mut replace_screen = status_screen(&panes, &tree, &theme, "ok", None, IconMode::Ascii);
+        replace_screen.dialog = Some(Dialog::Search {
+            query: FieldView {
+                text: "abc",
+                cursor: 3,
+                selection: None,
+            },
+            replacement: Some(FieldView {
+                text: "xyz",
+                cursor: 3,
+                selection: None,
+            }),
+            replacement_focus: false,
+            feedback: Some("Match >100 of 100+"),
+        });
+        let (mut term_repl, _) = render_screen(40, 10, &replace_screen);
+        let repl_cursor = term_repl.backend_mut().get_cursor_position().unwrap();
+        let repl_feedback_row = row_text(
+            term_repl.backend().buffer(),
+            Rect::new(0, repl_cursor.y - 1, 40, 1),
+            0,
+        );
+        assert!(
+            repl_feedback_row.contains("Match >100 of 100+"),
+            "expected feedback above Find field in Replace, got {repl_feedback_row:?}"
+        );
     }
 }

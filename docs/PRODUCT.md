@@ -2,7 +2,15 @@
 
 Status: draft. Arah yang sudah disepakati tercatat di [README.md](README.md); rincian berikut adalah usulan produk.
 
-Kondisi implementasi: editor hybrid panel + tab/shared history, browser Enter/parent, frame penuh, ikon bold/solid dan helper berkelompok tersedia. Gap vertikal luar dipangkas, parser/cache Markdown dan profil dev dipercepat tanpa menonaktifkan highlight. YAML/YML/JS/HTML/CSS serta grammar TypeScript/TSX asli ter-highlight. Preferensi pengguna persisten dan clipboard internal/Wayland/X11 tersedia; field editable, F1, Find/Replace dan guard file tetap berlaku. Grammar bukan type checker/LSP; produk tetap editor teks, bukan IDE. Validasi penggunaan harian dan dukungan platform berlanjut. Perintah/batas di [README.md](README.md).
+Kondisi implementasi: editor hybrid panel + tab/shared history, browser Enter/parent, frame penuh, ikon bold/solid dan helper berkelompok tersedia. Gap vertikal luar dipangkas, parser/cache Markdown dan profil dev dipercepat tanpa menonaktifkan highlight. YAML/YML/JS/HTML/CSS serta grammar TypeScript/TSX asli ter-highlight. Preferensi pengguna persisten dan clipboard internal/Wayland/X11 tersedia; field editable, F1, Find/Replace dan guard file tetap berlaku. Session restore otomatis pada `naf` tanpa path memulihkan buffer Untitled/dirty serta workspace dari exit normal; bukan crash recovery. Grammar bukan type checker/LSP; produk tetap editor teks, bukan IDE. Validasi penggunaan harian dan dukungan platform berlanjut. Perintah/batas di [README.md](README.md).
+
+Batch P1 terpilih menambahkan helper 80 kolom, navigasi konfirmasi dengan Cancel default, resize explorer lewat keyboard, konteks path, prefill pencarian dan penghitung match/wrap. Sesuai keputusan pengguna, tahap 4 ditutup untuk matriks Linux teruji, bukan seluruh terminal/font/host SSH; [bukti dan batas](ROADMAP.md#hasil-p1-aksesibilitas-dan-pencarian). Usulan P1/P2 lain serta publish/installer tetap di luar batch.
+
+Indent/dedent blok juga tersedia: Tab pada seleksi multibaris dan Shift+Tab pada baris aktif/terpilih mempertahankan seleksi, shared view dan satu transaksi undo. Ini kenyamanan editing teks, bukan autoindent atau konfigurasi keymap baru; [bukti](ROADMAP.md#hasil-indent-dan-dedent-blok).
+
+Scrollbar vertikal/horizontal editor bekerja per view: klik track dan drag thumb menggeser viewport tanpa memindahkan fokus/cursor/seleksi atau membuat edit. Jalur di dalam frame mengikuti background terminal dan dipadatkan pada panel minimum; pengukuran lebar baris panjang bertahap agar input tetap dapat dilayani. [Kontrak editor](ARCHITECTURE.md#scrollbar-editor).
+
+Explorer dan bantuan F1 memiliki scrollbar vertikal dengan gesture yang sama. Tree tidak mengganti pilihan/fokus atau membuka file lewat rail; bantuan menjaga state modal yang ditangguhkan dan wrapping tetap menyisakan footer. Track yang tidak muat disembunyikan, tanpa menimpa parent row, divider atau teks. Scrollbar horizontal Explorer, indikator overflow field dan switcher runtime tetap terpisah; [kontrak](ARCHITECTURE.md#scrollbar-explorer-dan-f1).
 
 ## Tujuan
 
@@ -25,12 +33,13 @@ Pengguna utama: orang yang nyaman bekerja di terminal tetapi menginginkan intera
 | --- | --- |
 | Editing | Insert/delete, navigasi, seleksi, undo/redo, indentasi, pencarian dan penggantian dalam dokumen |
 | File | Open, save, Save As, dokumen baru, penanda perubahan, penanganan kegagalan I/O |
-| Navigasi | Browser explorer dengan parent `..`/Backspace, Enter masuk folder, Left/Right tree expandable, tab per panel dan split/resize panel |
-| Input | Keyboard lengkap; klik, seleksi drag, double-click kata, dan wheel |
+| Navigasi | Browser explorer dengan parent `..`/Backspace, Enter masuk folder, Left/Right tree expandable, tab per panel dan split/resize panel; explorer tampil saat startup tanpa path/folder, tersembunyi untuk file, dan dapat di-toggle dengan Ctrl+B |
+| Input | Keyboard lengkap; klik, seleksi drag, double-click kata, wheel serta track/thumb scrollbar editor, Explorer dan F1 |
 | Tampilan | Frame tiap panel, ikon kategori bold/solid, background dasar seragam, syntax highlighting, nomor baris, fokus jelas, helper kelompok `[tombol] Aksi` dan bantuan F1; tema/profil ikon mengikuti [DESIGN.md](DESIGN.md) |
 | Clipboard | Internal atau sistem lokal Wayland/X11 jika helper tersedia; status backend/kegagalan jujur, Auto SSH internal, tanpa OSC 52 |
-| Keselamatan | Konfirmasi perubahan yang belum disimpan dan deteksi konflik file eksternal saat save |
+| Keselamatan | Konfirmasi close view terakhir/quit terpisah dan deteksi konflik file eksternal saat save |
 | Preferensi | Tema, warna, ikon dan mode clipboard melalui konfigurasi pengguna; override CLI dan penyimpanan eksplisit, bukan konfigurasi proyek atau snapshot sesi |
+| Sesi | Restore otomatis pada launch tanpa path, termasuk Untitled/dirty; Ctrl+Q menyimpan sesi privat, --no-session dan launch file/folder tetap terpisah |
 
 Batas jumlah panel ditentukan dari hasil prototipe dan ukuran terminal, bukan angka arbitrer. Split ditolak dengan penjelasan jika ruang minimum tidak cukup.
 
@@ -44,7 +53,7 @@ Batas jumlah panel ditentukan dari hasil prototipe dan ukuran terminal, bukan an
 - Pengukuran lokal tersedia di [ROADMAP.md](ROADMAP.md#hasil-geometri-sparse-untuk-baris-panjang). Cache geometri mempercepat navigasi/render/edit berulang pada baris panjang, tetapi lookup dingin masih perlu membaca prefix; batas 64 MiB tetap operasional, bukan SLA. Teks yang terlihat setelah jump tidak berarti highlight seluruh prefix selesai.
 - Integrasi IDE penuh bukan target akhir. Fitur tambahan dinilai dari manfaatnya untuk editing teks, bukan untuk mengejar paritas IDE.
 - Tidak ada recovery setelah crash sebelum fitur recovery benar-benar diimplementasikan dan diuji.
-- Session restore dicatat sebagai fitur tambahan dan belum tersedia; cakupan rencana serta batasnya ada di [ROADMAP.md](ROADMAP.md#fitur-tambahan--session-restore).
+- Session restore normal-exit tersedia untuk launch tanpa path, termasuk tab/panel/view dan buffer Untitled/dirty. Snapshot tidak dienkripsi, undo/redo dimulai ulang, dan tidak menulis file sumber; cakupan/batas ada di [ROADMAP.md](ROADMAP.md#fitur-tambahan--session-restore).
 
 ## Kriteria penerimaan produk
 
@@ -53,8 +62,8 @@ Batas jumlah panel ditentukan dari hasil prototipe dan ukuran terminal, bukan an
 - Undo/redo bekerja pada dokumen, termasuk ketika dokumen ditampilkan di beberapa panel.
 - Kegagalan save mempertahankan isi buffer dan status belum tersimpan.
 - File yang berubah di luar aplikasi tidak ditimpa tanpa keputusan pengguna.
-- Menutup tampilan terakhir dokumen yang berubah menawarkan Save, Discard, atau Cancel.
-- Tidak ada auto-save, eksekusi kode proyek, atau pengiriman isi dokumen tanpa fitur dan tindakan yang eksplisit.
+- Menutup tab/panel yang menghilangkan view terakhir dokumen dirty menawarkan Save, Discard, atau Cancel; quit sesi default mempertahankan buffer melalui snapshot, bukan membuangnya.
+- Tidak ada autosave file sumber, eksekusi kode proyek, atau pengiriman isi dokumen tanpa fitur dan tindakan yang eksplisit. Snapshot sesi saat Ctrl+Q merupakan fitur terpisah yang diaktifkan sesuai keputusan pengguna.
 - Tampilan tetap dapat digunakan setelah resize, termasuk ketika terminal terlalu kecil untuk layout normal.
 
 ## Keputusan yang masih terbuka

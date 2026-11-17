@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    fmt::Write as _,
     io,
     ops::Range,
     path::{Path, PathBuf},
@@ -20,11 +21,13 @@ use crate::{
     highlight::Highlighter,
     input::{Input, InputEvent},
     layout::{Axis, Divider, Layout, PaneMinimum},
+    scrollbar::Scrollbar,
     search::{self, Query},
+    session::SessionStore,
     terminal::TerminalSession,
     theme::{IconMode, Options, Theme},
-    ui::{self, ChoiceKind, Dialog, Geometry, PaneScreen, Screen, TabCaption},
-    workspace::{DocumentBuffer, Workspace},
+    ui::{self, ChoiceKind, Dialog, Geometry, PaneScreen, Screen, StatusLevel, TabCaption},
+    workspace::{DocumentBuffer, EditViewPolicy, Workspace},
 };
 
 const TICK: Duration = Duration::from_millis(50);
@@ -32,7 +35,9 @@ const HIGHLIGHT_IDLE_TICK: Duration = Duration::from_millis(16);
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_SEARCH_BYTES: usize = 4096;
+const MAX_COUNTED_MATCHES: usize = 100;
 const HIGHLIGHT_BUDGET: usize = 200;
+const SCROLL_WIDTH_TICK_BUDGET: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Copy)]
 enum AfterSave {
@@ -55,14 +60,17 @@ enum Modal {
     Unsaved {
         doc_id: u64,
         after: AfterSave,
+        focused: usize,
     },
     Overwrite {
         doc_id: u64,
         path: PathBuf,
+        focused: usize,
     },
     Conflict {
         doc_id: u64,
         path: PathBuf,
+        focused: usize,
     },
     Search {
         replace_mode: bool,
@@ -70,6 +78,45 @@ enum Modal {
     },
     Help {
         scroll: usize,
+    },
+}
+
+impl Modal {
+    fn choice(&self) -> Option<(ChoiceKind, usize)> {
+        match self {
+            Self::Unsaved { focused, .. } => Some((ChoiceKind::Unsaved, *focused)),
+            Self::Overwrite { focused, .. } => Some((ChoiceKind::Overwrite, *focused)),
+            Self::Conflict { focused, .. } => Some((ChoiceKind::Conflict, *focused)),
+            _ => None,
+        }
+    }
+
+    fn target<'a>(&'a self, workspace: &'a Workspace) -> Option<&'a Path> {
+        match self {
+            Self::Unsaved { doc_id, .. } => workspace.document(*doc_id).map(|buf| {
+                buf.path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(buf.label()))
+            }),
+            Self::Overwrite { path, .. } | Self::Conflict { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScrollbarTarget {
+    Editor {
+        pane_id: u64,
+        view_id: u64,
+        revision: u64,
+        text_area: Rect,
+    },
+    Explorer {
+        rows: usize,
+    },
+    Help {
+        viewport: (u16, u16),
     },
 }
 
@@ -88,6 +135,11 @@ enum DragState {
     SplitDivider {
         divider: Divider,
     },
+    Scrollbar {
+        target: ScrollbarTarget,
+        bar: Scrollbar,
+        anchor: u16,
+    },
     Field {
         kind: FieldKind,
     },
@@ -103,15 +155,93 @@ struct SearchMatch {
     range: Range<usize>,
 }
 
+struct SearchCache {
+    document_id: u64,
+    doc_revision: u64,
+    compiled: Query,
+    index: search::MatchIndex,
+}
+
 #[derive(Default)]
 struct SearchState {
     query: Field,
     replacement: Field,
     last_match: Option<SearchMatch>,
+    cache: Option<SearchCache>,
+    feedback: String,
+    feedback_has_position: bool,
+}
+
+impl SearchState {
+    fn update_feedback(&mut self, range: Option<&Range<usize>>, wrapped: bool) {
+        let Some(cache) = &self.cache else { return };
+        let count = cache.index.starts.len();
+        let position = range.and_then(|r| cache.index.starts.binary_search(&r.start).ok());
+        self.feedback.clear();
+        self.feedback_has_position = range.is_some();
+        if count == 0 {
+            self.feedback.push_str("No matches");
+            return;
+        }
+        if let Some(position) = position {
+            write!(self.feedback, "Match {} of {count}", position + 1)
+                .expect("writing to String cannot fail");
+        } else if range.is_some() && cache.index.has_more {
+            write!(self.feedback, "Match >{count} of {count}")
+                .expect("writing to String cannot fail");
+        } else {
+            write!(self.feedback, "Matches: {count}").expect("writing to String cannot fail");
+        }
+        if cache.index.has_more {
+            self.feedback.push('+');
+        }
+        if wrapped {
+            self.feedback.push_str(" (wrapped)");
+        }
+    }
+
+    fn current_feedback(&self, workspace: &Workspace) -> Option<&str> {
+        let cache = self.cache.as_ref()?;
+        let buf = workspace.active_document()?;
+        if cache.document_id != buf.id
+            || cache.doc_revision != buf.document.revision()
+            || cache.compiled.needle() != self.query.as_str()
+            || self.feedback.is_empty()
+        {
+            return None;
+        }
+        if self.feedback_has_position {
+            let matched = self.last_match.as_ref()?;
+            let view = workspace.active_view()?;
+            if matched.pane_id != workspace.active_pane_id()
+                || matched.view_id != view.id
+                || matched.document_id != buf.id
+                || matched.doc_revision != buf.document.revision()
+                || matched.query != self.query.as_str()
+                || view.selection().as_ref() != Some(&matched.range)
+            {
+                return None;
+            }
+        }
+        Some(&self.feedback)
+    }
+}
+
+#[derive(Debug)]
+struct StatusMessage {
+    level: StatusLevel,
+    text: String,
+}
+
+impl StatusMessage {
+    fn new(level: StatusLevel, text: String) -> Self {
+        Self { level, text }
+    }
 }
 
 struct App {
     workspace: Workspace,
+    session_store: Option<SessionStore>,
     highlighter: Highlighter,
     highlight_pending: bool,
     theme: Theme,
@@ -121,10 +251,12 @@ struct App {
     hit_targets_valid: bool,
     viewport: (u16, u16),
     clipboard: Clipboard,
-    status: String,
+    status: StatusMessage,
     modal: Option<Modal>,
     help_return: Option<Modal>,
     after_save: Option<AfterSave>,
+    path_retry: Option<(PathAction, Field)>,
+    input_sequence_pending: bool,
     quit: bool,
     drag: Option<DragState>,
     last_click: Option<(u64, u16, u16, Instant)>,
@@ -134,24 +266,37 @@ struct App {
     mins_scratch: Vec<PaneMinimum>,
     hl_docs_scratch: Vec<u64>,
     hl_ranges_scratch: Vec<Range<usize>>,
+    scroll_scan_cursor: usize,
+    scroll_metrics_dirty: bool,
 }
 
 impl App {
     fn new_with_root(root: PathBuf, options: Options) -> Self {
         let (workspace, exp_warn) = Workspace::new(root);
+        Self::with_workspace(workspace, exp_warn, options)
+    }
+
+    fn with_workspace(workspace: Workspace, exp_warn: Option<String>, options: Options) -> Self {
         let clipboard = Clipboard::new(options.clipboard);
         let status = match exp_warn {
-            Some(warn) => format!(
-                "Warn: explorer: {warn} | Clipboard: {}",
-                clipboard.startup_note()
+            Some(warn) => StatusMessage::new(
+                StatusLevel::Warning,
+                format!(
+                    "Warn: explorer: {warn} | Clipboard: {}",
+                    clipboard.startup_note()
+                ),
             ),
-            None => format!(
-                "Clipboard: {} | Ctrl+Q exits safely",
-                clipboard.startup_note()
+            None => StatusMessage::new(
+                StatusLevel::Info,
+                format!(
+                    "Clipboard: {} | Ctrl+Q exits safely",
+                    clipboard.startup_note()
+                ),
             ),
         };
         Self {
             workspace,
+            session_store: None,
             highlighter: Highlighter::new(),
             highlight_pending: false,
             theme: Theme::new(options.theme, options.colors),
@@ -165,6 +310,8 @@ impl App {
             modal: None,
             help_return: None,
             after_save: None,
+            path_retry: None,
+            input_sequence_pending: false,
             quit: false,
             drag: None,
             last_click: None,
@@ -174,6 +321,8 @@ impl App {
             mins_scratch: Vec::new(),
             hl_docs_scratch: Vec::new(),
             hl_ranges_scratch: Vec::new(),
+            scroll_scan_cursor: 0,
+            scroll_metrics_dirty: false,
         }
     }
 
@@ -195,6 +344,7 @@ impl App {
             Some(p) => {
                 let root = resolve_parent_dir(&p);
                 let mut app = Self::new_with_root(root, options);
+                app.workspace.explorer_visible = false;
                 let exp_warn = app.workspace.explorer.is_none();
                 match file_io::load(&p) {
                     Ok(loaded) => {
@@ -205,21 +355,29 @@ impl App {
                             .active_document()
                             .and_then(|d| d.read_only.clone())
                         {
-                            app.status = format!(
-                                "Read-only: {ro} | Clipboard: {}",
-                                app.clipboard.startup_note()
+                            app.status = StatusMessage::new(
+                                StatusLevel::Warning,
+                                format!(
+                                    "Read-only: {ro} | Clipboard: {}",
+                                    app.clipboard.startup_note()
+                                ),
                             );
                         } else if !exp_warn {
-                            app.status =
-                                format!("Opened | Clipboard: {}", app.clipboard.startup_note());
+                            app.status = StatusMessage::new(
+                                StatusLevel::Success,
+                                format!("Opened | Clipboard: {}", app.clipboard.startup_note()),
+                            );
                         }
                     }
                     Err(FileError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                         app.workspace.set_startup_missing_file(p);
                         if !exp_warn {
-                            app.status = format!(
-                                "New file; created only when saved | Clipboard: {}",
-                                app.clipboard.startup_note()
+                            app.status = StatusMessage::new(
+                                StatusLevel::Info,
+                                format!(
+                                    "New file; created only when saved | Clipboard: {}",
+                                    app.clipboard.startup_note()
+                                ),
                             );
                         }
                     }
@@ -228,6 +386,35 @@ impl App {
                 Ok(app)
             }
         }
+    }
+
+    fn bootstrap_session(options: Options) -> io::Result<Self> {
+        let store = SessionStore::open_default()?;
+        let loaded = store.load().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not restore {}: {error}", store.path().display()),
+            )
+        })?;
+        let (mut app, restored) = match loaded {
+            Some(loaded) => {
+                let (workspace, warning) = Workspace::restore_session(loaded)?;
+                (Self::with_workspace(workspace, warning, options), true)
+            }
+            None => (Self::bootstrap(None, options)?, false),
+        };
+        app.workspace.explorer_visible = true;
+        app.status = StatusMessage::new(
+            app.status.level,
+            format!(
+                "Session {}; Ctrl+Q keeps buffers | {}",
+                if restored { "restored" } else { "active" },
+                app.status.text,
+            ),
+        );
+        app.highlight_pending = restored;
+        app.session_store = Some(store);
+        Ok(app)
     }
 
     fn invalidate_hit_targets(&mut self) {
@@ -265,24 +452,33 @@ impl App {
         self.invalidate_hit_targets();
         self.highlight_pending = true;
         if outcome.already_in_pane {
-            self.status = "Switched to already-open tab".into();
+            self.status =
+                StatusMessage::new(StatusLevel::Info, "Switched to already-open tab".into());
         } else {
             let ro = self
                 .workspace
                 .document(outcome.document_id)
                 .and_then(|d| d.read_only.clone());
             self.status = match ro {
-                Some(reason) => format!(
-                    "Read-only: {reason} | Clipboard: {}",
-                    self.clipboard.startup_note()
-                ),
-                None if outcome.shared_existing => {
+                Some(reason) => StatusMessage::new(
+                    StatusLevel::Warning,
                     format!(
-                        "Opened shared view | Clipboard: {}",
+                        "Read-only: {reason} | Clipboard: {}",
                         self.clipboard.startup_note()
-                    )
-                }
-                None => format!("Opened | Clipboard: {}", self.clipboard.startup_note()),
+                    ),
+                ),
+                None => StatusMessage::new(
+                    StatusLevel::Success,
+                    format!(
+                        "{} | Clipboard: {}",
+                        if outcome.shared_existing {
+                            "Opened shared view"
+                        } else {
+                            "Opened"
+                        },
+                        self.clipboard.startup_note(),
+                    ),
+                ),
             };
         }
         Ok(())
@@ -299,16 +495,16 @@ impl App {
             return;
         };
         if let Some(reason) = &buf.read_only {
-            self.status = format!("Read-only: {reason}");
+            self.status = StatusMessage::new(StatusLevel::Warning, format!("Read-only: {reason}"));
             return;
         }
         let Some((result, mutated)) =
             self.workspace
-                .edit_transaction(doc_id, view_id, true, |doc| {
-                    match doc.replace(range, text) {
-                        Ok(cursor) => (Ok(cursor), Some(cursor)),
-                        Err(err) => (Err(err), None),
-                    }
+                .edit_transaction(doc_id, view_id, EditViewPolicy::FollowEdit, |doc| match doc
+                    .replace(range, text)
+                {
+                    Ok(cursor) => (Ok(cursor), Some(cursor)),
+                    Err(err) => (Err(err), None),
                 })
         else {
             return;
@@ -321,7 +517,50 @@ impl App {
                     self.invalidate_hit_targets();
                 }
             }
-            Err(error) => self.status = error.to_string(),
+            Err(error) => self.status = StatusMessage::new(StatusLevel::Error, error.to_string()),
+        }
+    }
+
+    fn indent_in_active_tab(&mut self, dedent: bool) {
+        let Some(view) = self.workspace.active_view() else {
+            return;
+        };
+        let view_id = view.id;
+        let doc_id = view.document_id;
+        let selection = view.selection();
+        let range = selection.clone().unwrap_or(view.cursor..view.cursor);
+        let Some(buf) = self.workspace.document(doc_id) else {
+            return;
+        };
+        let multiline = selection.is_some()
+            && buf.document.line_of(range.start) != buf.document.line_of(range.end);
+        if !dedent && !multiline {
+            let spaces = "    ";
+            let stop = crate::document::TAB_STOP;
+            let count = stop - buf.document.column_of(view.cursor) % stop;
+            self.replace_in_active_tab(&spaces[..count]);
+            return;
+        }
+        if let Some(reason) = &buf.read_only {
+            self.status = StatusMessage::new(StatusLevel::Warning, format!("Read-only: {reason}"));
+            return;
+        }
+        let Some((result, mutated)) = self.workspace.edit_transaction(
+            doc_id,
+            view_id,
+            EditViewPolicy::PreserveSelection,
+            |doc| (doc.indent_lines(range, dedent), None),
+        ) else {
+            return;
+        };
+        match result {
+            Ok(()) if mutated => {
+                self.search.last_match = None;
+                self.highlight_pending = true;
+                self.invalidate_hit_targets();
+            }
+            Ok(()) => {}
+            Err(error) => self.status = StatusMessage::new(StatusLevel::Error, error.to_string()),
         }
     }
 
@@ -337,11 +576,12 @@ impl App {
         self.search.last_match = None;
         self.invalidate_hit_targets();
         self.highlight_pending = true;
-        self.status = "New tab".into();
+        self.status = StatusMessage::new(StatusLevel::Info, "New tab".into());
     }
 
     fn open_path_dialog(&mut self) {
         self.drag = None;
+        self.path_retry = None;
         self.modal = Some(Modal::Path {
             action: PathAction::Open,
             value: Field::new(String::new()),
@@ -355,12 +595,18 @@ impl App {
             self.search.last_match = None;
             self.invalidate_hit_targets();
             self.highlight_pending = true;
-            self.status = match axis {
-                Axis::Columns => "Split left/right".into(),
-                Axis::Rows => "Split top/bottom".into(),
-            };
+            self.status = StatusMessage::new(
+                StatusLevel::Info,
+                match axis {
+                    Axis::Columns => "Split left/right".into(),
+                    Axis::Rows => "Split top/bottom".into(),
+                },
+            );
         } else {
-            self.status = "Cannot split: terminal too small for minimum pane size".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Cannot split: terminal too small for minimum pane size".into(),
+            );
         }
     }
 
@@ -397,6 +643,34 @@ impl App {
     }
 
     fn resize_nearest_divider(&mut self, axis: Axis, delta: isize) {
+        if axis == Axis::Columns && self.workspace.explorer_focused {
+            let editor = self.effective_editor_area_for_resize();
+            if editor.x == 0 {
+                self.status = StatusMessage::new(
+                    StatusLevel::Warning,
+                    "Explorer hidden; show it or enlarge the terminal before resizing".into(),
+                );
+                return;
+            }
+            // The sidebar starts at x=0; the editor follows its one-column gap.
+            let visible_width = editor.x - 1;
+            let step = u16::try_from(delta.unsigned_abs()).unwrap_or(u16::MAX);
+            let desired = if delta < 0 {
+                visible_width.saturating_sub(step)
+            } else {
+                visible_width.saturating_add(step)
+            };
+            let (min_w, min_h) = self.workspace.tree_minimum();
+            let collapsed = u32::from(editor.width) < min_w || u32::from(editor.height) < min_h;
+            if self
+                .workspace
+                .set_sidebar_width(desired, self.viewport.0, collapsed)
+            {
+                self.highlight_pending = true;
+                self.invalidate_hit_targets();
+            }
+            return;
+        }
         let active_pane_id = self.workspace.active_pane_id();
         let (active_rect, splits) = if self.hit_targets_valid && !self.geometry.panes.is_empty() {
             let Some(pane_geom) = self.geometry.pane(active_pane_id) else {
@@ -436,7 +710,8 @@ impl App {
             .copied();
 
         let Some(div) = nearest else {
-            self.status = "No split divider on that axis".into();
+            self.status =
+                StatusMessage::new(StatusLevel::Info, "No split divider on that axis".into());
             return;
         };
 
@@ -483,10 +758,11 @@ impl App {
             self.modal = Some(Modal::Unsaved {
                 doc_id,
                 after: AfterSave::CloseView { view_id },
+                focused: ChoiceKind::Unsaved.cancel_index(),
             });
         } else {
             self.close_view_unconditional(view_id);
-            self.status = "Closed tab".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Closed tab".into());
         }
     }
 
@@ -515,6 +791,7 @@ impl App {
             self.modal = Some(Modal::Unsaved {
                 doc_id,
                 after: AfterSave::ClosePane { pane_id },
+                focused: ChoiceKind::Unsaved.cancel_index(),
             });
         } else {
             for removed_doc in self.workspace.close_pane_unconditional(pane_id) {
@@ -525,12 +802,28 @@ impl App {
             self.highlight_pending = true;
             self.modal = None;
             self.after_save = None;
-            self.status = "Closed pane".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Closed pane".into());
         }
     }
 
     fn request_quit(&mut self) {
         self.drag = None;
+        if let Some(store) = &self.session_store {
+            match self
+                .workspace
+                .session_image()
+                .and_then(|image| store.save(&image))
+            {
+                Ok(()) => self.quit = true,
+                Err(error) => {
+                    self.status = StatusMessage::new(
+                        StatusLevel::Error,
+                        format!("Save failed: session: {error}; still in editor"),
+                    );
+                }
+            }
+            return;
+        }
         self.continue_quit();
     }
 
@@ -545,6 +838,7 @@ impl App {
             self.modal = Some(Modal::Unsaved {
                 doc_id,
                 after: AfterSave::Quit,
+                focused: ChoiceKind::Unsaved.cancel_index(),
             });
         } else {
             for id in self.workspace.drain_all_documents() {
@@ -589,6 +883,7 @@ impl App {
     }
 
     fn save_document_as(&mut self, doc_id: u64) {
+        self.path_retry = None;
         let value = self
             .workspace
             .document(doc_id)
@@ -602,16 +897,30 @@ impl App {
         });
     }
 
+    fn restore_failed_path(&mut self) {
+        self.modal = self
+            .path_retry
+            .take()
+            .map(|(action, value)| Modal::Path { action, value });
+        if self.modal.is_none() {
+            self.after_save = None;
+        }
+        self.invalidate_hit_targets();
+    }
+
     fn save_document_to(&mut self, doc_id: u64, path: PathBuf, overwrite: bool, save_as: bool) {
         let Some(buf) = self.workspace.document(doc_id) else {
             self.after_save = None;
             self.modal = None;
+            self.path_retry = None;
             return;
         };
         if let Some(reason) = &buf.read_only {
-            self.status = format!("Read-only: {reason}; save blocked (no implicit normalization)");
-            self.after_save = None;
-            self.modal = None;
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                format!("Read-only: {reason}; save blocked (no implicit normalization)"),
+            );
+            self.restore_failed_path();
             return;
         }
         if let Some(other_doc_id) = self.workspace.check_save_as_collision(doc_id, &path) {
@@ -619,11 +928,13 @@ impl App {
                 .workspace
                 .document(other_doc_id)
                 .map_or("another document", DocumentBuffer::label);
-            self.status = format!(
-                "Save failed: target matches open tab '{other_label}'; switch to or close that tab first"
+            self.status = StatusMessage::new(
+                StatusLevel::Error,
+                format!(
+                    "Save failed: target matches open tab '{other_label}'; switch to or close that tab first"
+                ),
             );
-            self.after_save = None;
-            self.modal = None;
+            self.restore_failed_path();
             return;
         }
         let expected = if !save_as && buf.path.as_ref() == Some(&path) {
@@ -648,8 +959,9 @@ impl App {
                     self.highlight_pending = true;
                 }
                 self.invalidate_hit_targets();
-                self.status = "Saved".into();
+                self.status = StatusMessage::new(StatusLevel::Success, "Saved".into());
                 self.modal = None;
+                self.path_retry = None;
                 if let Some(after) = self.after_save.take() {
                     match after {
                         AfterSave::CloseView { view_id } => self.close_view_unconditional(view_id),
@@ -658,12 +970,24 @@ impl App {
                     }
                 }
             }
-            Err(FileError::Exists) => self.modal = Some(Modal::Overwrite { doc_id, path }),
-            Err(FileError::Conflict) => self.modal = Some(Modal::Conflict { doc_id, path }),
+            Err(FileError::Exists) => {
+                self.modal = Some(Modal::Overwrite {
+                    doc_id,
+                    path,
+                    focused: ChoiceKind::Overwrite.cancel_index(),
+                })
+            }
+            Err(FileError::Conflict) => {
+                self.modal = Some(Modal::Conflict {
+                    doc_id,
+                    path,
+                    focused: ChoiceKind::Conflict.cancel_index(),
+                })
+            }
             Err(error) => {
-                self.status = format!("Save failed: {error}");
-                self.after_save = None;
-                self.modal = None;
+                self.status =
+                    StatusMessage::new(StatusLevel::Error, format!("Save failed: {error}"));
+                self.restore_failed_path();
             }
         }
     }
@@ -671,6 +995,7 @@ impl App {
     fn reload_document(&mut self, doc_id: u64, path: PathBuf) {
         match file_io::load(&path) {
             Ok(loaded) => {
+                self.path_retry = None;
                 self.highlighter.forget(doc_id);
                 self.highlight_pending = true;
                 self.workspace.reload_document(doc_id, path, loaded);
@@ -682,11 +1007,28 @@ impl App {
                 {
                     self.search.last_match = None;
                 }
+                // Reload replaces Document and can reuse its revision number.
+                if self
+                    .search
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.document_id == doc_id)
+                {
+                    self.search.cache = None;
+                    self.search.feedback.clear();
+                    self.search.feedback_has_position = false;
+                }
                 self.invalidate_hit_targets();
-                self.status = "Reloaded; local changes discarded by explicit request".into();
+                self.status = StatusMessage::new(
+                    StatusLevel::Success,
+                    "Reloaded; local changes discarded by explicit request".into(),
+                );
             }
             Err(error) => {
-                self.status = format!("Reload failed: {error}; buffer retained");
+                self.status = StatusMessage::new(
+                    StatusLevel::Error,
+                    format!("Reload failed: {error}; buffer retained"),
+                );
             }
         }
     }
@@ -713,26 +1055,39 @@ impl App {
         self.modal = None;
         self.after_save = None;
         self.help_return = None;
+        self.path_retry = None;
         self.invalidate_hit_targets();
-        self.status = if was_search {
-            "Search closed".into()
-        } else {
-            "Cancelled; document unchanged".into()
-        };
+        self.status = StatusMessage::new(
+            StatusLevel::Info,
+            if was_search {
+                "Search closed".into()
+            } else {
+                "Cancelled; document unchanged".into()
+            },
+        );
     }
 
     fn path_input(&mut self, text: &str) {
         if self.viewport.0 < ui::MIN_DIALOG_SIZE.0 || self.viewport.1 < ui::MIN_DIALOG_SIZE.1 {
-            self.status = "Resize to at least 20x6 to edit a dialog; Esc cancels".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Resize to at least 20x6 to edit a dialog; Esc cancels".into(),
+            );
             return;
         }
         if text.chars().any(char::is_control) {
-            self.status = "Path input rejected: control character or over 4096 bytes".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Error,
+                "Path input rejected: control character or over 4096 bytes".into(),
+            );
             return;
         }
         if let Some(Modal::Path { value, .. }) = &mut self.modal {
             if !value.insert(text, MAX_PATH_BYTES) {
-                self.status = "Path input rejected: control character or over 4096 bytes".into();
+                self.status = StatusMessage::new(
+                    StatusLevel::Error,
+                    "Path input rejected: control character or over 4096 bytes".into(),
+                );
             } else {
                 self.invalidate_hit_targets();
             }
@@ -741,7 +1096,10 @@ impl App {
 
     fn search_input(&mut self, text: &str, to_replacement: bool) {
         if self.viewport.0 < ui::MIN_SEARCH_SIZE.0 || self.viewport.1 < ui::MIN_SEARCH_SIZE.1 {
-            self.status = "Resize to at least 40x10 to edit search dialog; Esc cancels".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Resize to at least 40x10 to edit search dialog; Esc cancels".into(),
+            );
             return;
         }
         let field = if to_replacement {
@@ -762,14 +1120,20 @@ impl App {
                         .count()
                     > available)
         {
-            self.status = "Warn: search field limit is 4096 bytes".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Warn: search field limit is 4096 bytes".into(),
+            );
             return;
         }
         let normalized = normalize_paste(text);
         let text = normalized.as_ref();
         let before_rev = field.revision();
         if !field.insert(text, MAX_SEARCH_BYTES) {
-            self.status = "Warn: search field limit is 4096 bytes".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Warn: search field limit is 4096 bytes".into(),
+            );
             return;
         }
         if !to_replacement && field.revision() != before_rev {
@@ -782,7 +1146,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::Path { value, .. }) => {
                 let Some(sel) = value.selected() else {
-                    self.status = no_selection_status(cut);
+                    self.status = StatusMessage::new(StatusLevel::Info, no_selection_status(cut));
                     return;
                 };
                 let text = sel.to_owned();
@@ -792,10 +1156,16 @@ impl App {
                             value.insert("", MAX_PATH_BYTES);
                             self.invalidate_hit_targets();
                         }
-                        self.status = copy_success_status(cut, target);
+                        self.status = StatusMessage::new(
+                            StatusLevel::Success,
+                            copy_success_status(cut, target),
+                        );
                     }
                     Err(error) => {
-                        self.status = copy_failure_status(cut, &error);
+                        self.status = StatusMessage::new(
+                            StatusLevel::Error,
+                            copy_failure_status(cut, &error),
+                        );
                     }
                 }
             }
@@ -810,7 +1180,7 @@ impl App {
                     (&mut self.search.query, true)
                 };
                 let Some(sel) = field.selected() else {
-                    self.status = no_selection_status(cut);
+                    self.status = StatusMessage::new(StatusLevel::Info, no_selection_status(cut));
                     return;
                 };
                 let text = sel.to_owned();
@@ -824,15 +1194,21 @@ impl App {
                             }
                             self.invalidate_hit_targets();
                         }
-                        self.status = copy_success_status(cut, target);
+                        self.status = StatusMessage::new(
+                            StatusLevel::Success,
+                            copy_success_status(cut, target),
+                        );
                     }
                     Err(error) => {
-                        self.status = copy_failure_status(cut, &error);
+                        self.status = StatusMessage::new(
+                            StatusLevel::Error,
+                            copy_failure_status(cut, &error),
+                        );
                     }
                 }
             }
             _ => {
-                self.status = no_selection_status(cut);
+                self.status = StatusMessage::new(StatusLevel::Info, no_selection_status(cut));
             }
         }
     }
@@ -853,13 +1229,14 @@ impl App {
             match self.clipboard.read_external() {
                 Ok(text) => text,
                 Err(error) => {
-                    self.status = format!("Paste failed: {error}");
+                    self.status =
+                        StatusMessage::new(StatusLevel::Error, format!("Paste failed: {error}"));
                     return;
                 }
             }
         };
         if text.is_empty() {
-            self.status = self.clipboard.empty_note().into();
+            self.status = StatusMessage::new(StatusLevel::Info, self.clipboard.empty_note().into());
         } else if let Some(to_replacement) = to_replacement {
             self.search_input(&text, to_replacement);
         } else {
@@ -871,25 +1248,67 @@ impl App {
     }
 
     fn open_search_modal(&mut self, replace_mode: bool) {
+        let prefill = self.workspace.active_view().and_then(|view| {
+            let selection = view.selection()?;
+            let buf = self.workspace.document(view.document_id)?;
+            let text = buf.document.text().slice(selection);
+            (text.len_bytes() <= MAX_SEARCH_BYTES
+                && !text.chars().any(|ch| matches!(ch, '\n' | '\r')))
+            .then(|| text.to_string())
+        });
+        if let Some(text) = prefill {
+            if text != self.search.query.as_str() {
+                self.search.last_match = None;
+            }
+            self.search.query = Field::new(text);
+            self.search
+                .query
+                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        }
         self.drag = None;
         self.workspace.explorer_focused = false;
         self.modal = Some(Modal::Search {
             replace_mode,
             replacement_focus: false,
         });
+        self.invalidate_hit_targets();
+    }
+
+    fn refresh_search_cache(&mut self) -> bool {
+        let Some(buf) = self.workspace.active_document() else {
+            return false;
+        };
+        let valid = self.search.cache.as_ref().is_some_and(|cache| {
+            cache.document_id == buf.id
+                && cache.doc_revision == buf.document.revision()
+                && cache.compiled.needle() == self.search.query.as_str()
+        });
+        if !valid {
+            let Some(compiled) = Query::new(self.search.query.as_str()) else {
+                self.search.cache = None;
+                self.search.feedback.clear();
+                return false;
+            };
+            let index = compiled.match_index(&buf.document, MAX_COUNTED_MATCHES);
+            self.search.cache = Some(SearchCache {
+                document_id: buf.id,
+                doc_revision: buf.document.revision(),
+                compiled,
+                index,
+            });
+        }
+        true
     }
 
     fn find_in_active_tab(&mut self, reverse: bool) {
         if self.search.query.is_empty() {
             self.search.last_match = None;
-            self.status = "Enter a search query".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Enter a search query".into());
             return;
         }
-        let Some(compiled) = Query::new(self.search.query.as_str()) else {
-            self.search.last_match = None;
-            self.status = "Enter a search query".into();
+        if !self.refresh_search_cache() {
             return;
-        };
+        }
         let area = self.active_text_area();
         let pane_id = self.workspace.active_pane_id();
         let Some((tab, buf)) = self.workspace.active_view_and_doc_mut() else {
@@ -898,43 +1317,34 @@ impl App {
         let view_id = tab.id;
         let doc_id = buf.id;
         let doc = &buf.document;
-
-        let current_match = self
-            .search
-            .last_match
-            .as_ref()
-            .filter(|m| {
-                m.pane_id == pane_id
-                    && m.view_id == view_id
-                    && m.document_id == doc_id
-                    && m.doc_revision == doc.revision()
-                    && m.query == self.search.query.as_str()
-                    && tab.selection().as_ref() == Some(&m.range)
-            })
-            .map(|m| m.range.clone());
-
-        let found = if reverse {
-            if let Some(r) = &current_match {
-                match compiled.next(doc, r.start, true) {
-                    Some(m) if m == *r => {
-                        let wrap_from = if r.start > 0 {
-                            doc.previous(r.start)
-                        } else {
-                            doc.len_chars()
-                        };
-                        compiled.next(doc, wrap_from, true)
-                    }
-                    other => other,
-                }
-            } else {
-                compiled.next(doc, tab.cursor, true)
-            }
-        } else {
-            let from = current_match.as_ref().map_or(tab.cursor, |r| r.end);
-            compiled.next(doc, from, false)
+        let current_match = self.search.last_match.as_ref().filter(|m| {
+            m.pane_id == pane_id
+                && m.view_id == view_id
+                && m.document_id == doc_id
+                && m.doc_revision == doc.revision()
+                && m.query == self.search.query.as_str()
+                && tab.selection().as_ref() == Some(&m.range)
+        });
+        let (from, forced_wrap) = match (reverse, current_match) {
+            (true, Some(m)) if m.range.start == 0 => (doc.len_chars(), true),
+            (true, Some(m)) => (doc.previous(m.range.start), false),
+            (false, Some(m)) => (doc.next(m.range.start), false),
+            _ => (tab.cursor, false),
         };
-
+        let compiled = &self
+            .search
+            .cache
+            .as_ref()
+            .expect("refreshed search cache")
+            .compiled;
+        let found = compiled.next(doc, from, reverse);
         if let Some(range) = found {
+            let wrapped = forced_wrap
+                || if reverse {
+                    range.start > from
+                } else {
+                    range.start < from
+                };
             let prev_top = tab.top_line;
             tab.anchor = Some(range.start);
             tab.cursor = range.end;
@@ -943,6 +1353,7 @@ impl App {
             let top_changed = tab.top_line != prev_top;
             let line = doc.line_of(range.start) + 1;
             let col = doc.column_of(range.start) + 1;
+            self.search.update_feedback(Some(&range), wrapped);
             self.search.last_match = Some(SearchMatch {
                 pane_id,
                 view_id,
@@ -951,7 +1362,10 @@ impl App {
                 query: self.search.query.as_str().to_string(),
                 range,
             });
-            self.status = format!("Match at Ln {line}, Col {col}");
+            self.status = StatusMessage::new(
+                StatusLevel::Info,
+                format!("{} at Ln {line}, Col {col}", self.search.feedback),
+            );
             if scrolled {
                 self.invalidate_hit_targets_keep_drag();
             }
@@ -959,22 +1373,21 @@ impl App {
                 self.highlight_pending = true;
             }
         } else {
-            self.status = format!("No match for '{}'", self.search.query.as_str());
+            self.search.last_match = None;
+            self.search.update_feedback(None, false);
+            self.status = StatusMessage::new(
+                StatusLevel::Info,
+                format!("No match for '{}'", self.search.query.as_str()),
+            );
         }
     }
 
     fn replace_current_in_active_tab(&mut self) {
         if self.search.query.is_empty() {
             self.search.last_match = None;
-            self.status = "Enter a search query".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Enter a search query".into());
             return;
         }
-        let Some(compiled) = Query::new(self.search.query.as_str()) else {
-            self.search.last_match = None;
-            self.status = "Enter a search query".into();
-            return;
-        };
-        let area = self.active_text_area();
         let pane_id = self.workspace.active_pane_id();
         let Some(tab) = self.workspace.active_view() else {
             return;
@@ -986,7 +1399,10 @@ impl App {
             return;
         };
         if let Some(reason) = &buf.read_only {
-            self.status = format!("Read-only: {reason}; replace blocked");
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                format!("Read-only: {reason}; replace blocked"),
+            );
             return;
         }
         let valid_match = self
@@ -1004,109 +1420,51 @@ impl App {
             .map(|m| m.range.clone());
         let Some(matched_range) = valid_match else {
             self.search.last_match = None;
-            self.status = "No active match at current revision; press Enter or F3 to find".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Info,
+                "No active match at current revision; press Enter or F3 to find".into(),
+            );
             return;
         };
 
         if self.search.replacement.as_str() == self.search.query.as_str() {
-            let from = matched_range.end;
-            self.search.last_match = None;
-            let Some((tab, buf)) = self.workspace.active_view_and_doc_mut() else {
-                return;
-            };
-            let doc = &buf.document;
-            let mut scrolled = false;
-            let mut top_changed = false;
-            if let Some(next_range) = compiled.next(doc, from, false) {
-                let prev_top = tab.top_line;
-                tab.anchor = Some(next_range.start);
-                tab.cursor = next_range.end;
-                tab.preferred_column = None;
-                scrolled = tab.ensure_visible(doc, area);
-                top_changed = tab.top_line != prev_top;
-                self.search.last_match = Some(SearchMatch {
-                    pane_id,
-                    view_id,
-                    document_id: doc_id,
-                    doc_revision: doc.revision(),
-                    query: self.search.query.as_str().to_string(),
-                    range: next_range,
-                });
-            }
-            self.status = "Replacement matches query; moved to next".into();
-            if scrolled {
-                self.invalidate_hit_targets_keep_drag();
-            }
-            if top_changed {
-                self.highlight_pending = true;
-            }
+            self.find_in_active_tab(false);
+            self.status
+                .text
+                .insert_str(0, "Replacement matches query; ");
             return;
         }
 
         let replacement = self.search.replacement.as_str();
         let Some((result, mutated)) =
             self.workspace
-                .edit_transaction(doc_id, view_id, true, |doc| {
-                    match doc.replace(matched_range, replacement) {
-                        Ok(new_cursor) => (Ok(new_cursor), Some(new_cursor)),
-                        Err(err) => (Err(err), None),
-                    }
+                .edit_transaction(doc_id, view_id, EditViewPolicy::FollowEdit, |doc| match doc
+                    .replace(matched_range, replacement)
+                {
+                    Ok(new_cursor) => (Ok(new_cursor), Some(new_cursor)),
+                    Err(err) => (Err(err), None),
                 })
         else {
             return;
         };
 
         match result {
-            Ok(new_cursor) => {
+            Ok(_) => {
                 self.search.last_match = None;
                 if mutated {
                     self.highlight_pending = true;
                     self.invalidate_hit_targets();
                 }
-                let Some((tab, buf)) = self.workspace.active_view_and_doc_mut() else {
-                    return;
-                };
-                let doc = &buf.document;
-                if let Some(next_range) = compiled.next(doc, new_cursor, false) {
-                    let rev = doc.revision();
-                    let line = doc.line_of(next_range.start) + 1;
-                    let col = doc.column_of(next_range.start) + 1;
-                    tab.anchor = Some(next_range.start);
-                    tab.cursor = next_range.end;
-                    self.search.last_match = Some(SearchMatch {
-                        pane_id,
-                        view_id,
-                        document_id: doc_id,
-                        doc_revision: rev,
-                        query: self.search.query.as_str().to_string(),
-                        range: next_range,
-                    });
-                    let prev_top = tab.top_line;
-                    let scrolled = tab.ensure_visible(doc, area);
-                    let top_changed = tab.top_line != prev_top;
-                    self.status = format!("Replaced; next match at Ln {line}, Col {col}");
-                    if scrolled {
-                        self.invalidate_hit_targets_keep_drag();
-                    }
-                    if top_changed {
-                        self.highlight_pending = true;
-                    }
-                } else {
-                    let prev_top = tab.top_line;
-                    let scrolled = tab.ensure_visible(doc, area);
-                    let top_changed = tab.top_line != prev_top;
-                    self.status = "Replaced; no more matches".into();
-                    if scrolled {
-                        self.invalidate_hit_targets_keep_drag();
-                    }
-                    if top_changed {
-                        self.highlight_pending = true;
-                    }
-                }
+                self.find_in_active_tab(false);
+                self.status.level = StatusLevel::Success;
+                self.status.text.insert_str(0, "Replaced; ");
             }
             Err(error) => {
                 self.search.last_match = None;
-                self.status = format!("Error: replace failed: {error}");
+                self.status = StatusMessage::new(
+                    StatusLevel::Error,
+                    format!("Error: replace failed: {error}"),
+                );
             }
         }
     }
@@ -1114,12 +1472,12 @@ impl App {
     fn replace_all_in_active_tab(&mut self) {
         if self.search.query.is_empty() {
             self.search.last_match = None;
-            self.status = "Enter a search query".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Enter a search query".into());
             return;
         }
         let Some(compiled) = Query::new(self.search.query.as_str()) else {
             self.search.last_match = None;
-            self.status = "Enter a search query".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Enter a search query".into());
             return;
         };
         let area = self.active_text_area();
@@ -1132,25 +1490,32 @@ impl App {
             return;
         };
         if let Some(reason) = &buf.read_only {
-            self.status = format!("Read-only: {reason}; replace blocked");
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                format!("Read-only: {reason}; replace blocked"),
+            );
             return;
         }
         let replacement = self.search.replacement.as_str();
         let Some((result, mutated)) =
             self.workspace
-                .edit_transaction(doc_id, view_id, false, |doc| {
+                .edit_transaction(doc_id, view_id, EditViewPolicy::MapCursor, |doc| {
                     (search::replace_all(doc, &compiled, replacement), None)
                 })
         else {
             return;
         };
+        let succeeded = result.is_ok();
         match result {
             Ok(0) => {
                 self.search.last_match = None;
                 if self.search.query.as_str() == self.search.replacement.as_str() {
-                    self.status = "Replacement matches query; 0 changes".into();
+                    self.status = StatusMessage::new(
+                        StatusLevel::Info,
+                        "Replacement matches query; 0 changes".into(),
+                    );
                 } else {
-                    self.status = "No matches found".into();
+                    self.status = StatusMessage::new(StatusLevel::Info, "No matches found".into());
                 }
             }
             Ok(count) => {
@@ -1162,12 +1527,21 @@ impl App {
                 if let Some((tab, buf)) = self.workspace.active_view_and_doc_mut() {
                     tab.ensure_visible(&buf.document, area);
                 }
-                self.status = format!("Replaced {count} occurrence(s)");
+                self.status = StatusMessage::new(
+                    StatusLevel::Success,
+                    format!("Replaced {count} occurrence(s)"),
+                );
             }
             Err(error) => {
                 self.search.last_match = None;
-                self.status = format!("Error: replace failed: {error}");
+                self.status = StatusMessage::new(
+                    StatusLevel::Error,
+                    format!("Error: replace failed: {error}"),
+                );
             }
+        }
+        if succeeded && self.refresh_search_cache() {
+            self.search.update_feedback(None, false);
         }
     }
 
@@ -1214,7 +1588,7 @@ impl App {
         }
     }
 
-    fn modal_key(&mut self, key: KeyEvent) {
+    fn modal_key(&mut self, mut key: KeyEvent) {
         if matches!(self.modal, Some(Modal::Help { .. })) {
             self.help_modal_key(key);
             return;
@@ -1235,7 +1609,27 @@ impl App {
             return;
         }
         if self.viewport.0 < ui::MIN_DIALOG_SIZE.0 || self.viewport.1 < ui::MIN_DIALOG_SIZE.1 {
-            self.status = "Resize to at least 20x6 before confirming; Esc cancels".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Resize to at least 20x6 before confirming; Esc cancels".into(),
+            );
+            return;
+        }
+        let choice = self.modal.as_ref().and_then(Modal::choice);
+        if let Some((kind, _)) = choice
+            && !ui::choices_fit(
+                Rect::new(0, 0, self.viewport.0, self.viewport.1),
+                kind,
+                kind.message_lines(),
+                self.modal
+                    .as_ref()
+                    .and_then(|modal| modal.target(&self.workspace)),
+            )
+        {
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Resize to read the full confirmation; Esc cancels".into(),
+            );
             return;
         }
         if matches!(self.modal, Some(Modal::Path { .. })) {
@@ -1270,17 +1664,22 @@ impl App {
                         return;
                     };
                     if value.as_str().is_empty() {
-                        self.status = "Enter a file path".into();
+                        self.status =
+                            StatusMessage::new(StatusLevel::Warning, "Enter a file path".into());
                         self.modal = Some(Modal::Path { action, value });
                         return;
                     }
-                    let path = PathBuf::from(value.into_string());
+                    let path = PathBuf::from(value.as_str());
+                    self.path_retry = Some((action, value));
                     match action {
                         PathAction::Open => match self.open_tab_from_path(path) {
-                            Ok(()) => {}
+                            Ok(()) => self.path_retry = None,
                             Err(error) => {
-                                self.status =
-                                    format!("Open failed: {error}; previous documents retained");
+                                self.status = StatusMessage::new(
+                                    StatusLevel::Error,
+                                    format!("Open failed: {error}; previous documents retained"),
+                                );
+                                self.restore_failed_path();
                             }
                         },
                         PathAction::Save { doc_id } => {
@@ -1309,12 +1708,55 @@ impl App {
             }
             return;
         }
+        if let Some((kind, focused)) = choice
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            let backward = match key.code {
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Some(true),
+                KeyCode::Tab => Some(key.modifiers.contains(KeyModifiers::SHIFT)),
+                KeyCode::Right | KeyCode::Down => Some(false),
+                _ => None,
+            };
+            if let Some(backward) = backward {
+                let len = kind.actions().len();
+                let next = if backward {
+                    (focused + len - 1) % len
+                } else {
+                    (focused + 1) % len
+                };
+                if let Some(
+                    Modal::Unsaved { focused: value, .. }
+                    | Modal::Overwrite { focused: value, .. }
+                    | Modal::Conflict { focused: value, .. },
+                ) = &mut self.modal
+                {
+                    *value = next;
+                }
+                self.invalidate_hit_targets();
+                return;
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                let Some(&(_, code)) = kind.actions().get(focused) else {
+                    return;
+                };
+                if code == KeyCode::F(1) {
+                    self.open_help();
+                    return;
+                }
+                key = KeyEvent::new(code, KeyModifiers::NONE);
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    self.status = "No selection; Ctrl+C does not exit".into();
+                    self.status = StatusMessage::new(
+                        StatusLevel::Info,
+                        "No selection; Ctrl+C does not exit".into(),
+                    );
                     return;
                 }
                 KeyCode::Char('z')
@@ -1342,7 +1784,7 @@ impl App {
             return;
         }
         match self.modal.take() {
-            Some(Modal::Unsaved { doc_id, after }) => match ch {
+            Some(Modal::Unsaved { doc_id, after, .. }) => match ch {
                 's' => {
                     self.after_save = Some(after);
                     self.save_document(doc_id);
@@ -1352,7 +1794,10 @@ impl App {
                     match after {
                         AfterSave::CloseView { view_id } => {
                             self.close_view_unconditional(view_id);
-                            self.status = "Discarded unsaved changes".into();
+                            self.status = StatusMessage::new(
+                                StatusLevel::Info,
+                                "Discarded unsaved changes".into(),
+                            );
                         }
                         AfterSave::ClosePane { pane_id } => {
                             if let Some(removed_doc) = self
@@ -1377,10 +1822,10 @@ impl App {
                 }
                 _ => self.cancel_modal(),
             },
-            Some(Modal::Overwrite { doc_id, path }) if ch == 'y' => {
+            Some(Modal::Overwrite { doc_id, path, .. }) if ch == 'y' => {
                 self.save_document_to(doc_id, path, true, true);
             }
-            Some(Modal::Conflict { doc_id, path }) => match ch {
+            Some(Modal::Conflict { doc_id, path, .. }) => match ch {
                 'o' => self.save_document_to(doc_id, path, true, false),
                 'a' => self.save_document_as(doc_id),
                 'r' => {
@@ -1402,7 +1847,10 @@ impl App {
             return;
         }
         if self.viewport.0 < ui::MIN_SEARCH_SIZE.0 || self.viewport.1 < ui::MIN_SEARCH_SIZE.1 {
-            self.status = "Resize to at least 40x10 before using search; Esc cancels".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Resize to at least 40x10 before using search; Esc cancels".into(),
+            );
             return;
         }
         let Some(Modal::Search {
@@ -1478,14 +1926,20 @@ impl App {
                 if replace_mode {
                     self.replace_current_in_active_tab();
                 } else {
-                    self.status = "Open Replace (Ctrl+R) to replace".into();
+                    self.status = StatusMessage::new(
+                        StatusLevel::Info,
+                        "Open Replace (Ctrl+R) to replace".into(),
+                    );
                 }
             }
             KeyCode::F(7) => {
                 if replace_mode {
                     self.replace_all_in_active_tab();
                 } else {
-                    self.status = "Open Replace (Ctrl+R) to replace all".into();
+                    self.status = StatusMessage::new(
+                        StatusLevel::Info,
+                        "Open Replace (Ctrl+R) to replace all".into(),
+                    );
                 }
             }
             _ => {
@@ -1523,25 +1977,33 @@ impl App {
             return;
         };
         let Some(range) = view.selection() else {
-            self.status = no_selection_status(cut);
+            self.status = StatusMessage::new(StatusLevel::Info, no_selection_status(cut));
             return;
         };
         if cut && let Some(reason) = &buf.read_only {
-            self.status = format!("Read-only: {reason}; cut blocked");
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                format!("Read-only: {reason}; cut blocked"),
+            );
             return;
         }
         let text = buf.document.text().slice(range).to_string();
         match self.clipboard.copy(text) {
             Ok(target) => {
                 if cut {
-                    self.status = copy_success_status(true, target);
+                    self.status =
+                        StatusMessage::new(StatusLevel::Success, copy_success_status(true, target));
                     self.replace_in_active_tab("");
                 } else {
-                    self.status = copy_success_status(false, target);
+                    self.status = StatusMessage::new(
+                        StatusLevel::Success,
+                        copy_success_status(false, target),
+                    );
                 }
             }
             Err(error) => {
-                self.status = copy_failure_status(cut, &error);
+                self.status =
+                    StatusMessage::new(StatusLevel::Error, copy_failure_status(cut, &error));
             }
         }
     }
@@ -1554,23 +2016,11 @@ impl App {
         let position = if !extend && let Some(range) = tab.selection() {
             if right { range.end } else { range.start }
         } else if word {
-            let mut pos = tab.cursor;
             if right {
-                if pos < doc.len_chars() {
-                    pos = doc.word_range(pos).end;
-                }
-                while pos < doc.len_chars() && doc.text().char(pos).is_whitespace() {
-                    pos = doc.next(pos);
-                }
+                doc.word_right(tab.cursor)
             } else {
-                while pos > 0 && doc.text().char(doc.previous(pos)).is_whitespace() {
-                    pos = doc.previous(pos);
-                }
-                if pos > 0 {
-                    pos = doc.word_range(doc.previous(pos)).start;
-                }
+                doc.word_left(tab.cursor)
             }
-            pos
         } else if right {
             doc.next(tab.cursor)
         } else {
@@ -1623,9 +2073,10 @@ impl App {
             self.workspace.explorer_focused = false;
         } else if self.workspace.explorer.is_none() {
             if let Err(err) = self.workspace.retry_explorer() {
-                self.status = format!("Warn: explorer: {err}");
+                self.status =
+                    StatusMessage::new(StatusLevel::Warning, format!("Warn: explorer: {err}"));
             } else {
-                self.status = "Explorer shown".into();
+                self.status = StatusMessage::new(StatusLevel::Info, "Explorer shown".into());
             }
         }
         self.highlight_pending = true;
@@ -1635,23 +2086,32 @@ impl App {
     fn toggle_focus(&mut self) {
         if self.workspace.explorer_focused {
             self.workspace.explorer_focused = false;
-            self.status = "Editor focused".into();
+            self.status = StatusMessage::new(StatusLevel::Info, "Editor focused".into());
             return;
         }
         if !self.workspace.explorer_visible {
-            self.status = "Explorer hidden; press Ctrl+B to show".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Explorer hidden; press Ctrl+B to show".into(),
+            );
             return;
         }
         if self.workspace.explorer.is_none() {
-            self.status = "Explorer unavailable; press F5 to retry".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Explorer unavailable; press F5 to retry".into(),
+            );
             return;
         }
         if !self.explorer_fits_viewport() {
-            self.status = "Terminal too narrow for explorer".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Terminal too narrow for explorer".into(),
+            );
             return;
         }
         self.workspace.explorer_focused = true;
-        self.status = "Explorer focused".into();
+        self.status = StatusMessage::new(StatusLevel::Info, "Explorer focused".into());
     }
 
     fn refresh_explorer(&mut self) {
@@ -1660,10 +2120,14 @@ impl App {
                 Ok(()) => {
                     self.ensure_explorer_visible();
                     self.invalidate_hit_targets();
-                    self.status = "Explorer refreshed".into();
+                    self.status =
+                        StatusMessage::new(StatusLevel::Success, "Explorer refreshed".into());
                 }
                 Err(err) => {
-                    self.status = format!("Warn: explorer refresh: {err}");
+                    self.status = StatusMessage::new(
+                        StatusLevel::Warning,
+                        format!("Warn: explorer refresh: {err}"),
+                    );
                 }
             }
         } else {
@@ -1671,10 +2135,12 @@ impl App {
                 Ok(()) => {
                     self.ensure_explorer_visible();
                     self.invalidate_hit_targets();
-                    self.status = "Explorer loaded".into();
+                    self.status =
+                        StatusMessage::new(StatusLevel::Success, "Explorer loaded".into());
                 }
                 Err(err) => {
-                    self.status = format!("Warn: explorer: {err}");
+                    self.status =
+                        StatusMessage::new(StatusLevel::Warning, format!("Warn: explorer: {err}"));
                 }
             }
         }
@@ -1723,20 +2189,25 @@ impl App {
                 if let Some(exp) = self.workspace.explorer.as_mut()
                     && let Err(err) = exp.toggle_selected()
                 {
-                    self.status = format!("Warn: explorer: {err}");
+                    self.status =
+                        StatusMessage::new(StatusLevel::Warning, format!("Warn: explorer: {err}"));
                 }
                 self.ensure_explorer_visible();
                 self.invalidate_hit_targets();
             }
             EntryKind::File | EntryKind::Symlink => {
                 if let Err(err) = self.open_tab_from_path(entry.path.clone()) {
-                    self.status = format!("Open failed: {err}");
+                    self.status =
+                        StatusMessage::new(StatusLevel::Error, format!("Open failed: {err}"));
                 }
             }
             EntryKind::Other => {
-                self.status = entry.issue.clone().unwrap_or_else(|| {
-                    "Unsupported entry type (not a regular file or directory)".into()
-                });
+                self.status = StatusMessage::new(
+                    StatusLevel::Warning,
+                    entry.issue.clone().unwrap_or_else(|| {
+                        "Unsupported entry type (not a regular file or directory)".into()
+                    }),
+                );
             }
         }
     }
@@ -1757,20 +2228,30 @@ impl App {
                 Ok(true) => {
                     self.ensure_explorer_visible();
                     self.invalidate_hit_targets();
-                    self.status = format!("Explorer: {}", self.workspace.root_label);
+                    self.status = StatusMessage::new(
+                        StatusLevel::Info,
+                        format!("Explorer: {}", self.workspace.root_label),
+                    );
                 }
                 Ok(false) => {}
-                Err(err) => self.status = format!("Warn: explorer: {err}"),
+                Err(err) => {
+                    self.status =
+                        StatusMessage::new(StatusLevel::Warning, format!("Warn: explorer: {err}"))
+                }
             },
             EntryKind::File | EntryKind::Symlink => {
                 if let Err(err) = self.open_tab_from_path(entry.path.clone()) {
-                    self.status = format!("Open failed: {err}");
+                    self.status =
+                        StatusMessage::new(StatusLevel::Error, format!("Open failed: {err}"));
                 }
             }
             EntryKind::Other => {
-                self.status = entry.issue.clone().unwrap_or_else(|| {
-                    "Unsupported entry type (not a regular file or directory)".into()
-                });
+                self.status = StatusMessage::new(
+                    StatusLevel::Warning,
+                    entry.issue.clone().unwrap_or_else(|| {
+                        "Unsupported entry type (not a regular file or directory)".into()
+                    }),
+                );
             }
         }
     }
@@ -1782,10 +2263,19 @@ impl App {
             Ok(true) => {
                 self.ensure_explorer_visible();
                 self.invalidate_hit_targets();
-                self.status = format!("Explorer: {}", self.workspace.root_label);
+                self.status = StatusMessage::new(
+                    StatusLevel::Info,
+                    format!("Explorer: {}", self.workspace.root_label),
+                );
             }
-            Ok(false) => self.status = "Already at filesystem root".into(),
-            Err(err) => self.status = format!("Warn: explorer: {err}"),
+            Ok(false) => {
+                self.status =
+                    StatusMessage::new(StatusLevel::Info, "Already at filesystem root".into())
+            }
+            Err(err) => {
+                self.status =
+                    StatusMessage::new(StatusLevel::Warning, format!("Warn: explorer: {err}"))
+            }
         }
     }
 
@@ -1794,7 +2284,10 @@ impl App {
             || self.workspace.explorer.is_none()
             || !self.explorer_fits_viewport()
         {
-            self.status = "Explorer hidden on narrow screen; press Esc or F2 for editor".into();
+            self.status = StatusMessage::new(
+                StatusLevel::Warning,
+                "Explorer hidden on narrow screen; press Esc or F2 for editor".into(),
+            );
             return;
         }
         let page_step = isize::try_from(self.explorer_view_height().max(1)).unwrap_or(1);
@@ -1840,7 +2333,8 @@ impl App {
                 if let Some(exp) = self.workspace.explorer.as_mut()
                     && let Err(err) = exp.expand_selected()
                 {
-                    self.status = format!("Warn: explorer: {err}");
+                    self.status =
+                        StatusMessage::new(StatusLevel::Warning, format!("Warn: explorer: {err}"));
                 }
                 self.ensure_explorer_visible();
                 self.invalidate_hit_targets();
@@ -1861,6 +2355,10 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        if matches!(self.drag, Some(DragState::Scrollbar { .. })) {
+            self.drag = None;
+            self.dragged = false;
+        }
         if self.modal.is_some() {
             self.modal_key(key);
             return;
@@ -2000,7 +2498,7 @@ impl App {
         if key.code == KeyCode::Esc && !control && !alt {
             if self.workspace.explorer_focused {
                 self.workspace.explorer_focused = false;
-                self.status = "Editor focused".into();
+                self.status = StatusMessage::new(StatusLevel::Info, "Editor focused".into());
             } else {
                 if let Some(view) = self.workspace.active_view_mut() {
                     view.anchor = None;
@@ -2038,13 +2536,19 @@ impl App {
                         match self.clipboard.read_external() {
                             Ok(text) => text,
                             Err(error) => {
-                                self.status = format!("Paste failed: {error}");
+                                self.status = StatusMessage::new(
+                                    StatusLevel::Error,
+                                    format!("Paste failed: {error}"),
+                                );
                                 return;
                             }
                         }
                     };
                     if text.is_empty() {
-                        self.status = self.clipboard.empty_note().into();
+                        self.status = StatusMessage::new(
+                            StatusLevel::Info,
+                            self.clipboard.empty_note().into(),
+                        );
                     } else {
                         self.paste_in_active_tab(&text);
                     }
@@ -2062,16 +2566,22 @@ impl App {
                     let Some(buf) = self.workspace.document(doc_id) else {
                         return;
                     };
-                    if buf.read_only.is_some() {
+                    if let Some(reason) = &buf.read_only {
+                        self.status = StatusMessage::new(
+                            StatusLevel::Warning,
+                            format!("Read-only: {reason}; undo/redo blocked"),
+                        );
                         return;
                     }
-                    if let Some((_, true)) =
-                        self.workspace
-                            .edit_transaction(doc_id, view_id, true, |doc| {
-                                let cursor = if is_undo { doc.undo() } else { doc.redo() };
-                                (cursor.is_some(), cursor)
-                            })
-                    {
+                    if let Some((_, true)) = self.workspace.edit_transaction(
+                        doc_id,
+                        view_id,
+                        EditViewPolicy::FollowEdit,
+                        |doc| {
+                            let cursor = if is_undo { doc.undo() } else { doc.redo() };
+                            (cursor.is_some(), cursor)
+                        },
+                    ) {
                         self.search.last_match = None;
                         self.highlight_pending = true;
                         self.invalidate_hit_targets();
@@ -2128,17 +2638,8 @@ impl App {
                 self.replace_in_active_tab("");
             }
             KeyCode::Enter if !control && !alt => self.replace_in_active_tab("\n"),
-            KeyCode::Tab if !control && !alt => {
-                let Some(view) = self.workspace.active_view() else {
-                    return;
-                };
-                let Some(buf) = self.workspace.document(view.document_id) else {
-                    return;
-                };
-                let spaces = "    ";
-                let count = 4 - buf.document.column_of(view.cursor) % 4;
-                self.replace_in_active_tab(&spaces[..count]);
-            }
+            KeyCode::Tab if !control && !alt => self.indent_in_active_tab(shift),
+            KeyCode::BackTab if !control && !alt => self.indent_in_active_tab(true),
             KeyCode::Char(ch) if !control && !alt => {
                 self.replace_in_active_tab(ch.encode_utf8(&mut [0; 4]));
             }
@@ -2152,7 +2653,15 @@ impl App {
             self.dragged = false;
             return;
         }
-        if !self.hit_targets_valid {
+        let continues_help_drag = matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
+            && matches!(
+                self.drag,
+                Some(DragState::Scrollbar {
+                    target: ScrollbarTarget::Help { .. },
+                    ..
+                })
+            );
+        if !self.hit_targets_valid && !continues_help_drag {
             return;
         }
         let pos = (mouse.column, mouse.row).into();
@@ -2166,6 +2675,20 @@ impl App {
                     .copied()
                 {
                     self.modal_key(cmd.key);
+                    return;
+                }
+                if let Some(bar) = self
+                    .geometry
+                    .help_scrollbar
+                    .filter(|bar| bar.track.contains(pos))
+                {
+                    self.start_scrollbar(
+                        ScrollbarTarget::Help {
+                            viewport: self.viewport,
+                        },
+                        Some(bar),
+                        mouse,
+                    );
                     return;
                 }
                 if let Some(hit) = self.geometry.fields.iter().find(|f| f.area.contains(pos)) {
@@ -2202,6 +2725,10 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if matches!(self.drag, Some(DragState::Scrollbar { .. })) {
+                    self.drag_scrollbar(mouse);
+                    return;
+                }
                 if let Some(DragState::Field { kind }) = self.drag {
                     if let Some(hit) = self.geometry.fields.iter().find(|f| f.kind == kind) {
                         let clamped_x = mouse
@@ -2255,7 +2782,11 @@ impl App {
             || (matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
                 && matches!(
                     self.drag,
-                    Some(DragState::ExplorerDivider { .. } | DragState::SplitDivider { .. })
+                    Some(
+                        DragState::ExplorerDivider { .. }
+                            | DragState::SplitDivider { .. }
+                            | DragState::Scrollbar { .. }
+                    )
                 ));
         if !self.hit_targets_valid && !completes_drag {
             return;
@@ -2325,6 +2856,52 @@ impl App {
                             self.invalidate_hit_targets();
                         }
                     }
+                    return;
+                }
+                if let Some(bar) = self
+                    .geometry
+                    .sidebar_scrollbar
+                    .filter(|bar| bar.track.contains(pos))
+                {
+                    if let Some(explorer) = self.workspace.explorer.as_ref() {
+                        let target = ScrollbarTarget::Explorer {
+                            rows: explorer.rows().len(),
+                        };
+                        self.start_scrollbar(target, Some(bar), mouse);
+                    }
+                    return;
+                }
+                if let Some((pane_id, area, bar)) = self.geometry.panes.iter().find_map(|pane| {
+                    if let Some(bar) = pane.vertical_scrollbar
+                        && bar.track.contains(pos)
+                    {
+                        return Some((pane.id, pane.text_area, Some(bar)));
+                    }
+                    if pane
+                        .horizontal_track
+                        .is_some_and(|track| track.contains(pos))
+                    {
+                        return Some((pane.id, pane.text_area, pane.horizontal_scrollbar));
+                    }
+                    None
+                }) {
+                    let Some(view) = self
+                        .workspace
+                        .pane(pane_id)
+                        .and_then(|pane| pane.active_tab())
+                    else {
+                        return;
+                    };
+                    let Some(buffer) = self.workspace.document(view.document_id) else {
+                        return;
+                    };
+                    let target = ScrollbarTarget::Editor {
+                        pane_id,
+                        view_id: view.id,
+                        revision: buffer.document.revision(),
+                        text_area: area,
+                    };
+                    self.start_scrollbar(target, bar, mouse);
                     return;
                 }
 
@@ -2477,6 +3054,7 @@ impl App {
                         self.invalidate_hit_targets_keep_drag();
                     }
                 }
+                Some(DragState::Scrollbar { .. }) => self.drag_scrollbar(mouse),
                 Some(DragState::Text {
                     pane_id, view_id, ..
                 }) => {
@@ -2523,6 +3101,9 @@ impl App {
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {
+                if matches!(self.drag, Some(DragState::Scrollbar { .. })) {
+                    self.drag = None;
+                }
                 // Wheel targets the whole sidebar panel but scrolls by the real
                 // inner rows height.
                 if let Some(panel) = self.geometry.sidebar_panel
@@ -2548,12 +3129,12 @@ impl App {
                     }
                     return;
                 }
-                let Some(pane_id) = self
+                let Some((pane_id, text_area)) = self
                     .geometry
                     .panes
                     .iter()
                     .find(|p| !p.text_area.is_empty() && p.area.contains(pos))
-                    .map(|p| p.id)
+                    .map(|p| (p.id, p.text_area))
                 else {
                     return;
                 };
@@ -2562,14 +3143,42 @@ impl App {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => tab.top_line = tab.top_line.saturating_sub(3),
                         MouseEventKind::ScrollDown => {
-                            tab.top_line =
-                                (tab.top_line + 3).min(buf.document.line_count().saturating_sub(1));
+                            tab.top_line = (tab.top_line + 3).min(
+                                buf.document
+                                    .line_count()
+                                    .saturating_sub(usize::from(text_area.height)),
+                            );
                         }
                         MouseEventKind::ScrollLeft => {
                             tab.left_cell = tab.left_cell.saturating_sub(4);
                         }
                         MouseEventKind::ScrollRight => {
-                            tab.left_cell = tab.left_cell.saturating_add(4);
+                            let content_width = tab
+                                .horizontal_width
+                                .measurement()
+                                .and_then(|width| {
+                                    width.for_view(
+                                        buf.document.revision(),
+                                        tab.top_line,
+                                        text_area.height,
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    let end = tab
+                                        .top_line
+                                        .saturating_add(usize::from(text_area.height))
+                                        .min(buf.document.line_count());
+                                    (tab.top_line..end)
+                                        .map(|line| {
+                                            buf.document.column_of(buf.document.line_end(line))
+                                        })
+                                        .max()
+                                        .unwrap_or(0)
+                                        .saturating_add(1)
+                                });
+                            let max_left =
+                                content_width.saturating_sub(usize::from(text_area.width));
+                            tab.left_cell = tab.left_cell.saturating_add(4).min(max_left);
                         }
                         _ => {}
                     }
@@ -2583,6 +3192,232 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn start_scrollbar(
+        &mut self,
+        target: ScrollbarTarget,
+        bar: Option<Scrollbar>,
+        mouse: MouseEvent,
+    ) {
+        self.drag = None;
+        self.mouse_down = None;
+        self.dragged = false;
+        self.last_click = None;
+        let Some(bar) = bar.filter(|bar| bar.max_offset > 0) else {
+            return;
+        };
+        let coordinate = match bar.axis {
+            Axis::Columns => mouse.column,
+            Axis::Rows => mouse.row,
+        };
+        if bar.thumb.contains((mouse.column, mouse.row).into()) {
+            self.drag = Some(DragState::Scrollbar {
+                target,
+                bar,
+                anchor: coordinate,
+            });
+        } else {
+            self.scroll_to(target, bar.axis, bar.page_offset(coordinate));
+        }
+    }
+
+    fn captured_scrollbar(&self, target: ScrollbarTarget, axis: Axis) -> Option<Scrollbar> {
+        match target {
+            ScrollbarTarget::Editor {
+                pane_id,
+                view_id,
+                revision,
+                text_area,
+            } => {
+                if self.modal.is_some() {
+                    return None;
+                }
+                let view = self.workspace.pane(pane_id)?.active_tab()?;
+                if view.id != view_id
+                    || self
+                        .workspace
+                        .document(view.document_id)?
+                        .document
+                        .revision()
+                        != revision
+                {
+                    return None;
+                }
+                let pane = self.geometry.pane(pane_id)?;
+                if pane.text_area != text_area {
+                    return None;
+                }
+                match axis {
+                    Axis::Rows => pane.vertical_scrollbar,
+                    Axis::Columns => pane.horizontal_scrollbar,
+                }
+            }
+            ScrollbarTarget::Explorer { rows } => {
+                if self.modal.is_some()
+                    || !self.workspace.explorer_visible
+                    || self.workspace.explorer.as_ref()?.rows().len() != rows
+                {
+                    return None;
+                }
+                self.geometry.sidebar_scrollbar
+            }
+            ScrollbarTarget::Help { viewport } => {
+                if self.viewport != viewport || !matches!(self.modal, Some(Modal::Help { .. })) {
+                    return None;
+                }
+                self.geometry.help_scrollbar
+            }
+        }
+    }
+
+    fn drag_scrollbar(&mut self, mouse: MouseEvent) {
+        let Some(DragState::Scrollbar {
+            target,
+            bar,
+            anchor,
+        }) = self.drag
+        else {
+            return;
+        };
+        let valid = self
+            .captured_scrollbar(target, bar.axis)
+            .is_some_and(|current| {
+                current.track == bar.track && current.max_offset == bar.max_offset
+            });
+        if !valid {
+            self.drag = None;
+            self.dragged = false;
+            return;
+        }
+        let coordinate = match bar.axis {
+            Axis::Columns => mouse.column,
+            Axis::Rows => mouse.row,
+        };
+        self.dragged |= coordinate != anchor;
+        if self.dragged {
+            self.scroll_to(target, bar.axis, bar.drag_offset(anchor, coordinate));
+        }
+    }
+
+    fn scroll_to(&mut self, target: ScrollbarTarget, axis: Axis, offset: usize) {
+        match target {
+            ScrollbarTarget::Editor { pane_id, .. } => {
+                let Some((tab, _)) = self.workspace.pane_active_view_and_doc_mut(pane_id) else {
+                    return;
+                };
+                let position = match axis {
+                    Axis::Rows => &mut tab.top_line,
+                    Axis::Columns => &mut tab.left_cell,
+                };
+                if *position == offset {
+                    return;
+                }
+                *position = offset;
+                self.highlight_pending |= axis == Axis::Rows;
+            }
+            ScrollbarTarget::Explorer { .. } => {
+                let Some(explorer) = self.workspace.explorer.as_mut() else {
+                    return;
+                };
+                let previous = explorer.top();
+                explorer.set_top(offset);
+                if previous == explorer.top() {
+                    return;
+                }
+            }
+            ScrollbarTarget::Help { .. } => {
+                let Some(Modal::Help { scroll }) = &mut self.modal else {
+                    return;
+                };
+                if *scroll == offset {
+                    return;
+                }
+                *scroll = offset;
+            }
+        }
+        self.invalidate_hit_targets_keep_drag();
+    }
+
+    fn scroll_width_pending(&self) -> bool {
+        self.geometry.panes.iter().any(|pane| {
+            pane.horizontal_track.is_some()
+                && self
+                    .workspace
+                    .pane(pane.id)
+                    .and_then(|pane| pane.active_tab())
+                    .is_some_and(|view| view.horizontal_width.pending())
+        })
+    }
+
+    fn update_scroll_metrics(&mut self) -> bool {
+        if !self.hit_targets_valid {
+            return false;
+        }
+        let mut changed = false;
+        let mut viewport_changed = false;
+        for pane in &self.geometry.panes {
+            let Some((view, buf)) = self.workspace.pane_active_view_and_doc_mut(pane.id) else {
+                continue;
+            };
+            let top = view.top_line.min(
+                buf.document
+                    .line_count()
+                    .saturating_sub(usize::from(pane.text_area.height)),
+            );
+            if view.top_line != top {
+                view.top_line = top;
+                self.highlight_pending = true;
+                viewport_changed = true;
+            }
+            if pane.horizontal_track.is_some() {
+                view.horizontal_width
+                    .prepare(&buf.document, top, pane.text_area.height);
+                if let Some(width) = view.horizontal_width.measurement() {
+                    let left = view.left_cell.min(
+                        width
+                            .cells
+                            .saturating_sub(usize::from(pane.text_area.width)),
+                    );
+                    viewport_changed |= left != view.left_cell;
+                    view.left_cell = left;
+                }
+            }
+        }
+        let count = self.geometry.panes.len();
+        let started = Instant::now();
+        let mut idle_visits = 0;
+        while count > 0 && idle_visits < count && started.elapsed() < SCROLL_WIDTH_TICK_BUDGET {
+            let index = self.scroll_scan_cursor % count;
+            self.scroll_scan_cursor = (index + 1) % count;
+            let pane = &self.geometry.panes[index];
+            let Some((view, buf)) = self.workspace.pane_active_view_and_doc_mut(pane.id) else {
+                idle_visits += 1;
+                continue;
+            };
+            if pane.horizontal_track.is_none() || !view.horizontal_width.pending() {
+                idle_visits += 1;
+                continue;
+            }
+            idle_visits = 0;
+            if view.horizontal_width.advance(&buf.document, 512) {
+                changed = true;
+                let width = view
+                    .horizontal_width
+                    .measurement()
+                    .expect("completed width scan has a measurement")
+                    .cells;
+                let left = view
+                    .left_cell
+                    .min(width.saturating_sub(usize::from(pane.text_area.width)));
+                viewport_changed |= left != view.left_cell;
+                view.left_cell = left;
+            }
+        }
+        if viewport_changed {
+            self.invalidate_hit_targets_keep_drag();
+        }
+        changed || viewport_changed
     }
 
     fn drag_tick(&mut self) -> bool {
@@ -2614,7 +3449,8 @@ impl App {
             tab.top_line = tab.top_line.saturating_sub(1);
         }
         if y >= area.bottom() {
-            tab.top_line = (tab.top_line + 1).min(doc.line_count().saturating_sub(1));
+            tab.top_line =
+                (tab.top_line + 1).min(doc.line_count().saturating_sub(usize::from(area.height)));
         }
         if x < area.x {
             tab.left_cell = tab.left_cell.saturating_sub(1);
@@ -2715,14 +3551,6 @@ impl App {
             );
             any_pending |= progress.pending;
             need_redraw |= progress.changed;
-            if let Some(warning) = progress.warning {
-                self.status = if warning.starts_with("Warn") {
-                    warning
-                } else {
-                    format!("Warn: highlight: {warning}")
-                };
-                need_redraw = true;
-            }
         }
 
         self.highlight_pending = any_pending;
@@ -2731,9 +3559,13 @@ impl App {
 
     fn event(&mut self, event: InputEvent) -> bool {
         match event {
+            InputEvent::ControlSequencePending => self.input_sequence_pending = true,
+            InputEvent::ControlSequenceResumed => self.input_sequence_pending = false,
             InputEvent::PasteRejected => {
-                self.status =
-                    "Paste rejected: invalid UTF-8 or over 1 MiB; nothing inserted".into();
+                self.status = StatusMessage::new(
+                    StatusLevel::Error,
+                    "Paste rejected: invalid UTF-8 or over 1 MiB; nothing inserted".into(),
+                );
             }
             InputEvent::Terminal(Event::Paste(text)) => match &self.modal {
                 Some(Modal::Path { .. }) => self.path_input(&text),
@@ -2759,9 +3591,11 @@ impl App {
                             }
                         }
                     } else {
-                        self.status =
+                        self.status = StatusMessage::new(
+                            StatusLevel::Warning,
                             "Explorer focused; press Esc or F2 to focus editor before pasting"
-                                .into();
+                                .into(),
+                        );
                     }
                 }
             },
@@ -2818,6 +3652,7 @@ impl App {
                 selection: view.selection(),
                 top_line: view.top_line,
                 left_cell: view.left_cell,
+                horizontal_extent: view.horizontal_width.measurement(),
                 read_only: buf.read_only.is_some(),
                 tabs: &all_captions[start..end],
                 highlights: self.highlighter.lines(buf.id),
@@ -2829,19 +3664,6 @@ impl App {
         } else {
             None
         };
-        let unsaved_title = match &self.modal {
-            Some(Modal::Unsaved { doc_id, .. }) => {
-                let label = self
-                    .workspace
-                    .document(*doc_id)
-                    .map_or("document", DocumentBuffer::label);
-                format!("Unsaved changes: {label}")
-            }
-            _ => String::new(),
-        };
-        let unsaved = ["Save changes before closing this document?"];
-        let overwrite = ["Target exists. Replace its contents?"];
-        let conflict = ["File changed outside Notefart. Choose how to continue."];
         let dialog = match &self.modal {
             Some(Modal::Path { action, value }) => Some(Dialog::Path {
                 title: match action {
@@ -2850,20 +3672,35 @@ impl App {
                 },
                 value: value.view(),
             }),
-            Some(Modal::Unsaved { .. }) => Some(Dialog::Choices {
-                title: &unsaved_title,
-                lines: &unsaved,
+            Some(Modal::Unsaved { focused, .. }) => Some(Dialog::Choices {
+                title: "Unsaved changes",
+                lines: ChoiceKind::Unsaved.message_lines(),
                 kind: ChoiceKind::Unsaved,
+                target: self
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| modal.target(&self.workspace)),
+                focused: *focused,
             }),
-            Some(Modal::Overwrite { .. }) => Some(Dialog::Choices {
+            Some(Modal::Overwrite { focused, .. }) => Some(Dialog::Choices {
                 title: "Confirm overwrite",
-                lines: &overwrite,
+                lines: ChoiceKind::Overwrite.message_lines(),
                 kind: ChoiceKind::Overwrite,
+                target: self
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| modal.target(&self.workspace)),
+                focused: *focused,
             }),
-            Some(Modal::Conflict { .. }) => Some(Dialog::Choices {
+            Some(Modal::Conflict { focused, .. }) => Some(Dialog::Choices {
                 title: "External file conflict",
-                lines: &conflict,
+                lines: ChoiceKind::Conflict.message_lines(),
                 kind: ChoiceKind::Conflict,
+                target: self
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| modal.target(&self.workspace)),
+                focused: *focused,
             }),
             Some(Modal::Search {
                 replace_mode,
@@ -2872,6 +3709,7 @@ impl App {
                 query: self.search.query.view(),
                 replacement: replace_mode.then(|| self.search.replacement.view()),
                 replacement_focus: *replacement_focus,
+                feedback: self.search.current_feedback(&self.workspace),
             }),
             Some(Modal::Help { scroll }) => Some(Dialog::Help { scroll: *scroll }),
             None => None,
@@ -2885,7 +3723,17 @@ impl App {
             active_pane: active_pane_id,
             tree: &self.workspace.tree,
             title: &self.workspace.root_label,
-            status: &self.status,
+            status: if self.input_sequence_pending {
+                "Ctrl+G resumes input; terminal sequence incomplete"
+            } else {
+                &self.status.text
+            },
+            status_level: if self.input_sequence_pending {
+                StatusLevel::Warning
+            } else {
+                self.status.level
+            },
+            highlight_warning: active_buf.and_then(|buf| self.highlighter.warning(buf.id)),
             active_path,
             format,
             dirty,
@@ -2898,6 +3746,7 @@ impl App {
         };
         let out = draw_fn(&model, &mut self.geometry);
         self.hit_targets_valid = true;
+        self.scroll_metrics_dirty = self.update_scroll_metrics();
         out
     }
 
@@ -2933,7 +3782,7 @@ impl App {
 
         draw(self)?;
 
-        let mut post_render_dirty = false;
+        let mut post_render_dirty = self.scroll_metrics_dirty;
         let new_text_area = self.geometry.pane(active_pane_id).map(|p| p.text_area);
         if let Some(area) = new_text_area
             && previous_text_area != Some(area)
@@ -2950,7 +3799,8 @@ impl App {
                 .iter()
                 .zip(self.geometry.panes.iter())
                 .any(|((id1, r1), p2)| *id1 != p2.id || *r1 != p2.text_area);
-        if panes_changed || post_render_dirty {
+        // Scrollbar-only redraws do not change the syntax viewport.
+        if panes_changed {
             self.highlight_pending = true;
         }
         if post_render_dirty {
@@ -2965,7 +3815,7 @@ impl App {
             *skip_pre_render_highlight = true;
             return Ok(true);
         }
-        Ok(false)
+        Ok(self.scroll_metrics_dirty)
     }
 }
 
@@ -2990,7 +3840,7 @@ fn copy_failure_status(cut: bool, error: &ClipboardError) -> String {
     if cut {
         format!("Cut failed: {error}; source retained")
     } else {
-        format!("Copy failed: {error}; data kept in internal clipboard")
+        format!("Copy failed: {error}")
     }
 }
 
@@ -3035,8 +3885,23 @@ fn byte_for_column(stops: &[(u16, usize)], col: u16) -> usize {
         .unwrap_or(0)
 }
 
-pub(crate) fn run(path: Option<PathBuf>, options: Options) -> io::Result<()> {
-    let mut app = App::bootstrap(path, options)?;
+pub(crate) fn run(
+    path: Option<PathBuf>,
+    options: Options,
+    session_enabled: bool,
+) -> io::Result<()> {
+    crate::terminal::verify_tty()?;
+    let mut app = if session_enabled {
+        App::bootstrap_session(options).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{error}; use --no-session for separate editing"),
+            )
+        })?
+    } else {
+        App::bootstrap(path, options)?
+    };
+    crate::terminal::use_theme_color_policy();
     let mut session = TerminalSession::enter()?;
     let outcome = run_loop(&mut session, &mut app);
     let restored = session.restore();
@@ -3095,7 +3960,7 @@ fn run_loop(session: &mut TerminalSession, app: &mut App) -> io::Result<()> {
         }
         let wait_timeout = if redraw {
             Duration::ZERO
-        } else if app.highlight_pending {
+        } else if app.highlight_pending || app.scroll_width_pending() {
             HIGHLIGHT_IDLE_TICK
         } else {
             TICK
@@ -3118,6 +3983,7 @@ fn run_loop(session: &mut TerminalSession, app: &mut App) -> io::Result<()> {
             }
         } else {
             redraw |= app.drag_tick();
+            redraw |= app.update_scroll_metrics();
             if redraw {
                 skip_pre_render_highlight = false;
             } else if app.highlight_pending && app.update_highlight() {
@@ -3163,6 +4029,27 @@ mod tests {
         terminal
     }
 
+    fn draw_measured_frame(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = draw_frame(app, width, height);
+        // Complete fixture measurement deterministically, independent of the idle time budget.
+        for pane in &app.geometry.panes {
+            if let Some((view, buf)) = app.workspace.pane_active_view_and_doc_mut(pane.id)
+                && pane.horizontal_track.is_some()
+            {
+                view.horizontal_width.advance(&buf.document, usize::MAX);
+            }
+        }
+        app.render_step(&mut false, &mut Vec::new(), |app| {
+            app.render_with(|model, geometry| {
+                terminal
+                    .draw(|frame| ui::draw(frame, model, geometry))
+                    .map(|_| ())
+            })
+        })
+        .unwrap();
+        terminal
+    }
+
     fn ctrl(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
@@ -3180,6 +4067,7 @@ mod tests {
             tabs: Vec::new(),
             previous_tab: None,
             next_tab: None,
+            ..PaneGeometry::default()
         }];
     }
 
@@ -3337,7 +4225,7 @@ mod tests {
         let view_id = app.workspace.active_view_id();
         let doc_id = app.workspace.active_document().unwrap().id;
         app.workspace
-            .edit_transaction(doc_id, view_id, true, |doc| {
+            .edit_transaction(doc_id, view_id, EditViewPolicy::FollowEdit, |doc| {
                 let c = doc.replace(0..0, "a\nb\nc").unwrap();
                 (c, Some(c))
             });
@@ -3526,6 +4414,7 @@ mod tests {
             ],
             previous_tab: None,
             next_tab: None,
+            ..PaneGeometry::default()
         }];
         app.hit_targets_valid = true;
 
@@ -3919,6 +4808,7 @@ mod tests {
             tabs: Vec::new(),
             previous_tab: None,
             next_tab: None,
+            ..PaneGeometry::default()
         }];
         app.hit_targets_valid = true;
 
@@ -3958,7 +4848,7 @@ mod tests {
         let view_id = app.workspace.active_view_id();
         let doc_id = app.workspace.active_document().unwrap().id;
         app.workspace
-            .edit_transaction(doc_id, view_id, false, |doc| {
+            .edit_transaction(doc_id, view_id, EditViewPolicy::MapCursor, |doc| {
                 let c = doc.replace(0..0, "zero\none\ntwo\nthree\nfour\n").unwrap();
                 (c, Some(c))
             });
@@ -4210,7 +5100,7 @@ mod tests {
             app.workspace.explorer.as_ref().unwrap().rows(),
             rows_before.as_slice()
         );
-        assert!(app.status.starts_with("Warn: explorer:"));
+        assert_eq!(app.status.level, StatusLevel::Warning);
 
         // Enter with no selectable row on an empty root is a safe no-op.
         let empty = tempfile::tempdir().unwrap();
@@ -4227,7 +5117,6 @@ mod tests {
                 .rows()
                 .is_empty()
         );
-        assert!(!empty_app.status.starts_with("Warn:"));
     }
 
     #[test]
@@ -4439,6 +5328,7 @@ mod tests {
             tabs: Vec::new(),
             previous_tab: Some(Rect::new(28, 1, 1, 1)),
             next_tab: Some(Rect::new(79, 1, 1, 1)),
+            ..PaneGeometry::default()
         }];
         app.hit_targets_valid = true;
         app.mouse(
@@ -4843,7 +5733,7 @@ mod tests {
         app.viewport = (20, 20);
         app.key(fkey(8));
         assert_eq!(app.workspace.panes().len(), 1);
-        assert!(app.status.contains("Cannot split"));
+        assert_eq!(app.status.level, StatusLevel::Warning);
 
         // Refuses vertical split on 6-row screen (compact body 4 < 4 + 1 + 4)
         app.viewport = (80, 6);
@@ -5146,7 +6036,7 @@ mod tests {
                 .to_string(),
             "foo bar foo"
         );
-        assert!(app.status.contains("No active match"));
+        assert_eq!(app.status.level, StatusLevel::Info);
     }
 
     #[test]
@@ -5234,7 +6124,7 @@ mod tests {
 
         // Input control char '\n' -> rejected before mutation, preserving selection
         app.modal_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE));
-        assert!(app.status.contains("rejected"));
+        assert_eq!(app.status.level, StatusLevel::Error);
         if let Some(Modal::Path { value, .. }) = &app.modal {
             assert_eq!(value.as_str(), "/path/to/my_file.txt");
             assert_eq!(value.selected(), Some("my_file"));
@@ -5259,7 +6149,7 @@ mod tests {
         }
         let huge_paste = "a".repeat(4100);
         app.path_input(&huge_paste);
-        assert!(app.status.contains("rejected"));
+        assert_eq!(app.status.level, StatusLevel::Error);
         if let Some(Modal::Path { value, .. }) = &app.modal {
             assert_eq!(value.as_str(), "/path/to/new_name.txt");
             assert_eq!(value.selected(), Some("new_name"));
@@ -5286,7 +6176,7 @@ mod tests {
 
         // Ctrl+C in field copies field selection, not document, and pastes back into field
         app.modal_key(ctrl('c'));
-        assert!(app.status.contains("Copied to internal clipboard"));
+        assert_eq!(app.status.level, StatusLevel::Success);
         assert_eq!(
             app.workspace
                 .active_document()
@@ -5309,7 +6199,7 @@ mod tests {
 
         // Empty copy (no selection) in field does not touch document or clipboard
         app.modal_key(ctrl('c'));
-        assert!(app.status.contains("No selection"));
+        assert_eq!(app.status.level, StatusLevel::Info);
         if let Some(Modal::Path { value, .. }) = &mut app.modal {
             value.move_to(value.as_str().len(), false);
         }
@@ -5324,7 +6214,7 @@ mod tests {
 
         // Ctrl+X cuts from field, document unchanged, paste confirms cut text
         app.modal_key(ctrl('x'));
-        assert!(app.status.contains("Cut to internal clipboard"));
+        assert_eq!(app.status.level, StatusLevel::Success);
         if let Some(Modal::Path { value, .. }) = &mut app.modal {
             assert_eq!(value.as_str(), "dialogtext");
             value.move_to(value.as_str().len(), false);
@@ -5763,7 +6653,6 @@ mod tests {
         })
         .unwrap();
         assert!(app.hit_targets_valid);
-        assert!(!app.highlight_pending);
 
         // Jump to line 250 via Search (F3) and drain incremental highlight ticks.
         app.search.query = "NEEDLE_TARGET".into();
@@ -5993,5 +6882,1178 @@ mod tests {
         app.modal_key(ctrl('v'));
         assert_eq!(app.search.query.as_str(), "a\nb");
         assert_eq!(app.search.query.selection(), Some(0..3));
+    }
+
+    #[test]
+    fn agy_p0_failed_open_preserves_path_caret_and_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("keep this buffer");
+        app.open_path_dialog();
+        app.path_input(dir.path().join("missing.txt").to_str().unwrap());
+        let expected = match &mut app.modal {
+            Some(Modal::Path { value, .. }) => {
+                value.move_to(1, false);
+                value.move_to(4, true);
+                value.clone()
+            }
+            _ => panic!("expected path editor"),
+        };
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Modal::Path {
+            action: PathAction::Open,
+            value,
+        }) = &app.modal
+        else {
+            panic!("failed Open must retain the editable path");
+        };
+        assert_eq!(value, &expected);
+        assert_eq!(app.status.level, StatusLevel::Error);
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "keep this buffer"
+        );
+    }
+
+    #[test]
+    fn agy_p0_failed_save_as_keeps_pending_quit_until_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("keep me");
+        app.key(ctrl('q'));
+        app.modal_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let parent = dir.path().join("missing");
+        let target = parent.join("note.txt");
+        app.path_input(target.to_str().unwrap());
+        let expected = match &mut app.modal {
+            Some(Modal::Path { value, .. }) => {
+                value.move_to(1, false);
+                value.move_to(4, true);
+                value.clone()
+            }
+            _ => panic!("expected Save As"),
+        };
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.quit);
+        assert!(matches!(app.after_save, Some(AfterSave::Quit)));
+        let Some(Modal::Path { value, .. }) = &app.modal else {
+            panic!("failed Save As must remain editable");
+        };
+        assert_eq!(value, &expected);
+        assert!(app.workspace.active_document().unwrap().document.is_dirty());
+        std::fs::create_dir(parent).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep me");
+        assert!(app.quit);
+        assert!(app.path_retry.is_none());
+    }
+
+    #[test]
+    fn agy_p0_failed_overwrite_restores_path_and_cancel_clears_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("destination");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("note.txt");
+        std::fs::write(&target, "old").unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("new");
+        app.key(ctrl('q'));
+        app.modal_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.path_input(target.to_str().unwrap());
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Overwrite { .. })));
+        std::fs::remove_file(&target).unwrap();
+        std::fs::remove_dir(parent).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let Some(Modal::Path { value, .. }) = &app.modal else {
+            panic!("overwrite failure must restore Save As");
+        };
+        assert_eq!(value.as_str(), target.to_str().unwrap());
+        assert!(matches!(app.after_save, Some(AfterSave::Quit)));
+        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.after_save.is_none() && app.path_retry.is_none());
+        assert!(!app.quit);
+        assert!(app.workspace.active_document().unwrap().document.is_dirty());
+    }
+
+    #[test]
+    fn agy_p0_small_choices_block_hidden_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("keep me");
+        app.key(ctrl('q'));
+        draw_frame(&mut app, 20, 6);
+        app.modal_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!app.quit);
+        assert!(matches!(app.modal, Some(Modal::Unsaved { .. })));
+        assert!(app.geometry.commands.is_empty());
+        assert!(app.workspace.active_document().unwrap().document.is_dirty());
+        draw_frame(&mut app, 120, 36);
+        app.modal_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn agy_p0_highlight_warning_does_not_replace_saved_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.rs");
+        std::fs::write(&path, "x".repeat(16 * 1024 + 1)).unwrap();
+        let mut app = test_app(dir.path());
+        app.open_tab_from_path(path).unwrap();
+        app.save_active_document();
+        let before = (app.status.level, app.status.text.clone());
+        app.update_highlight();
+        assert_eq!((app.status.level, &app.status.text), (before.0, &before.1));
+        let doc_id = app.workspace.active_document().unwrap().id;
+        assert!(app.highlighter.warning(doc_id).is_some());
+        app.render_with(|screen, _| {
+            assert_eq!(screen.status_level, StatusLevel::Success);
+            assert!(screen.highlight_warning.is_some());
+        });
+        app.update_highlight();
+        assert_eq!((app.status.level, &app.status.text), (before.0, &before.1));
+    }
+
+    #[test]
+    fn agy_p0_horizontal_wheel_stops_at_visible_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_visible = false;
+        app.replace_in_active_tab(&"x".repeat(100));
+        draw_frame(&mut app, 50, 12);
+        let area = app.active_text_area();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollRight,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..30 {
+            app.mouse(mouse, Instant::now());
+            draw_frame(&mut app, 50, 12);
+        }
+        assert_eq!(
+            app.workspace.active_view().unwrap().left_cell,
+            101usize.saturating_sub(usize::from(area.width))
+        );
+        app.key(ctrl('a'));
+        app.replace_in_active_tab("short");
+        draw_frame(&mut app, 50, 12);
+        app.mouse(mouse, Instant::now());
+        assert_eq!(app.workspace.active_view().unwrap().left_cell, 0);
+    }
+
+    #[test]
+    fn p1_confirmation_keyboard_defaults_cancel_and_preserves_focus_through_help() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("unsaved text");
+        let doc_id = app.workspace.active_document().unwrap().id;
+        app.request_close_active_view();
+        draw_frame(&mut app, 80, 24);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(app.workspace.document(doc_id).unwrap().document.is_dirty());
+
+        app.request_close_active_view();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.modal.as_ref().and_then(Modal::choice),
+            Some((ChoiceKind::Unsaved, 3))
+        );
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.workspace.document(doc_id).is_none());
+        assert!(app.modal.is_none());
+        assert!(!app.workspace.active_document().unwrap().document.is_dirty());
+    }
+
+    #[test]
+    fn p1_explorer_keyboard_resize_uses_visible_width_and_refuses_hidden_sidebar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.sidebar_width = 40;
+        app.workspace.explorer_focused = true;
+        draw_frame(&mut app, 50, 12);
+        let visible = app.geometry.sidebar_panel.unwrap().width;
+        assert!(visible < app.workspace.sidebar_width);
+        app.key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        draw_frame(&mut app, 50, 12);
+        assert_eq!(app.geometry.sidebar_panel.unwrap().width, visible - 2);
+        let saved_width = app.workspace.sidebar_width;
+        draw_frame(&mut app, 30, 12);
+        assert!(app.geometry.sidebar_panel.is_none());
+        app.key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.workspace.sidebar_width, saved_width);
+        assert!(app.workspace.explorer_focused);
+        assert!(!app.workspace.active_document().unwrap().document.is_dirty());
+    }
+
+    #[test]
+    fn p1_search_prefill_count_wrap_replace_and_undo_follow_document_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("é é é");
+        {
+            let tab = app.workspace.active_view_mut().unwrap();
+            tab.anchor = Some(0);
+            tab.cursor = 1;
+        }
+        app.open_search_modal(true);
+        assert_eq!(app.search.query.as_str(), "é");
+        app.find_in_active_tab(false);
+        assert_eq!(app.search.last_match.as_ref().unwrap().range, 2..3);
+        assert_eq!(app.search.feedback, "Match 2 of 3");
+        app.find_in_active_tab(false);
+        app.find_in_active_tab(false);
+        assert_eq!(app.search.last_match.as_ref().unwrap().range, 0..1);
+        assert_eq!(app.search.feedback, "Match 1 of 3 (wrapped)");
+
+        app.search.replacement = Field::new("x".into());
+        app.replace_current_in_active_tab();
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "x é é"
+        );
+        assert_eq!(
+            app.search.current_feedback(&app.workspace),
+            Some("Match 1 of 2")
+        );
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.key(ctrl('z'));
+        assert!(app.search.current_feedback(&app.workspace).is_none());
+        app.find_in_active_tab(false);
+        assert_eq!(
+            app.search.cache.as_ref().unwrap().index.starts,
+            vec![0, 2, 4]
+        );
+    }
+
+    #[test]
+    fn p1_search_prefill_never_truncates_multiline_or_oversized_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        for text in ["one\ntwo".to_owned(), "é".repeat(2049)] {
+            app.search.query = Field::new("keep".into());
+            app.replace_in_active_tab(&text);
+            let len = app
+                .workspace
+                .active_document()
+                .unwrap()
+                .document
+                .len_chars();
+            let tab = app.workspace.active_view_mut().unwrap();
+            tab.anchor = Some(0);
+            tab.cursor = len;
+            app.open_search_modal(false);
+            assert_eq!(app.search.query.as_str(), "keep");
+            app.cancel_modal();
+        }
+    }
+
+    #[test]
+    fn p1_find_visits_all_counted_overlapping_matches_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("aaaa");
+        app.workspace.active_view_mut().unwrap().cursor = 0;
+        app.search.query = Field::new("aa".into());
+        for range in [0..2, 1..3, 2..4, 0..2] {
+            app.find_in_active_tab(false);
+            assert_eq!(app.search.last_match.as_ref().unwrap().range, range);
+        }
+        assert_eq!(app.search.feedback, "Match 1 of 3 (wrapped)");
+        app.find_in_active_tab(true);
+        assert_eq!(app.search.last_match.as_ref().unwrap().range, 2..4);
+        assert_eq!(app.search.feedback, "Match 3 of 3 (wrapped)");
+        app.find_in_active_tab(true);
+        assert_eq!(app.search.last_match.as_ref().unwrap().range, 1..3);
+    }
+
+    #[test]
+    fn p1_reload_invalidates_counts_even_when_document_revision_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reload.txt");
+        std::fs::write(&path, "nothing").unwrap();
+        let mut app = test_app(dir.path());
+        app.open_tab_from_path(path.clone()).unwrap();
+        let doc_id = app.workspace.active_document().unwrap().id;
+        app.search.query = Field::new("z".into());
+        app.find_in_active_tab(false);
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        assert_eq!(
+            app.search.current_feedback(&app.workspace),
+            Some("No matches")
+        );
+
+        std::fs::write(&path, "z z").unwrap();
+        app.reload_document(doc_id, path);
+        assert_eq!(
+            app.workspace.active_document().unwrap().document.revision(),
+            revision
+        );
+        assert!(app.search.current_feedback(&app.workspace).is_none());
+        app.find_in_active_tab(false);
+        assert_eq!(app.search.cache.as_ref().unwrap().index.starts, vec![0, 2]);
+        assert_eq!(app.search.feedback, "Match 1 of 2");
+    }
+
+    #[test]
+    fn p1_open_search_rejects_mouse_commands_from_the_previous_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        draw_frame(&mut app, 80, 24);
+        let old_help = app
+            .geometry
+            .commands
+            .iter()
+            .find(|hit| hit.key.code == KeyCode::F(1))
+            .unwrap()
+            .area;
+        app.open_search_modal(false);
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: old_help.x,
+                row: old_help.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Search { .. })));
+    }
+
+    #[test]
+    fn block_indent_preserves_selection_direction_excludes_end_line_and_groups_undo() {
+        for reverse in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = test_app(dir.path());
+            app.workspace.explorer_focused = false;
+            app.replace_in_active_tab("α\nb\nlast");
+            app.workspace
+                .document_mut(app.workspace.active_document().unwrap().id)
+                .unwrap()
+                .document
+                .mark_saved();
+            {
+                let view = app.workspace.active_view_mut().unwrap();
+                view.cursor = if reverse { 0 } else { 4 };
+                view.anchor = Some(if reverse { 4 } else { 0 });
+            }
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(
+                app.workspace
+                    .active_document()
+                    .unwrap()
+                    .document
+                    .text()
+                    .to_string(),
+                "    α\n    b\nlast"
+            );
+            let view = app.workspace.active_view().unwrap();
+            assert_eq!(view.cursor, if reverse { 4 } else { 12 });
+            assert_eq!(view.anchor, Some(if reverse { 12 } else { 4 }));
+            assert_eq!(view.selection(), Some(4..12));
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(
+                app.workspace
+                    .active_document()
+                    .unwrap()
+                    .document
+                    .text()
+                    .to_string(),
+                "        α\n        b\nlast"
+            );
+            app.key(ctrl('z'));
+            assert_eq!(
+                app.workspace
+                    .active_document()
+                    .unwrap()
+                    .document
+                    .text()
+                    .to_string(),
+                "    α\n    b\nlast"
+            );
+            app.key(ctrl('z'));
+            assert_eq!(
+                app.workspace
+                    .active_document()
+                    .unwrap()
+                    .document
+                    .text()
+                    .to_string(),
+                "α\nb\nlast"
+            );
+            assert!(!app.workspace.active_document().unwrap().document.is_dirty());
+        }
+    }
+
+    #[test]
+    fn block_dedent_accepts_backtab_and_shift_tab_without_noop_history_or_readonly_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_focused = false;
+        app.replace_in_active_tab("\tα\n  b\nplain");
+        app.workspace
+            .document_mut(app.workspace.active_document().unwrap().id)
+            .unwrap()
+            .document
+            .mark_saved();
+        app.key(ctrl('a'));
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "α\nb\nplain"
+        );
+        assert_eq!(app.workspace.active_view().unwrap().selection(), Some(0..9));
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.workspace.active_document().unwrap().document.revision(),
+            revision
+        );
+        assert_eq!(app.workspace.active_view().unwrap().selection(), Some(0..9));
+        app.key(ctrl('z'));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "\tα\n  b\nplain"
+        );
+        assert!(!app.workspace.active_document().unwrap().document.is_dirty());
+        app.workspace
+            .document_mut(app.workspace.active_document().unwrap().id)
+            .unwrap()
+            .read_only = Some("fixture".into());
+        app.key(ctrl('a'));
+        let selected = app.workspace.active_view().unwrap().selection();
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        for key in [
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            app.key(key);
+            assert_eq!(
+                app.workspace
+                    .active_document()
+                    .unwrap()
+                    .document
+                    .text()
+                    .to_string(),
+                "\tα\n  b\nplain"
+            );
+            assert_eq!(
+                app.workspace.active_document().unwrap().document.revision(),
+                revision
+            );
+            assert_eq!(app.workspace.active_view().unwrap().selection(), selected);
+            assert_eq!(app.status.level, StatusLevel::Warning);
+        }
+    }
+
+    #[test]
+    fn block_indent_shared_views_keep_interior_carets_selection_and_viewports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.viewport = (120, 36);
+        app.workspace.explorer_focused = false;
+        app.replace_in_active_tab("aa\nbb\ncc\ndd");
+        app.workspace
+            .document_mut(app.workspace.active_document().unwrap().id)
+            .unwrap()
+            .document
+            .mark_saved();
+        let p1 = app.workspace.active_pane_id();
+        let v1 = app.workspace.active_view_id();
+        app.key(fkey(8));
+        let p2 = app.workspace.active_pane_id();
+        let v2 = app.workspace.active_view_id();
+        {
+            let view = app.workspace.view_mut(v2).unwrap().1;
+            view.cursor = 7;
+            view.anchor = Some(4);
+            view.top_line = 2;
+            view.left_cell = 1;
+        }
+        app.workspace.activate_view(p1, v1);
+        {
+            let view = app.workspace.active_view_mut().unwrap();
+            view.cursor = 8;
+            view.anchor = Some(0);
+        }
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "    aa\n    bb\n    cc\ndd"
+        );
+        let other = app.workspace.view(v2).unwrap().1;
+        assert_eq!(
+            (other.cursor, other.anchor, other.top_line, other.left_cell),
+            (19, Some(12), 2, 1)
+        );
+        app.workspace.activate_view(p2, v2);
+        app.key(ctrl('z'));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "aa\nbb\ncc\ndd"
+        );
+        assert!(!app.workspace.active_document().unwrap().document.is_dirty());
+        let other = app.workspace.view(v1).unwrap().1;
+        assert_eq!((other.cursor, other.anchor), (8, Some(0)));
+        {
+            let view = app.workspace.active_view_mut().unwrap();
+            view.cursor = 7;
+            view.anchor = Some(4);
+            view.top_line = 2;
+        }
+        app.workspace.activate_view(p1, v1);
+        app.key(ctrl('y'));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "    aa\n    bb\n    cc\ndd"
+        );
+        let other = app.workspace.view(v2).unwrap().1;
+        assert_eq!(
+            (other.cursor, other.anchor, other.top_line),
+            (19, Some(12), 2)
+        );
+    }
+
+    #[test]
+    fn block_indent_keeps_single_line_tab_and_modal_explorer_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_focused = false;
+        app.replace_in_active_tab("a界e\u{301}z");
+        {
+            let view = app.workspace.active_view_mut().unwrap();
+            view.cursor = 1;
+            view.anchor = Some(0);
+        }
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "   界e\u{301}z"
+        );
+        assert_eq!(app.workspace.active_view().unwrap().anchor, None);
+        app.key(ctrl('z'));
+        {
+            let view = app.workspace.active_view_mut().unwrap();
+            view.cursor = 1;
+            view.anchor = None;
+        }
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "a   界e\u{301}z"
+        );
+        app.open_search_modal(true);
+        for code in [KeyCode::Tab, KeyCode::BackTab] {
+            app.key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(
+                app.workspace
+                    .active_document()
+                    .unwrap()
+                    .document
+                    .text()
+                    .to_string(),
+                "a   界e\u{301}z"
+            );
+        }
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.workspace.explorer_focused = true;
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "a   界e\u{301}z"
+        );
+    }
+    #[test]
+    fn scrollbars_drag_only_the_origin_shared_view_without_changing_edit_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_visible = false;
+        app.replace_in_active_tab(&format!("{}\n", "界\t".repeat(40)).repeat(80));
+        let doc_id = app.workspace.active_document().unwrap().id;
+        app.workspace
+            .document_mut(doc_id)
+            .unwrap()
+            .document
+            .mark_saved();
+        let revision = app.workspace.document(doc_id).unwrap().document.revision();
+        let first = app.workspace.active_pane_id();
+        app.viewport = (80, 28);
+        app.key(fkey(8));
+        let second = app.workspace.active_pane_id();
+        for id in [first, second] {
+            let view = app
+                .workspace
+                .pane_mut(id)
+                .unwrap()
+                .active_tab_mut()
+                .unwrap();
+            view.cursor = 2;
+            view.anchor = Some(1);
+            view.preferred_column = Some(7);
+            let offset = if id == first { 1 } else { 0 };
+            view.top_line = offset;
+            view.left_cell = offset;
+        }
+        for axis in [Axis::Rows, Axis::Columns] {
+            let terminal = draw_measured_frame(&mut app, 80, 28);
+            let geom = app.geometry.pane(first).unwrap();
+            let bar = match axis {
+                Axis::Rows => geom.vertical_scrollbar.unwrap(),
+                Axis::Columns => geom.horizontal_scrollbar.unwrap(),
+            };
+            for y in bar.track.top()..bar.track.bottom() {
+                for x in bar.track.left()..bar.track.right() {
+                    assert_eq!(
+                        terminal.backend().buffer()[(x, y)].bg,
+                        ratatui::style::Color::Reset
+                    );
+                }
+            }
+            let x = bar.thumb.x;
+            let y = bar.thumb.y;
+            app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+            let before = app.workspace.pane(first).unwrap().active_tab().unwrap();
+            assert_eq!(
+                match axis {
+                    Axis::Rows => before.top_line,
+                    Axis::Columns => before.left_cell,
+                },
+                bar.offset
+            );
+            app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+            let before = app.workspace.pane(first).unwrap().active_tab().unwrap();
+            assert_eq!(
+                match axis {
+                    Axis::Rows => before.top_line,
+                    Axis::Columns => before.left_cell,
+                },
+                bar.offset
+            );
+            app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: 79,
+                    row: 27,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+            // Return to the quantized first cell after moving, not outside the rail.
+            app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+            let returned = app.workspace.pane(first).unwrap().active_tab().unwrap();
+            assert_eq!(
+                match axis {
+                    Axis::Rows => returned.top_line,
+                    Axis::Columns => returned.left_cell,
+                },
+                0
+            );
+            app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: 79,
+                    row: 27,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+            app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: 79,
+                    row: 27,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+            draw_measured_frame(&mut app, 80, 28);
+            let view = app.workspace.pane(first).unwrap().active_tab().unwrap();
+            assert_eq!(
+                match axis {
+                    Axis::Rows => view.top_line,
+                    Axis::Columns => view.left_cell,
+                },
+                bar.max_offset
+            );
+            assert_eq!(
+                (view.cursor, view.anchor, view.preferred_column),
+                (2, Some(1), Some(7))
+            );
+            let other = app.workspace.pane(second).unwrap().active_tab().unwrap();
+            assert_eq!(
+                (other.cursor, other.anchor, other.top_line, other.left_cell),
+                (2, Some(1), 0, 0)
+            );
+            assert_eq!(app.workspace.active_pane_id(), second);
+            let doc = &app.workspace.document(doc_id).unwrap().document;
+            assert_eq!(doc.revision(), revision);
+            assert!(!doc.is_dirty());
+        }
+    }
+
+    #[test]
+    fn scrollbar_track_rejects_stale_text_hits_and_changed_document_drag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_visible = false;
+        app.replace_in_active_tab(&"long line of text\n".repeat(100));
+        let view = app.workspace.active_view_mut().unwrap();
+        view.cursor = 0;
+        view.anchor = Some(2);
+        let view_id = view.id;
+        let doc_id = view.document_id;
+        draw_measured_frame(&mut app, 50, 16);
+        let geometry = app.geometry.panes[0].clone();
+        let bar = geometry.vertical_scrollbar.unwrap();
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: bar.track.x,
+                row: bar.track.bottom() - 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            Instant::now(),
+        );
+        let top = app.workspace.active_view().unwrap().top_line;
+        assert_eq!(top, usize::from(geometry.text_area.height));
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: geometry.text_area.x + 3,
+                row: geometry.text_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            Instant::now(),
+        );
+        draw_measured_frame(&mut app, 50, 16);
+        let view = app.workspace.active_view().unwrap();
+        assert_eq!((view.cursor, view.anchor, view.top_line), (0, Some(2), top));
+        let bar = app.geometry.panes[0].vertical_scrollbar.unwrap();
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: bar.thumb.x,
+                row: bar.thumb.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            Instant::now(),
+        );
+        app.workspace
+            .edit_transaction(doc_id, view_id, EditViewPolicy::PreserveSelection, |doc| {
+                let end = doc.len_chars();
+                let caret = doc.replace(end..end, "tail").unwrap();
+                ((), Some(caret))
+            });
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: bar.track.x,
+                row: bar.track.bottom() - 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            Instant::now(),
+        );
+        assert!(app.drag.is_none());
+        let view = app.workspace.active_view().unwrap();
+        assert_eq!((view.cursor, view.anchor, view.top_line), (0, Some(2), top));
+        draw_measured_frame(&mut app, 12, 6);
+        let pane = &app.geometry.panes[0];
+        assert!(!pane.text_area.is_empty());
+        assert!(pane.vertical_scrollbar.is_none());
+        assert!(pane.horizontal_track.is_none());
+    }
+
+    #[test]
+    fn cached_horizontal_extent_clamps_inactive_view_after_width_only_resize() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_visible = false;
+        app.replace_in_active_tab(&format!("{}\n", "x".repeat(200)).repeat(40));
+        app.workspace.active_view_mut().unwrap().cursor = 0;
+        let first = app.workspace.active_pane_id();
+        app.viewport = (80, 28);
+        app.key(fkey(8));
+        let second = app.workspace.active_pane_id();
+        draw_measured_frame(&mut app, 80, 28);
+        let old = app
+            .geometry
+            .pane(first)
+            .unwrap()
+            .horizontal_scrollbar
+            .unwrap();
+        app.workspace
+            .pane_mut(first)
+            .unwrap()
+            .active_tab_mut()
+            .unwrap()
+            .left_cell = old.max_offset;
+        draw_measured_frame(&mut app, 80, 28);
+        let terminal = draw_measured_frame(&mut app, 120, 28);
+        let pane = app.geometry.pane(first).unwrap();
+        assert!(pane.text_area.width > old.track.width);
+        let view = app.workspace.pane(first).unwrap().active_tab().unwrap();
+        let expected_left = 201usize.saturating_sub(usize::from(pane.text_area.width));
+        assert_eq!(view.left_cell, expected_left);
+        assert_eq!(
+            terminal.backend().buffer()[(pane.text_area.right() - 2, pane.text_area.y)].symbol(),
+            "x"
+        );
+        assert_eq!(app.workspace.active_pane_id(), second);
+        assert_eq!(
+            app.workspace
+                .pane(second)
+                .unwrap()
+                .active_tab()
+                .unwrap()
+                .left_cell,
+            0
+        );
+    }
+
+    #[test]
+    fn explorer_scrollbar_preserves_selection_focus_and_document_and_rejects_changed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..128 {
+            std::fs::write(dir.path().join(format!("entry-{index:03}.txt")), "fixture").unwrap();
+        }
+        let mut app = test_app(dir.path());
+        app.workspace.explorer_visible = true;
+        app.workspace.explorer_focused = false;
+        app.workspace.explorer.as_mut().unwrap().set_top(1);
+        let doc_id = app.workspace.active_document().unwrap().id;
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        let caret = {
+            let view = app.workspace.active_view().unwrap();
+            (view.cursor, view.anchor)
+        };
+        let selected = app.workspace.explorer.as_ref().unwrap().selected();
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        draw_measured_frame(&mut app, 120, 36);
+        let bar = app.geometry.sidebar_scrollbar.unwrap();
+        app.mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.track.x,
+                bar.track.bottom() - 1,
+            ),
+            Instant::now(),
+        );
+        assert_eq!(
+            app.workspace.explorer.as_ref().unwrap().top(),
+            1 + usize::from(bar.track.height)
+        );
+        let rows = app.geometry.sidebar.unwrap();
+        // The rows changed: a queued click must not select/open the old row.
+        app.mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), rows.x + 5, rows.y),
+            Instant::now(),
+        );
+        assert_eq!(
+            app.workspace.explorer.as_ref().unwrap().selected(),
+            selected
+        );
+        assert_eq!(app.workspace.active_document().unwrap().id, doc_id);
+        app.workspace.explorer.as_mut().unwrap().set_top(1);
+        draw_measured_frame(&mut app, 120, 36);
+        let bar = app.geometry.sidebar_scrollbar.unwrap();
+        app.mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            ),
+            Instant::now(),
+        );
+        app.mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            ),
+            Instant::now(),
+        );
+        assert_eq!(app.workspace.explorer.as_ref().unwrap().top(), 1);
+        app.mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 119, u16::MAX),
+            Instant::now(),
+        );
+        assert_eq!(
+            app.workspace.explorer.as_ref().unwrap().top(),
+            bar.max_offset
+        );
+        app.mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                bar.thumb.x,
+                bar.track.y,
+            ),
+            Instant::now(),
+        );
+        app.mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 119, 35),
+            Instant::now(),
+        );
+        assert_eq!(app.workspace.explorer.as_ref().unwrap().top(), 0);
+        assert_eq!(
+            app.workspace.explorer.as_ref().unwrap().selected(),
+            selected
+        );
+        assert!(!app.workspace.explorer_focused);
+        assert_eq!(app.workspace.active_document().unwrap().id, doc_id);
+        assert_eq!(
+            app.workspace.active_document().unwrap().document.revision(),
+            revision
+        );
+        let view = app.workspace.active_view().unwrap();
+        assert_eq!((view.cursor, view.anchor), caret);
+
+        app.workspace.explorer.as_mut().unwrap().set_top(1);
+        draw_measured_frame(&mut app, 120, 36);
+        let bar = app.geometry.sidebar_scrollbar.unwrap();
+        app.mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            ),
+            Instant::now(),
+        );
+        std::fs::write(dir.path().join("zz-extra.txt"), "new entry").unwrap();
+        app.workspace.explorer.as_mut().unwrap().refresh().unwrap();
+        app.mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 119, u16::MAX),
+            Instant::now(),
+        );
+        assert_eq!(app.workspace.explorer.as_ref().unwrap().top(), 1);
+        assert_eq!(
+            app.workspace.explorer.as_ref().unwrap().selected(),
+            selected
+        );
+        app.key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "Z"
+        );
+    }
+
+    #[test]
+    fn help_scrollbar_preserves_suspended_field_and_cancels_on_resize_or_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.open_search_modal(true);
+        app.search.query = "needle".into();
+        app.search.query.move_to(1, false);
+        app.search.query.move_to(4, true);
+        app.search.replacement = "keep".into();
+        if let Some(Modal::Search {
+            replacement_focus, ..
+        }) = &mut app.modal
+        {
+            *replacement_focus = true;
+        }
+        let doc_id = app.workspace.active_document().unwrap().id;
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.key(fkey(1));
+        draw_frame(&mut app, 80, 24);
+        let bar = app.geometry.help_scrollbar.unwrap();
+        let footer = app.geometry.commands[0].area;
+        app.mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.track.x,
+                bar.track.bottom() - 1,
+            ),
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Help { scroll })
+            if scroll == usize::from(bar.track.height)));
+        // A footer hit from before scrolling must not dismiss the modal.
+        app.mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), footer.x, footer.y),
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        draw_frame(&mut app, 80, 24);
+        let bar = app.geometry.help_scrollbar.unwrap();
+        app.mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            ),
+            Instant::now(),
+        );
+        app.mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            ),
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Help { scroll }) if scroll == bar.offset));
+        app.mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, u16::MAX),
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Help { scroll }) if scroll == bar.max_offset));
+        app.mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, bar.track.y),
+            Instant::now(),
+        );
+        app.mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Help { scroll: 0 })));
+        app.key(fkey(1));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Search {
+                replace_mode: true,
+                replacement_focus: true
+            })
+        ));
+        assert_eq!(app.search.query.as_str(), "needle");
+        assert_eq!(app.search.query.selected(), Some("eed"));
+        assert_eq!(app.search.query.cursor(), 4);
+        assert_eq!(app.search.replacement.as_str(), "keep");
+
+        app.key(fkey(1));
+        draw_frame(&mut app, 80, 24);
+        let bar = app.geometry.help_scrollbar.unwrap();
+        app.mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            ),
+            Instant::now(),
+        );
+        draw_frame(&mut app, 19, 5);
+        app.mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, u16::MAX),
+            Instant::now(),
+        );
+        assert!(matches!(app.modal, Some(Modal::Help { scroll: 0 })));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Search {
+                replacement_focus: true,
+                ..
+            })
+        ));
+        assert_eq!(app.search.query.selected(), Some("eed"));
+        assert_eq!(app.workspace.active_document().unwrap().id, doc_id);
+        assert_eq!(
+            app.workspace.active_document().unwrap().document.revision(),
+            revision
+        );
+        assert!(!app.workspace.active_document().unwrap().document.is_dirty());
     }
 }

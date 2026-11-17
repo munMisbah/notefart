@@ -39,8 +39,9 @@ Kebijakan save diterapkan per dokumen/tab:
 3. Save As tidak menimpa file yang sudah ada tanpa konfirmasi.
 4. Untuk regular file yang didukung, tulis snapshot ke temporary file di direktori target dengan izin awal terbatas, flush/sync sesuai platform, lalu replace dan sinkronkan direktori jika didukung.
 5. Replacement mempertahankan mode, uid/gid dan xattrs/ACL melalui file descriptor atau menolak jika operasi metadata gagal. Sesudah copy, identity/mode/owner/ctime dicek ulang sebelum persist, termasuk pada overwrite eksplisit. Mode/uid/gid dan user xattr telah dibuktikan melalui runtime; seluruh varian ACL/security label belum divalidasi pada filesystem nyata.
-6. Bersihkan temporary file pada kegagalan yang dapat ditangani. Jangan menghapus file asli untuk mencoba memperbaiki kegagalan replace.
-7. Tandai revision yang benar-benar tersimpan sebagai checkpoint hanya setelah seluruh langkah save yang diwajibkan berhasil.
+6. Replace mengganti **nama** temporary, bukan descriptor. Nama itu diverifikasi ulang terhadap dev/inode descriptor yang menerima buffer tepat sebelum replace; sesudah replace, direktori tujuan diverifikasi menunjuk inode yang sama. Ketidakcocokan menghasilkan `Substituted` dan dokumen tetap dirty, bukan `Saved`. Ini mengurangi race pada direktori yang dapat ditulis proses lain, bukan menghapusnya: celah check→rename tetap ada.
+7. Bersihkan temporary file pada kegagalan yang dapat ditangani. Jangan menghapus file asli untuk mencoba memperbaiki kegagalan replace.
+8. Tandai revision yang benar-benar tersimpan sebagai checkpoint hanya setelah seluruh langkah save yang diwajibkan berhasil.
 
 Atomic replace dapat mengganti inode dan memutus hubungan hard link. Save langsung ke final-component symlink dan file dengan beberapa hard link **ditolak**, termasuk pada overwrite eksplisit; Save As ke path regular baru tetap tersedia. Membuka untuk membaca dan mengedit buffer tetap diperbolehkan. Write-through link belum didukung.
 
@@ -82,7 +83,9 @@ UTF-8/BOM dan LF/CRLF dipertahankan. Mixed newline/lone CR dibuka read-only tanp
 - Keduanya menolak stdin/stdout non-TTY sebelum mengubah terminal. Raw mode, alternate screen, cursor, mouse, dan bracketed paste tetap dimiliki guard terpusat.
 - Jalur `crossterm::event::read` dan thread pembaca lama sudah dihapus. Decoder streaming pada thread utama memakai readiness poll Rustix dan read maksimal 4096 byte; tidak menunggu sisa paste/escape di dalam read loop.
 - Payload paste maksimum 1 MiB; overflow membuang seluruh payload lalu drain sampai terminator, hanya mempertahankan prefix delimiter kecil. Invalid UTF-8 paste juga ditolak utuh. CSI dibatasi 64 byte; buffer ingress punya retensi kecil berbatas terpisah dari payload. Tidak ada antrean event atau thread yang ditinggalkan saat shutdown.
-- Timeout kosong tidak membuang prefix CSI/paste. Lone Escape memakai idle delay; ESC baru meresinkronisasi CSI lama. OSC/DCS/string-control yang tidak didukung dibuang sampai BEL/ST tanpa menerjemahkan body menjadi shortcut.
+- Timeout kosong tidak membuang prefix CSI/paste. Lone Escape memakai idle delay; ESC baru meresinkronisasi CSI lama maupun prefix SS3 (`\x1bO`) yang terpotong tanpa mengonsumsi ESC pembuka berikutnya. OSC/DCS/string-control yang tidak didukung dibuang sampai BEL/ST tanpa menerjemahkan body menjadi shortcut.
+- Ketika control string atau prefix SS3 belum selesai melewati idle delay, decoder dapat mengirim notifikasi Pending sekali. App/probe menampilkan hint Ctrl+G tanpa menafsirkan payload sebagai perintah. Setelah parser kembali aman, notifikasi Resumed menghapus hint tanpa mengganti hasil aksi pengguna sebelumnya.
+- Ctrl+G adalah BEL yang sudah menjadi terminator control string; bukan timeout yang mengaktifkan shortcut dari payload tertahan. Legacy Alt dan pembuka control string tertentu tetap ambigu pada wire. Recovery ini tidak menjanjikan dukungan otomatis seluruh kombinasi Alt, dan tidak mengubah batas paste/CSI.
 - Batas protokol: hanya bytes di dalam bracketed paste yang dikenali sebagai paste. Terminal yang mengirim paste sebagai ketikan biasa dapat memicu shortcut; sequence terminator pada wire memang mengakhiri paste. Kitty/Windows keyboard dan X10 mouse tidak diklaim didukung.
 - Tampilan dokumen/path/status menetralkan kontrol terminal/Bidi. Dokumen dan field membuat grapheme zero-width standalone terlihat. Tab, combining mark, ZWJ dan karakter lebar memakai mapping cell yang konsisten untuk rendering, cursor dan hit testing; font/glyph fisik tetap bergantung terminal.
 - Cache geometri hanyalah state turunan: checkpoint harus berada di batas grapheme, menyimpan kolom terminal sebenarnya, dan memakai konteks slice utuh saat resume. Edit/undo/redo menginvalidasi suffix sebelum Rope berubah; cache baris sesudahnya dibuang, clone memulai cache baru. Renderer tetap melakukan clipping, dan escape kontrol/Bidi tetap melalui jalur yang sama; cache tidak mengeksekusi atau meneruskan bytes kontrol mentah.
@@ -90,7 +93,7 @@ UTF-8/BOM dan LF/CRLF dipertahankan. Mixed newline/lone CR dibuka read-only tanp
 - Bit mode hanya dibersihkan setelah pemulihan berhasil; Interrupted diulang dan Drop dapat mencoba lagi. Panic hook sudah direview statis, tetapi belum diuji melalui fault injection panic/syscall.
 - Cleanup SIGTERM saat paste parsial terbukti dengan decoder baru pada editor dan probe. Hasil batch awal untuk SIGHUP/SIGINT ada di roadmap; tidak ada janji cleanup tepat waktu ketika filesystem sinkron sedang macet.
 - Tidak ada autosave/crash recovery. Signal terminasi melaporkan edit belum disimpan tanpa menulisnya. Suspend/resume eksternal belum didukung; SIGKILL/mati listrik/terminal hilang tidak menjamin restorasi.
-- Log probe hanya menampilkan preview dalam memori; jangan paste rahasia saat layar direkam. Editor tidak mencatat isi dokumen/clipboard ke disk. Snapshot buffer/session belum tersedia; konfigurasi hanya memuat preferensi.
+- Log probe hanya menampilkan preview dalam memori; jangan paste rahasia saat layar direkam. Log bukan rekaman isi dokumen/clipboard. Session restore pada launch tanpa path kini menyimpan isi buffer ke snapshot privat saat exit normal, terpisah dari konfigurasi preferensi dan clipboard.
 
 
 ## Clipboard dan privasi
@@ -107,14 +110,60 @@ UTF-8/BOM dan LF/CRLF dipertahankan. Mixed newline/lone CR dibuka read-only tanp
 - Log tidak memuat isi dokumen/clipboard. Path juga berpotensi sensitif; batasi log dan jelaskan lokasi log jika logging ditambahkan.
 - Clipboard internal dan buffer berada di memori proses; belum ada janji secure erase, perlindungan swap, atau perlindungan dari proses lain dengan hak setara.
 
+## Snapshot sesi dan privasi
+
+- Session restore otomatis hanya untuk `naf` tanpa path. `--no-session` dan launch file/folder tidak membaca, menulis, menghapus, atau menahan lock snapshot default. `--no-config` bukan opt-out sesi.
+- Snapshot memuat isi buffer termasuk Untitled/dirty, path dan state view; lokasi XDG_STATE_HOME/HOME absolut, direktori 0700, file 0600. Ini **bukan enkripsi**, secure erase atau perlindungan dari proses dengan hak pengguna yang sama. Snapshot lama bertahan sampai diganti oleh exit normal berikutnya.
+- Penyimpanan memakai lock eksklusif nonblocking dan tempfile satu direktori, file sync, atomic replace serta directory sync. Target link/nonregular ditolak; binding directory/lock/tempfile/destination diperiksa. Seperti save file, celah POSIX check→rename tidak dijanjikan hilang.
+- Metadata JSON dan ukuran payload dibatasi; teks dialirkan per chunk dengan checksum BLAKE3 dan EOF tepat. Checksum mendeteksi kerusakan, bukan autentikasi terhadap penulis yang dapat mengubah snapshot. Workspace menolak ID/ref/topologi tidak valid sebelum dipakai.
+- Restore tidak menimpa sumber atau memperbarui baseline ke kondisi disk terbaru: baseline asli dipertahankan agar Save eksplisit mendeteksi konflik. Gagal simpan sebelum persist mempertahankan snapshot lama dan editor/buffer; setelah replace, error sync berarti durability tidak pasti, bukan disk pasti belum berubah.
+- Tidak ada autosave atau snapshot baru pada signal/panic/Drop; ini bukan crash recovery. Discard close berlaku pada snapshot normal-exit berikutnya. Undo/redo tidak dipersistensikan, dirty checkpoint tetap dipertahankan.
+- Bukti fungsional normal-exit/restore ada di [ROADMAP.md](ROADMAP.md#hasil-session-restore-otomatis); itu bukan pengganti security test terpisah melalui model yang ditentukan pengguna.
+
+### Hasil verifikasi model terpisah
+
+Review read-only dan security test session restore dikerjakan oleh `atmo/alicn/deepseek-v4.1-flash-1017` melalui worker Orca; integrator membaca laporan/log dan tidak menjalankan ulang security test. Tidak ada kerentanan session restore yang terkonfirmasi pada scope ini.
+
+| Kelompok skenario | Dijalankan | Lolos |
+| --- | ---: | ---: |
+| Snapshot rusak, panjang/checksum, metadata, graph/ref/ID/path | 35 | 35 |
+| Mode, symlink/hardlink, FIFO dan objek nonregular | 11 | 11 |
+
+- Log negatif menunjukkan exit nonzero dan snapshot rusak tidak berubah. Instance kedua ditolak nonblocking, lock tidak di-unlink, dan `--no-session`/launch file langsung tidak menyentuh state default.
+- Kegagalan sebelum persist mempertahankan snapshot lama/editor/buffer. Fault injection `fsync` direktori sesudah replace menghasilkan pesan `durability uncertain`; snapshot baru sudah ada, editor tetap terbuka dan retry normal berhasil.
+- Source berubah, berganti inode meski isi sama, atau hilang menghasilkan dialog konflik saat Save tanpa overwrite/pembuatan ulang. Ctrl+Q tidak menulis source. Endpoint view ekstrem di-clamp, file melebihi total ukuran ditolak, dan SIGTERM tidak membuat snapshot baru.
+- Pencocokan manual RustSec advisory-db commit `02e2517f457a359fc6d3440ea4560c8ea188fee8` tidak menemukan advisory untuk serde 1.0.229, serde_json 1.0.145 atau memchr 2.8.3. Binary `cargo-audit` tidak tersedia pada worker; ini bukan klaim audit penuh semua platform. Dua advisory unsound `lru 0.12.5` dan tiga paket unmaintained yang sudah tercatat tetap menjadi risiko dependency lama, bukan regresi sesi.
+- Worker menemukan pesan saran `--no-session` ganda pada error lock. Integrator menghapus saran dari lapisan storage agar hanya App yang memberi konteks CLI, lalu membangun binary akhir `9242eb967a5af206c4338a83af34b8270434faadab5da3b644b2d5a0c6e6c53b`. Model yang sama mengamati ulang instance kedua: exit nonzero/nonblocking, saran tampil satu kali; format dan operasi snapshot tidak berubah.
+- Batas bukti: ownership UID lain tidak diuji runtime; disk penuh nyata, ACL/xattr, filesystem jaringan, race same-UID check→rename, panic injection dan fuzz/stress luas tidak dibuktikan. Catatan hardening `O_NOCTTY` pada open snapshot belum memiliki repro kerentanan; tidak diklaim diperbaiki oleh batch ini.
+
+
 ## Dependency dan konfigurasi
 
 - Pilih dependency terawat dan minimum; review lisensi, advisory, serta kebutuhan native code saat pin versi.
 - Grammar/theme tidak boleh menjalankan kode proyek secara implisit.
 - Helper clipboard menggunakan path executable dan argv terpisah; tidak ada shell command yang dibangun dari teks clipboard, nama file atau konfigurasi.
 - Hanya konfigurasi preferensi pengguna yang dibaca, bukan konfigurasi proyek: empat key string `theme`, `color`, `icons`, `clipboard`, maksimum 64 KiB UTF-8. Tipe/key/nilai yang tidak dikenali gagal sebelum raw mode; help/version/probe tidak bergantung pada isi konfigurasi.
-- Lokasi default mengikuti XDG_CONFIG_HOME absolut atau HOME absolut; tidak memakai CWD sebagai fallback. Flag CLI menang atas konfigurasi; `--no-config` membypassnya. Startup tidak menulis file. Penyimpanan eksplisit `--save-config` memakai replacement atomik dan menolak target link/non-regular, bukan overwrite langsung.
+- Lokasi preferensi default mengikuti XDG_CONFIG_HOME absolut atau HOME absolut; tidak memakai CWD sebagai fallback. Flag CLI menang atas konfigurasi; `--no-config` membypass preferensi. Startup tidak menulis file konfigurasi; sesi default dapat membuat direktori/lock state. Penyimpanan preferensi eksplisit `--save-config` memakai replacement atomik dan menolak target link/non-regular, bukan overwrite langsung.
 - Preferensi bukan snapshot sesi atau autosave; tidak menyimpan isi buffer, path tab, clipboard, token atau rahasia proyek. Konfigurasi proyek tidak dapat menimpa kebijakan keamanan pengguna.
+
+### Hasil audit dependency (2026-11-14)
+
+`cargo-audit 0.23.0` (binary rilis RustSec, sha256 diverifikasi) dijalankan terhadap `Cargo.lock` 119 dependency dengan target Linux/x86_64 dan database advisory commit `4ef2df8` (1509 advisory): **tidak ada vulnerability**.
+
+Warning yang tersisa bersifat informasional dan transversal, bukan temuan lokal:
+
+| Paket | Advisory | Jalur | Penilaian |
+| --- | --- | --- | --- |
+| `paste 1.0.15` | RUSTSEC-2024-0436 unmaintained | proc-macro `ratatui` | Hanya diperluas saat kompilasi; tidak ada input runtime. |
+| `bincode 1.3.3` | RUSTSEC-2025-0141 unmaintained | `syntect` (runtime dan build) | Deserialisasi hanya dump grammar/theme yang di-link saat build, bukan file proyek. |
+| `yaml-rust 0.4.5` | RUSTSEC-2024-0320 unmaintained | build-dependency `syntect` | Tidak ikut binary akhir. |
+| `lru 0.12.5` | RUSTSEC-2026-0253, RUSTSEC-2026-0002 unsound | `ratatui 0.29` | Butuh unwinding panic dengan `Drop` yang panic, atau `IterMut`; reachability pada pemakaian cache ratatui **belum diuji**. |
+
+Metadata lisensi seluruh 119 paket diperiksa: setiap paket menawarkan jalur lisensi permisif (MIT, Apache-2.0, 0BSD, Zlib, Unlicense, BSL-1.0, Unicode-3.0). Kewajiban notice Oniguruma/Unicode dan atribusi grammar tetap berlaku. Package aplikasi sendiri belum mendeklarasikan field `license`, sehingga audit distribusi publik belum selesai.
+
+Audit ini menilai metadata advisory, bukan membuktikan kode aman: reachability `lru`, kualitas build native Oniguruma, dan advisory baru setelah commit di atas tetap terbuka. Jalankan ulang audit saat dependency berubah, bukan sekali saat rilis.
+
+Audit di atas merupakan bukti historis sebelum penambahan session restore. Lockfile sesi menambahkan serde_json 1.0.145 dan memchr 2.8.3, serta menjadikan serde yang sudah transitif sebagai dependency langsung. Hasil audit 119 dependency tersebut tidak otomatis berlaku untuk lockfile baru; pencocokan RustSec manual dan batas verifikasi baru dicatat pada bagian session restore.
 
 ## CI dan artifact build
 
@@ -127,3 +176,14 @@ UTF-8/BOM dan LF/CRLF dipertahankan. Mixed newline/lone CR dibuka read-only tanp
 ## Bukti minimum sebelum rilis
 
 Uji file dengan escape sequence dan nama berkarakter kontrol; save gagal dan disk penuh melalui fault injection yang aman; perubahan file eksternal; Save As ke target existing; symlink/hard link; file non-regular; serta exit/error dan restorasi terminal. Jalankan dengan direktori sementara dan fixture terisolasi, bukan file pengguna.
+
+## Verifikasi input batch AGY P0
+
+Verifikasi ini dijalankan oleh worker `atmo/alicn/deepseek-v4.1-flash-1017`; integrator membaca laporannya dan tidak mengulang pengujian security. Suite seluruh target dan review caller App tercatat di [ROADMAP](ROADMAP.md#hasil-perbaikan-bug-p0-audit-agy).
+
+- Runtime editor menggunakan fixture terisolasi dan socket tmux unik. OSC yang belum ditutup menampilkan petunjuk recovery; shortcut dan teks di dalam payload tetap dibuang, bukan dijalankan atau disisipkan. BEL mengakhiri drain dan input biasa kembali bekerja.
+- DCS dengan ST terfragmentasi juga pulih tanpa mengeksekusi payload. Bare SS3 menampilkan petunjuk lalu kelanjutan F1 membuka Help; input biasa berikutnya tetap bekerja.
+- Bracketed paste yang memuat escape dan byte shortcut diperlakukan sebagai data; paste terfragmentasi tetap utuh, tidak memunculkan hint kontrol tertunda, dan Ctrl+Q nyata setelah paste tetap membuka konfirmasi perubahan.
+- Batas paste 1 MiB dan overflow/drain dibuktikan oleh unit test, tidak diulang sebagai payload besar dalam runtime PTY. Logging Pending/Resumed pada probe hanya ditinjau statis, bukan dibuktikan lewat runtime probe.
+- Ambiguitas legacy `Alt+]`/OSC tetap batas protokol. Tidak ada timeout yang melepas payload tertunda ke dispatcher shortcut; petunjuk `Ctrl+G` menyediakan recovery yang aman.
+

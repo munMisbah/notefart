@@ -2,6 +2,103 @@
 
 ## Unreleased
 
+### Scrollbar Explorer dan bantuan F1
+
+- Tambahkan rail vertikal di baris tree dan katalog bantuan, terpisah dari parent row, divider, border dan footer. Track yang terlalu kecil tidak diterbitkan.
+- Satukan capture/page/drag editor, Explorer dan Help tanpa mengubah pilihan file, fokus atau field modal; key dan perubahan konteks membatalkan capture lama.
+- Hit row mengecualikan rail; wrapping, page dan limit F1 memakai lebar katalog yang sama. Memoisasi jumlah row per lebar katalog statis menghindari penghitungan ulang per frame tanpa salinan katalog.
+- Pertahankan background terminal dan fallback ASCII/Unicode/Nerd; katalog F1/CLI menjelaskan gesture scrollbar. Field overflow serta theme/keymap runtime tetap di luar cakupan.
+- Verifikasi DeepSeek: 130 kasus tes berbeda pada empat filter terarah serta TUI nyata lulus; [hash, metode dan batas](docs/ROADMAP.md#hasil-scrollbar-explorer-dan-f1). Bukan suite seluruh target atau matriks font/mouse fisik.
+
+### Scrollbar editor per view
+
+- Tambahkan track dan thumb vertikal/horizontal di dalam frame, dengan klik page serta drag terikat pane asal tanpa mengubah fokus, cursor, seleksi atau history.
+- Pertahankan background terminal, bentuk ASCII/tipis-tebal dan minimum teks; rail tidak bertabrakan dengan border resize split. Wheel/autoscroll memakai batas vertikal viewport yang sama.
+- Ukur lebar render baris terlihat secara bertahap dan simpan cache per view/revisi; track horizontal menandai hasil pending tanpa thumb palsu. Cache tidak dipersist dan tidak menyalin dokumen. Explorer/help/field di luar cakupan.
+- Perbaiki rail satu sel/thumb nol pada gutter lebar, endpoint thumb terkuantisasi dan clamp pane nonaktif setelah resize. Pisahkan redraw metadata dari invalidasi syntax; 88 tes recheck serta TUI DeepSeek pada build akhir lulus. [Bukti, hash dan batas](docs/ROADMAP.md#hasil-scrollbar-editor).
+
+### Indent dan dedent blok
+
+- Tab dengan seleksi multibaris menambah empat spasi per baris tanpa mengganti isi seleksi; endpoint awal baris berikutnya dikecualikan. Tab biasa/seleksi satu baris tetap memakai tab stop empat kolom.
+- Shift+Tab mengurangi satu tab awal atau hingga empat spasi pada baris aktif/terpilih, menjaga boundary grapheme dan arah seleksi. No-op tidak membuat dirty/history atau menghapus redo.
+- Satu perintah blok menjadi satu undo bersama; prefix disimpan ringkas tanpa salinan seluruh blok, dan cursor/anchor/viewport shared view dipetakan per perubahan prefix.
+- Format, 113 tes terarah, build release dan 23 skenario TUI DeepSeek lolos; [bukti serta batas](docs/ROADMAP.md#hasil-indent-dan-dedent-blok). Tidak menambahkan scrollbar, autoindent, pengaturan tab width, atau menjalankan ulang audit/soak tahap 4.
+
+### P1 aksesibilitas dan Find/Replace
+
+- Prioritaskan Help/All, Quit, Files dan Pane pada helper 80 kolom; panah overflow tab yang nonaktif tidak menerbitkan hit klik.
+- Tambahkan fokus tombol konfirmasi dengan Tab/Shift+Tab/panah dan Enter/Space, default Cancel, serta target path/Untitled. F1 mempertahankan fokus dan guard ukuran mencakup konteks target.
+- Gunakan Alt+Shift+Left/Right untuk resize explorer saat fokus, berbasis lebar yang terlihat; shortcut editor tetap menggeser split.
+- Prefill Find/Replace dari seleksi satu baris yang muat; tampilkan penghitung, total berbatas `100+`, posisi `>100` serta penanda wrapped. Cache tidak dipindai per-frame dan diinvalidasi saat reload.
+- Selaraskan navigasi Find overlapping dua arah dengan hitungan; replacement non-overlap dan shared undo tetap dipertahankan.
+- Perbaiki override warna CLI/config yang masih dikalahkan `NO_COLOR` oleh Crossterm; tema menjadi satu pemilik keputusan. Auto/None tetap tanpa warna, tanpa mutasi environment pengguna.
+- Tutup tahap 4 untuk matriks Linux teruji sesuai keputusan pengguna: P1 unit/runtime, VTE dengan Nerd Font Mono, client tmux, SSH loopback dan soak; [bukti, urutan build dan batas](docs/ROADMAP.md#hasil-p1-aksesibilitas-dan-pencarian). Publish/installer serta client fisik/non-loopback tidak diklaim selesai.
+
+### Frame terpisah tanpa indikator horizontal
+
+- Kembalikan dua frame atas–bawah tanpa baris kosong tambahan; jangan gabungkan border. Jarak kiri–kanan tetap satu kolom.
+- Hapus titik combining dan fallback underscore horizontal setelah laporan glitch client; border/corner tetap utuh. Grip kolom dan resize mouse/keyboard tetap tersedia tanpa mengubah minimum, gap atau hit resize.
+- Hapus junction dan clipping judul khusus shared border; judul kembali pada frame masing-masing.
+- Format, satu tes regresi (78 frame), build release dan dua smoke Nerd/ASCII lolos, termasuk dua panel minimum 12×11; [bukti serta batas](docs/ROADMAP.md#hasil-penghapusan-indikator-horizontal). Tidak menjalankan security test.
+
+### Jarak split atas–bawah
+
+- Hilangkan baris kosong antar-panel atas–bawah; pertahankan gap kiri–kanan satu kolom dan jarak tab-ke-teks.
+- Pertahankan frame dan resize lewat border pemisah; selaraskan minimum/preflight serta offset drag/keyboard.
+- Verifikasi 17 target tes terarah dan smoke release Nerd/ASCII, termasuk dua panel minimum pada 12×11; [urutan pemeriksaan dan batas](docs/ROADMAP.md#hasil-perapatan-jarak-split-bertingkat). Tidak menjalankan security test.
+
+### Background terminal dan tab aktif
+
+- Ikuti background default terminal pada semua tema agar canvas tidak menutup efek glass/transparan; foreground tema tetap tersedia tanpa flag baru.
+- Beri tab aktif background seleksi dengan foreground terbaca untuk label, ikon, dirty/read-only dan close. Marker/bold serta fallback reverse tetap tersedia.
+- Tambahkan satu baris kosong antara tab dan isi editor; padatkan pada panel minimum agar 12×6 tetap dapat dipakai dan hit mouse tetap sesuai.
+- Gunakan pasangan warna seleksi untuk prefix field fokus; hapus accessor gaya yang tidak lagi dipakai.
+- Format, 14 tes terarah, build release dan tiga sesi TUI lokal lolos; [bukti serta batas](docs/ROADMAP.md#hasil-background-terminal-dan-tab-aksesibel). Tidak menjalankan security test.
+
+### Perbaikan bug P0 audit AGY
+
+- Perbaiki warna eksplisit border/indikator explorer/canvas compact dan kontras marker explorer terpilih tanpa mengganti palet.
+- Pertahankan input path, caret, seleksi, dan kelanjutan Close/Quit ketika Open/Save As gagal; retry tetap tersedia setelah kegagalan overwrite.
+- Nonaktifkan pilihan destruktif jika seluruh pesan dan tombol tidak muat; pertahankan petunjuk keluar pada terminal kecil. Perjelas bahwa Discard langsung berlaku per dokumen.
+- Pisahkan level status dan catatan highlight persisten; warning highlight tidak lagi menimpa hasil operasi pengguna.
+- Beri petunjuk recovery `Ctrl+G` untuk urutan input terminal yang belum selesai, tanpa mengubah payload kontrol menjadi shortcut.
+- Hilangkan janji fallback clipboard internal pada kegagalan copy System; batasi scroll horizontal pada isi viewport.
+- Build debug/release, suite oleh ATMO, dan runtime TUI diverifikasi; [bukti serta batasnya](docs/ROADMAP.md#hasil-perbaikan-bug-p0-audit-agy). Usulan P1/P2 belum diimplementasikan.
+
+### Validasi workflow build release
+
+- Build release terbaru dan CLI version sukses. Tiga sesi pada backend terminal Orca langsung, tanpa tmux, membuktikan edit Unicode/shared undo/Replace All, mouse CJK, clipboard internal/Save As serta restore Untitled/dirty dengan tiga panel.
+- Semua sesi keluar 0 dan memulihkan termios; terminal dan fixture terisolasi dibersihkan tanpa mengambil fokus atau memakai file pengguna. Tidak mengubah kode produksi; rincian binary dan metode di [ROADMAP.md](docs/ROADMAP.md#hasil-validasi-workflow-release-pada-terminal-orca).
+- Ini bukti screen backend, bukan validasi GUI/font fisik atau input keyboard/mouse client. Tidak menjalankan security test, suite luas, packaging, GitHub Actions, publish atau installer; kesiapan rilis keseluruhan tetap terbuka.
+
+### Visibilitas explorer saat startup
+
+- `naf` tanpa path selalu menampilkan explorer, termasuk saat sesi sebelumnya menyembunyikannya; buffer, tab/split, root dan lebar tersimpan tetap dipulihkan. Argumen folder menampilkan explorer, argumen file existing/baru menyembunyikannya.
+- Gunakan Ctrl+B yang sudah tersedia untuk hide/unhide tanpa membuang state; drag resize dan layout compact tetap berlaku. Help CLI dan dokumentasi menjelaskan aturan startup baru; tidak menambah flag atau mengubah format snapshot.
+- Format, satu tes navigasi/fokus explorer dan build dev lolos. Tujuh sesi TUI tmux membuktikan startup/restore, toggle, mouse/edit/save/undo, resize dan pemulihan lebar; semua keluar 0 dan memulihkan termios/alternate screen. Tidak menjalankan security test atau suite luas.
+
+### Session restore otomatis
+
+- `naf` tanpa path memulihkan workspace dari exit normal; Ctrl+Q menyimpan sesi beserta Untitled/dirty tanpa menulis file sumber. `--no-session` serta launch file/folder tetap terpisah dan memakai dirty guard lama.
+- Simpan satu teks per dokumen shared beserta baseline asli, format/read-only/dirty, tab/panel aktif, split/ratio, cursor/selection/viewport dan root/visibility/fokus/lebar explorer. Undo/redo dimulai ulang, bukan dirty state.
+- Tambah storage privat XDG_STATE_HOME/HOME, lock eksklusif nonblocking, metadata bertipe berbatas, payload Rope streaming, checksum BLAKE3 dan atomic replacement. Gagal simpan tetap di editor; snapshot rusak tidak diubah menjadi sesi kosong. Snapshot bukan enkripsi, autosave atau crash recovery.
+- Tambah serde langsung dan serde_json; lockfile menambahkan serde_json/memchr dengan metadata lisensi/MSRV diverifikasi. Audit dependency lama tidak dianggap mencakup lockfile baru.
+- Satu regresi dirty checkpoint dan empat tes CLI/config/theme lolos; build dev serta lima sesi TUI normal-exit/restore, shared save, BOM/CRLF, Discard, launch terpisah dan resize dibuktikan. Security test terarah dikerjakan model `atmo/alicn/deepseek-v4.1-flash-1017`, tanpa temuan kerentanan sesi terkonfirmasi; pesan saran `--no-session` ganda diperbaiki dan diamati ulang oleh model yang sama. Rincian/batas ada di [ROADMAP.md](docs/ROADMAP.md#hasil-session-restore-otomatis) dan [SECURITY.md](docs/SECURITY.md#hasil-verifikasi-model-terpisah).
+
+### Navigasi kata panjang dan validasi editor tmux
+
+- Percepat Ctrl+Left/Right dan double-click pada run kata/spasi panjang melalui iterator char Rope berurutan. Kelas tetap mengikuti karakter pertama setiap grapheme; combining mark, Prepend, emoji dan newline tidak dipotong menjadi batas palsu.
+- Pindahkan navigasi kata directional ke `Document`; hapus pemindaian kedua arah yang tidak diperlukan dan loop whitespace per-grapheme dari controller. Tidak menambah salinan dokumen, cache atau dependency.
+- 19 tes dokumen lolos, termasuk tiga regresi Unicode/whitespace/chunk; build dev sukses. Empat profil editor di tmux membuktikan seleksi keyboard, double-click, shared undo/redo/save, close panel, resize dan restorasi terminal dengan bytes fixture kembali tepat.
+- Pengukuran sebelum/sesudah beserta metode dan batas ada di [ROADMAP.md](docs/ROADMAP.md#hasil-navigasi-kata-panjang-dan-validasi-editor-tmux). Tidak menjalankan security test, menambah session restore, installer atau janji dukungan terminal fisik.
+
+### Audit keamanan dependency dan integritas persist
+
+- Audit `cargo-audit 0.23.0` (binary rilis RustSec dengan sha256 terverifikasi) atas 119 dependency Linux/x86_64: nol vulnerability. Tiga paket unmaintained (`paste`, `bincode`, `yaml-rust`) dan dua advisory unsound `lru 0.12.5` lewat ratatui dicatat bersama jalur dependency dan batas reachability di [SECURITY.md](docs/SECURITY.md#hasil-audit-dependency-2026-11-14).
+- Perbaiki substitusi nama temporary pada save: nama divalidasi terhadap dev/inode/link count descriptor penulis tepat sebelum replace, dan direktori tujuan diverifikasi menunjuk inode yang sama sesudah replace. Ketidakcocokan menghasilkan `FileError::Substituted` sehingga buffer tetap dirty, bukan checkpoint palsu.
+- Perbaiki prefix SS3 terpotong (`\x1bO`) yang menelan ESC pembuka bracketed paste; ESC baru kini diparse dari byte pertamanya, jadi payload paste tidak lagi menjadi shortcut (termasuk Ctrl+A/Ctrl+S). Double escape setelah prefix tetap menghasilkan satu Esc. Sesi TUI nyata membuktikan perbedaan: build tanpa perbaikan menyimpan `REPLACED` tanpa aksi pengguna, build dengan perbaikan menyimpan payload literal `\x01REPLACED\x13` sebagai data sampai Ctrl+S eksplisit.
+- Tambah tiga regresi (substitusi nama temporary, binding inode pada save sukses, prefix SS3 sebelum paste dan double escape). `cargo fmt --check` dan **274 tes** lolos. Celah check→rename, reachability `lru`, varian ACL/security label, dan fault injection panic tetap terbuka.
+
 ### Executable naf
 
 - Ganti satu-satunya target executable menjadi `naf`; nama aplikasi/package Notefart dan namespace konfigurasi `notefart` tetap. Tidak menambahkan alias binary lama.
