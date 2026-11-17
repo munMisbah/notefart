@@ -224,6 +224,8 @@ Scrollbar editor menempati jalur satu sel di dalam frame, bukan border pembatas 
 
 Explorer dan F1 memakai scrollbar vertikal dengan gaya yang sama. Rail Explorer hanya sejajar baris tree; parent row dan divider bukan bagian rail. Rail F1 hanya sejajar katalog yang di-wrap, tidak menyempitkan footer Esc/F1. Drag tidak memilih/membuka file atau mengubah field modal yang ditangguhkan; track konten yang muat tidak interaktif. Minimum track dua sel menjaga thumb tetap dapat dipakai. [Kontrak state](ARCHITECTURE.md#scrollbar-explorer-dan-f1).
 
+Field path/Find/Replace menampilkan `‹`/`›` saat teks berada di luar window (`<`/`>` pada ASCII, termasuk mode tanpa warna). Jika window dasar menyembunyikan teks dan tersedia minimal tiga sel nilai, dua gutter satu sel dipisahkan dari teks; sisi yang tidak overflow kosong. Indikator tidak dapat diklik untuk memindahkan caret/fokus atau ikut terseleksi; prefix tetap terpisah. Dengan satu/dua sel nilai, gutter tidak dibuat agar caret tetap terlihat. Pemotongan sebagian grapheme tetap memakai marker clipping lama; [kontrak byte/hit](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan).
+
 ## Shortcut runtime
 
 | Shortcut | Aksi |
@@ -250,10 +252,15 @@ Explorer dan F1 memakai scrollbar vertikal dengan gaya yang sama. Rail Explorer 
 | F6 / F7 dalam Replace | Ganti hasil aktif / Replace All satu undo |
 | F8 / F9 | Split kiri-kanan / atas-bawah |
 | F10 / Shift+F10 | Fokus panel berikutnya / sebelumnya, termasuk yang sementara tersembunyi |
+| F11 / Alt+P | Buka Appearance dari editor/explorer; perubahan tampilan berlaku setelah Apply |
 | F12 | Tutup panel dengan guard per dokumen |
 | Alt+Shift+Left/Right atau Up/Down | Geser divider Columns terdekat dua sel / Rows satu sel |
 
 Ctrl+C tanpa seleksi tidak keluar atau menyalin seluruh dokumen. Modal mengambil input field, bukan meneruskan shortcut editor ke dokumen belakang. Ctrl+H tetap Backspace karena byte terminal sama; Replace memakai Ctrl+R.
+
+Appearance berisi draft tema, mode warna dan profil ikon; tampilan aktual baru berubah saat Apply. Tab/Shift+Tab atau Up/Down mengunjungi tiga row lalu Apply/Cancel; Left/Right mengubah nilai row, Space mengganti nilai atau mengaktifkan tombol, Enter/A menerapkan kecuali Enter pada Cancel. Mnemonic t/T, c/C dan i/I memilih row lalu next/previous; uppercase atau Shift bergerak ke pilihan sebelumnya. Mouse prev/next memakai aksi yang sama, dan klik Apply tidak bergantung pada tombol yang sebelumnya fokus.
+
+Esc membuang draft; F1 kembali dengan draft/fokus yang sama. Minimum 40×10 berlaku pada renderer dan input; di bawahnya tidak ada Apply/cycle tersembunyi. Pilihan hanya untuk sesi berjalan: tidak menulis konfigurasi/snapshot atau mengubah dokumen, seleksi, viewport dan clipboard. F11/Alt+P tidak membuka Appearance di atas dialog lain; tidak ada perubahan shortcut F12 atau pemasangan font.
 
 Helper memprioritaskan aksi inti, bukan seluruh shortcut split. F1 dan `--help` memakai katalog berkelompok yang sama. Bantuan memakai panah, PageUp/Down, Home/End dan wheel; page mengikuti jumlah baris visual yang benar-benar terlihat. Flow control, font dan protokol terminal masih memerlukan matriks validasi lebih luas.
 

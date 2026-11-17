@@ -187,6 +187,40 @@ pub(crate) const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "Appearance",
+        bindings: &[
+            (
+                "F11 / Alt+P",
+                "Open from editor or explorer, not over another modal.",
+            ),
+            (
+                "Tab / Shift+Tab / Up / Down",
+                "Move focus among theme, colors, icons, Apply and Cancel.",
+            ),
+            (
+                "Left / Right",
+                "Change a row value or move between buttons.",
+            ),
+            (
+                "Space",
+                "Cycle the focused row or activate the focused button.",
+            ),
+            ("Enter / A", "Apply; Enter on Cancel cancels instead."),
+            (
+                "t/T / c/C / i/I",
+                "Select theme, colors or icons and cycle next/previous.",
+            ),
+            (
+                "Esc / F1",
+                "Cancel the draft or open Help; F1 returns to the draft and focus.",
+            ),
+            (
+                "Apply",
+                "Changes are run-only, without preview or configuration writes; terminal font is unchanged and Nerd icons are opt-in.",
+            ),
+        ],
+    },
+    Section {
         title: "Confirmation dialogs",
         bindings: &[
             (

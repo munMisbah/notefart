@@ -25,7 +25,7 @@ use crate::{
     search::{self, Query},
     session::SessionStore,
     terminal::TerminalSession,
-    theme::{IconMode, Options, Theme},
+    theme::{ColorMode, IconMode, Options, Theme, ThemeKind},
     ui::{self, ChoiceKind, Dialog, Geometry, PaneScreen, Screen, StatusLevel, TabCaption},
     workspace::{DocumentBuffer, EditViewPolicy, Workspace},
 };
@@ -75,6 +75,10 @@ enum Modal {
     Search {
         replace_mode: bool,
         replacement_focus: bool,
+    },
+    Appearance {
+        draft: Options,
+        focused: usize,
     },
     Help {
         scroll: usize,
@@ -245,7 +249,7 @@ struct App {
     highlighter: Highlighter,
     highlight_pending: bool,
     theme: Theme,
-    icons: IconMode,
+    options: Options,
     search: SearchState,
     geometry: Geometry,
     hit_targets_valid: bool,
@@ -300,7 +304,7 @@ impl App {
             highlighter: Highlighter::new(),
             highlight_pending: false,
             theme: Theme::new(options.theme, options.colors),
-            icons: options.icons,
+            options,
             search: SearchState::default(),
             geometry: Geometry::default(),
             hit_targets_valid: false,
@@ -1033,6 +1037,116 @@ impl App {
         }
     }
 
+    fn open_appearance(&mut self) {
+        self.modal = Some(Modal::Appearance {
+            draft: self.options,
+            focused: 0,
+        });
+        self.invalidate_hit_targets();
+    }
+
+    fn appearance_key(&mut self, key: KeyEvent) {
+        if self.viewport.0 < ui::MIN_APPEARANCE_SIZE.0
+            || self.viewport.1 < ui::MIN_APPEARANCE_SIZE.1
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        let Some(Modal::Appearance { draft, focused }) = &mut self.modal else {
+            return;
+        };
+        let mut cycle = None;
+        let mut apply = false;
+        let mut cancel = false;
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Down => {
+                *focused = (*focused + 1) % ui::APPEARANCE_FOCUS_COUNT;
+            }
+            KeyCode::Tab if !shift => {
+                *focused = (*focused + 1) % ui::APPEARANCE_FOCUS_COUNT;
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
+                *focused = (*focused + ui::APPEARANCE_FOCUS_COUNT - 1) % ui::APPEARANCE_FOCUS_COUNT;
+            }
+            KeyCode::Home => *focused = 0,
+            KeyCode::End => *focused = ui::APPEARANCE_FOCUS_COUNT - 1,
+            KeyCode::Left | KeyCode::Right if *focused >= 3 => {
+                *focused = if *focused == 3 { 4 } else { 3 };
+            }
+            KeyCode::Left => cycle = Some((*focused, true)),
+            KeyCode::Right => cycle = Some((*focused, false)),
+            KeyCode::Char(' ') if *focused < 3 => cycle = Some((*focused, false)),
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                cancel = *focused == 4;
+                apply = !cancel;
+            }
+            KeyCode::Char('a' | 'A') => apply = true,
+            KeyCode::Char(ch) => {
+                *focused = match ch {
+                    't' | 'T' => 0,
+                    'c' | 'C' => 1,
+                    'i' | 'I' => 2,
+                    _ => return,
+                };
+                cycle = Some((*focused, shift || ch.is_ascii_uppercase()));
+            }
+            _ => return,
+        }
+        if let Some((row, backwards)) = cycle {
+            match row {
+                0 => {
+                    draft.theme = match (draft.theme, backwards) {
+                        (ThemeKind::Dark, false) | (ThemeKind::Terminal, true) => ThemeKind::Light,
+                        (ThemeKind::Light, false) | (ThemeKind::Dark, true) => ThemeKind::Terminal,
+                        (ThemeKind::Terminal, false) | (ThemeKind::Light, true) => ThemeKind::Dark,
+                    };
+                }
+                1 => {
+                    draft.colors = match (draft.colors, backwards) {
+                        (ColorMode::Auto, false) | (ColorMode::Ansi256, true) => {
+                            ColorMode::Truecolor
+                        }
+                        (ColorMode::Truecolor, false) | (ColorMode::Ansi16, true) => {
+                            ColorMode::Ansi256
+                        }
+                        (ColorMode::Ansi256, false) | (ColorMode::None, true) => ColorMode::Ansi16,
+                        (ColorMode::Ansi16, false) | (ColorMode::Auto, true) => ColorMode::None,
+                        (ColorMode::None, false) | (ColorMode::Truecolor, true) => ColorMode::Auto,
+                    };
+                }
+                2 => {
+                    draft.icons = match (draft.icons, backwards) {
+                        (IconMode::Unicode, false) | (IconMode::Ascii, true) => IconMode::Nerd,
+                        (IconMode::Nerd, false) | (IconMode::Unicode, true) => IconMode::Ascii,
+                        (IconMode::Ascii, false) | (IconMode::Nerd, true) => IconMode::Unicode,
+                    };
+                }
+                _ => {}
+            }
+        }
+        if apply {
+            let visual = *draft;
+            if self.options.theme != visual.theme || self.options.colors != visual.colors {
+                self.theme = Theme::new(visual.theme, visual.colors);
+            }
+            self.options.theme = visual.theme;
+            self.options.colors = visual.colors;
+            self.options.icons = visual.icons;
+            self.modal = None;
+            self.status = StatusMessage::new(
+                StatusLevel::Success,
+                "Appearance applied for this run".into(),
+            );
+        } else if cancel {
+            self.cancel_modal();
+            return;
+        }
+        self.invalidate_hit_targets();
+    }
+
     fn open_help(&mut self) {
         if matches!(self.modal, Some(Modal::Help { .. })) {
             return;
@@ -1602,6 +1716,10 @@ impl App {
         }
         if key.code == KeyCode::Esc {
             self.cancel_modal();
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Appearance { .. })) {
+            self.appearance_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::Search { .. })) {
@@ -2367,6 +2485,11 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        if alt && !control && matches!(key.code, KeyCode::Char('p' | 'P')) {
+            self.open_appearance();
+            return;
+        }
+
         if alt && !control && shift {
             match key.code {
                 KeyCode::Left => {
@@ -2446,6 +2569,10 @@ impl App {
                 }
                 KeyCode::F(10) => {
                     self.cycle_pane(if shift { -1 } else { 1 });
+                    return;
+                }
+                KeyCode::F(11) => {
+                    self.open_appearance();
                     return;
                 }
                 KeyCode::F(12) => {
@@ -3600,8 +3727,9 @@ impl App {
                 }
             },
             InputEvent::Terminal(Event::Key(key)) => {
+                let was_appearance = matches!(self.modal, Some(Modal::Appearance { .. }));
                 self.key(key);
-                if self.modal.is_none() && !self.workspace.explorer_focused {
+                if !was_appearance && self.modal.is_none() && !self.workspace.explorer_focused {
                     let area = self.active_text_area();
                     if let Some((tab, buf)) = self.workspace.active_view_and_doc_mut() {
                         let prev_top = tab.top_line;
@@ -3711,6 +3839,10 @@ impl App {
                 replacement_focus: *replacement_focus,
                 feedback: self.search.current_feedback(&self.workspace),
             }),
+            Some(Modal::Appearance { draft, focused }) => Some(Dialog::Appearance {
+                draft: *draft,
+                focused: *focused,
+            }),
             Some(Modal::Help { scroll }) => Some(Dialog::Help { scroll: *scroll }),
             None => None,
         };
@@ -3742,7 +3874,7 @@ impl App {
             sidebar_width: self.workspace.sidebar_width,
             explorer_focused: self.workspace.explorer_focused,
             theme: &self.theme,
-            icons: self.icons,
+            icons: self.options.icons,
         };
         let out = draw_fn(&model, &mut self.geometry);
         self.hit_targets_valid = true;
@@ -4069,6 +4201,198 @@ mod tests {
             next_tab: None,
             ..PaneGeometry::default()
         }];
+    }
+
+    #[test]
+    fn appearance_draft_help_cancel_and_apply_preserve_document_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_root(
+            dir.path().to_path_buf(),
+            Options {
+                theme: ThemeKind::Dark,
+                colors: ColorMode::Auto,
+                icons: IconMode::Unicode,
+                ..internal_options()
+            },
+        );
+        let line = "long line for scrolling ".repeat(10) + "\n";
+        app.replace_in_active_tab(&line.repeat(40));
+        {
+            let view = app.workspace.active_view_mut().unwrap();
+            view.cursor = 3;
+            view.anchor = Some(1);
+            view.top_line = 20;
+            view.left_cell = 4;
+        }
+        let original = app.options;
+        let palette = app.theme;
+        app.clipboard.put_internal("clipboard sentinel".into());
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        let key = |code| InputEvent::Terminal(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        app.event(key(KeyCode::F(11)));
+        app.event(key(KeyCode::Char('t')));
+        app.event(key(KeyCode::Char('i')));
+        app.event(key(KeyCode::F(1)));
+        app.event(key(KeyCode::Esc));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Appearance {
+                draft: Options {
+                    theme: ThemeKind::Light,
+                    colors: ColorMode::Auto,
+                    icons: IconMode::Nerd,
+                    ..
+                },
+                focused: 2,
+            })
+        ));
+        assert_eq!(app.options, original);
+        assert_eq!(app.theme, palette);
+        for ch in ['s', 'q', 'c', 'v', 'x', 'z', 'a'] {
+            app.event(InputEvent::Terminal(Event::Key(ctrl(ch))));
+        }
+        assert!(matches!(app.modal, Some(Modal::Appearance { .. })));
+        app.event(key(KeyCode::Esc));
+        assert_eq!(app.options, original);
+        app.event(key(KeyCode::F(11)));
+        app.event(key(KeyCode::Char('t')));
+        app.event(key(KeyCode::Char('i')));
+        app.event(key(KeyCode::Char('a')));
+        assert_eq!(app.options.theme, ThemeKind::Light);
+        assert_eq!(app.options.colors, ColorMode::Auto);
+        assert_eq!(app.options.icons, IconMode::Nerd);
+        assert_eq!(app.options.clipboard, original.clipboard);
+        let view = app.workspace.active_view().unwrap();
+        assert_eq!(
+            (view.cursor, view.anchor, view.top_line, view.left_cell),
+            (3, Some(1), 20, 4)
+        );
+        let document = &app.workspace.active_document().unwrap().document;
+        assert_eq!(document.revision(), revision);
+        assert!(document.is_dirty());
+        assert_eq!(app.clipboard.take_internal(), "clipboard sentinel");
+    }
+
+    #[test]
+    fn appearance_tiny_and_stale_hits_cannot_apply_but_apply_click_ignores_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_root(
+            dir.path().to_path_buf(),
+            Options {
+                theme: ThemeKind::Dark,
+                colors: ColorMode::None,
+                icons: IconMode::Unicode,
+                ..internal_options()
+            },
+        );
+        app.event(InputEvent::Terminal(Event::Key(fkey(11))));
+        draw_frame(&mut app, 80, 24);
+        let previous = app
+            .geometry
+            .commands
+            .iter()
+            .find(|hit| hit.key.code == KeyCode::Char('T'))
+            .unwrap()
+            .area;
+        let previous_mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: previous.x,
+            row: previous.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(previous_mouse, Instant::now());
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Appearance {
+                draft: Options {
+                    theme: ThemeKind::Terminal,
+                    ..
+                },
+                focused: 0,
+            })
+        ));
+        app.mouse(previous_mouse, Instant::now());
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Appearance {
+                draft: Options {
+                    theme: ThemeKind::Terminal,
+                    ..
+                },
+                focused: 0,
+            })
+        ));
+        draw_frame(&mut app, 80, 24);
+        let next = app
+            .geometry
+            .commands
+            .iter()
+            .find(|hit| hit.key.code == KeyCode::Char('t'))
+            .unwrap()
+            .area;
+        app.mouse(
+            MouseEvent {
+                column: next.x,
+                row: next.y,
+                ..previous_mouse
+            },
+            Instant::now(),
+        );
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Appearance {
+                draft: Options {
+                    theme: ThemeKind::Dark,
+                    ..
+                },
+                focused: 0,
+            })
+        ));
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        draw_frame(&mut app, 80, 24);
+        let apply = app
+            .geometry
+            .commands
+            .iter()
+            .find(|hit| hit.key.code == KeyCode::Char('a'))
+            .unwrap()
+            .area;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: apply.x,
+            row: apply.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.invalidate_hit_targets();
+        app.mouse(mouse, Instant::now());
+        assert!(app.modal.is_some());
+        app.viewport = (39, 9);
+        app.hit_targets_valid = true;
+        app.mouse(mouse, Instant::now());
+        assert!(app.modal.is_some());
+        app.viewport = (80, 24);
+        app.invalidate_hit_targets();
+        app.mouse(mouse, Instant::now());
+        assert!(app.modal.is_some());
+        draw_frame(&mut app, 80, 24);
+        let apply = app
+            .geometry
+            .commands
+            .iter()
+            .find(|hit| hit.key.code == KeyCode::Char('a'))
+            .unwrap()
+            .area;
+        app.mouse(
+            MouseEvent {
+                column: apply.x,
+                row: apply.y,
+                ..mouse
+            },
+            Instant::now(),
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(app.options.theme, ThemeKind::Light);
     }
 
     #[test]

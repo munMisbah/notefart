@@ -33,7 +33,7 @@ Batch P1 terpilih telah terintegrasi dan lulus verifikasi fungsional `atmo/alicn
 | 2.2 resize explorer dan tombol konfirmasi | Alt+Shift+Left/Right saat explorer fokus; Tab/panah/Enter/Space dengan Cancel default dan return F1 | Lulus unit/runtime |
 | 3.2.1–2 | Prefill seleksi satu baris, posisi/total match berbatas jujur dan wrapped, cache revisi, overlap Find dua arah | Lulus unit/runtime |
 | 3.3.1, konteks path | Path target/Untitled pada Unsaved/Overwrite/Conflict, termasuk guard ukuran | Lulus unit/runtime |
-| P1/P2 di luar cakupan di atas | Misalnya keymap/switcher runtime dan indikator overflow field | Tetap usulan; indent/dedent serta scrollbar editor, Explorer dan F1 ditangani pada batch lanjutan di bawah |
+| P1/P2 di luar cakupan di atas | Misalnya keymap runtime serta undo/autoscroll field | Tetap usulan; indent/dedent, scrollbar, indikator overflow field dan switcher tampilan ditangani pada batch lanjutan di bawah |
 
 Dua review fungsional read-only AGY telah selesai. Temuan invalidasi cache saat reload, konsistensi overlap maju dan hit mouse stale saat membuka pencarian ditangani integrator dengan regresi tambahan. Suite 310 tes dan seluruh skenario runtime P1 di atas lolos; temuan override warna backend diselesaikan dengan regresi dan uji ulang terarah. Pengguna menyetujui penutupan tahap 4 untuk matriks Linux teruji dengan batas fisik/non-loopback yang dicatat di ROADMAP.
 
@@ -57,6 +57,23 @@ Dua review fungsional read-only AGY telah selesai. Temuan invalidasi cache saat 
 - Scroll tree tidak mengganti pilihan, fokus atau dokumen; scroll F1 tidak mengubah field Find/Replace, Open/Save As maupun state konfirmasi yang ditangguhkan. Wrapping, page dan limit bantuan memakai ruang katalog setelah rail.
 - DeepSeek memverifikasi 130 kasus tes berbeda pada empat filter terarah serta TUI nyata, termasuk minimum/tiny, resize-held drag, modal return dan fallback ikon. Bukan suite seluruh target atau review AGY baru.
 - [Kontrak](ARCHITECTURE.md#scrollbar-explorer-dan-f1) dan [bukti, hash serta batas](ROADMAP.md#hasil-scrollbar-explorer-dan-f1). Indikator overflow field dan switcher runtime tetap di luar batch; isi audit awal di bawah tidak ditulis ulang.
+
+## Status tindak lanjut indikator overflow field
+
+- Path, Find dan Replace memakai indikator pasif `‹`/`›`, atau `<`/`>` pada ASCII, saat window menyembunyikan teks. Indikator tidak dimasukkan ke `FieldHit`, sehingga kliknya tidak menempatkan caret atau memindahkan fokus ke field lain.
+- Dua gutter hanya dibuat jika tersedia minimal tiga sel nilai; pada satu/dua sel, caret diprioritaskan. Ini tidak menambahkan autoscroll, undo field, word-delete, toleransi double-click atau hover dari usulan audit.
+- [Kontrak field dan mapping byte](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan). Isi audit awal tetap catatan historis, bukan daftar kekurangan terbaru.
+- Tiga kasus tes terarah lulus setelah migrasi assertion caret; smoke penutupan `openai-codex/gpt-6.1-terra` membuktikan byte klik setelah resize, seleksi path, clipboard penuh dan return F1 melalui output fixture. Bukan review AGY atau security audit baru; [bukti, hash dan batas](ROADMAP.md#hasil-indikator-overflow-field).
+
+## Status tindak lanjut switcher tampilan runtime
+
+- F11/Alt+P membuka draft tema, mode warna dan profil ikon dengan Apply/Cancel, keyboard dan mouse. F1 menangguhkan lalu memulihkan draft/fokus; F12 tetap Close pane.
+- Apply berlaku untuk run ini tanpa menyimpan konfigurasi/sesi, mengganti backend clipboard/font, mengubah dokumen/undo atau mengikuti ulang caret saat menu ditutup. Background utama tetap mengikuti terminal.
+- Ukuran minimum 40×10; di bawahnya hanya Esc/F1 yang aktif dan target klik lama tidak dipakai. Ini bukan konfigurasi keymap atau preview tema.
+- [Kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime). Isi audit awal tetap catatan historis, bukan daftar kekurangan terbaru.
+- Empat tes Appearance lulus. Smoke awal terhenti oleh selector driver yang keliru, bukan bug aplikasi; smoke sisa skenario lulus tanpa mengubah produksi atau mengulang tes. Penutupan memakai `openai-codex/gpt-6.1-terra`, bukan review AGY/security baru; [bukti, hash dan batas](ROADMAP.md#hasil-switcher-tampilan-runtime).
+
+
 
 
 

@@ -10,7 +10,11 @@ Indent/dedent blok juga tersedia: Tab pada seleksi multibaris dan Shift+Tab pada
 
 Scrollbar vertikal/horizontal editor bekerja per view: klik track dan drag thumb menggeser viewport tanpa memindahkan fokus/cursor/seleksi atau membuat edit. Jalur di dalam frame mengikuti background terminal dan dipadatkan pada panel minimum; pengukuran lebar baris panjang bertahap agar input tetap dapat dilayani. [Kontrak editor](ARCHITECTURE.md#scrollbar-editor).
 
-Explorer dan bantuan F1 memiliki scrollbar vertikal dengan gesture yang sama. Tree tidak mengganti pilihan/fokus atau membuka file lewat rail; bantuan menjaga state modal yang ditangguhkan dan wrapping tetap menyisakan footer. Track yang tidak muat disembunyikan, tanpa menimpa parent row, divider atau teks. Scrollbar horizontal Explorer, indikator overflow field dan switcher runtime tetap terpisah; [kontrak](ARCHITECTURE.md#scrollbar-explorer-dan-f1).
+Explorer dan bantuan F1 memiliki scrollbar vertikal dengan gesture yang sama. Tree tidak mengganti pilihan/fokus atau membuka file lewat rail; bantuan menjaga state modal yang ditangguhkan dan wrapping tetap menyisakan footer. Track yang tidak muat disembunyikan, tanpa menimpa parent row, divider atau teks. Scrollbar horizontal Explorer tetap di luar cakupan batch scrollbar; [kontrak](ARCHITECTURE.md#scrollbar-explorer-dan-f1).
+
+Field path, Find dan Replace menandai teks tersembunyi dengan `‹`/`›` (`<`/`>` pada ASCII). Indikator pasif berada di luar area klik/seleksi teks dan tidak ikut menjadi isi field. Pada satu/dua sel nilai, caret diprioritaskan dan indikator disembunyikan; bukan tambahan autoscroll, undo field atau shortcut baru. [Kontrak field](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan).
+
+Appearance kini menyediakan pergantian tema, mode warna dan profil ikon melalui F11/Alt+P. Perubahan berupa draft sampai Apply; Cancel tidak mengubah tampilan aktif. Preferensi hanya berlaku untuk run ini, tanpa mengubah dokumen/riwayat, viewport, backend clipboard, font atau konfigurasi tersimpan. Ini bukan konfigurasi keymap runtime; [kontrak](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
 
 ## Tujuan
 

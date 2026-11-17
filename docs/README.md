@@ -220,13 +220,21 @@ Baris panjang memakai cache geometri sparse per dokumen sehingga posisi cursor, 
 
 ### Validasi release terbaru
 
-Release `./target/release/naf` kini juga memiliki scrollbar vertikal Explorer dan bantuan F1. Klik track melakukan page scroll, drag thumb menggeser viewport tanpa mengganti pilihan file/fokus atau state modal yang ditangguhkan; rail terpisah dari parent row, divider dan footer. DeepSeek memverifikasi TUI nyata dan **130 kasus tes berbeda** lulus pada empat filter terarah, bukan suite seluruh target. [Bukti, hash dan batas](ROADMAP.md#hasil-scrollbar-explorer-dan-f1).
+F11 atau Alt+P membuka **Appearance** untuk tema, mode warna dan profil ikon. Panah atau T/C/I mengubah draft; Apply/Enter menerapkan untuk run ini, Esc membatalkan, dan F1 memulihkan draft/fokus saat kembali. Keyboard dan mouse tersedia pada minimal 40×10; di bawahnya hanya Esc/F1. Tidak mengubah konfigurasi tersimpan, clipboard atau font terminal. [Kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
+
+Empat tes Appearance serta smoke TUI nyata melalui `openai-codex/gpt-6.1-terra` lulus, termasuk Auto yang tetap menjadi pilihan Auto, override Truecolor/Nerd dan kontrol minimum/tiny. Fixture/config tidak berubah dan aplikasi keluar 0; bukan bukti font/glass atau mouse fisik. [Bukti switcher, hash dan batas](ROADMAP.md#hasil-switcher-tampilan-runtime).
+
+Field path, Find dan Replace kini menandai teks tersembunyi dengan `‹`/`›` (`<`/`>` pada ASCII). Indikator pasif tidak menjadi isi/seleksi atau target klik field; caret tetap terlihat, termasuk saat ruang nilai hanya satu/dua sel tanpa indikator. [Kontrak field](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan).
+
+Tiga kasus tes terarah lulus setelah migrasi kontrak caret. Smoke akhir oleh `openai-codex/gpt-6.1-terra` membuktikan klik/seleksi, clipboard internal penuh, F1 dan hit setelah resize 80×24/40×10 melalui output fixture identik byte-per-byte; bukan suite seluruh target atau uji mouse fisik. [Bukti field, hash dan batas](ROADMAP.md#hasil-indikator-overflow-field).
+
+Scrollbar vertikal Explorer dan bantuan F1 tetap tersedia. Klik track melakukan page scroll, drag thumb tidak mengganti pilihan file/fokus atau state modal yang ditangguhkan. Batch scrollbar sebelumnya ditutup dengan TUI nyata DeepSeek dan 130 kasus tes berbeda pada empat filter terarah, bukan suite seluruh target. [Bukti scrollbar, hash dan batas](ROADMAP.md#hasil-scrollbar-explorer-dan-f1).
 
 Scrollbar vertikal/horizontal per view editor tetap tersedia, termasuk pengukuran lebar bertahap dan rail minimum. Batch editor sebelumnya ditutup dengan 88 tes recheck terarah serta TUI nyata setelah perbaikan batas; [bukti editor](ROADMAP.md#hasil-scrollbar-editor).
 
 Indent/dedent blok tetap tersedia; batch sebelumnya mencakup 113 tes terarah dan 23 skenario TUI. [Bukti indentasi](ROADMAP.md#hasil-indent-dan-dedent-blok).
 
-Penutupan tahap 4 tetap berlaku untuk matriks Linux yang disetujui pengguna: PTY, VTE/Xvfb, client tmux dan SSH loopback pada [batch P1 sebelumnya](ROADMAP.md#hasil-p1-aksesibilitas-dan-pencarian). Uji indentasi serta scrollbar editor/Explorer/F1 memakai input/protokol tmux/PTY, bukan desktop atau mouse fisik; publish/installer tetap terpisah. Indikator overflow field dan theme/keymap runtime belum termasuk fitur ini.
+Penutupan tahap 4 tetap berlaku untuk matriks Linux yang disetujui pengguna: PTY, VTE/Xvfb, client tmux dan SSH loopback pada [batch P1 sebelumnya](ROADMAP.md#hasil-p1-aksesibilitas-dan-pencarian). Uji indentasi serta scrollbar editor/Explorer/F1 memakai input/protokol tmux/PTY, bukan desktop atau mouse fisik; publish/installer serta keymap runtime tetap terpisah.
 
 ## Contoh syntax di `testfile`
 

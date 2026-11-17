@@ -84,10 +84,8 @@ pub(crate) fn draw(
         return None;
     }
 
-    let val_x = area.x + written_prefix;
-    let val_width = avail_width - written_prefix;
-    hit.area = Rect::new(val_x, area.y, val_width, 1);
-    hit.stops.reserve(val_width as usize);
+    let value_x = area.x + written_prefix;
+    let value_width = avail_width - written_prefix;
 
     let sel_range = value.selection.as_ref().and_then(|r| {
         let start = r.start.min(r.end);
@@ -113,10 +111,44 @@ pub(crate) fn draw(
         cursor_col = total_width;
     }
 
-    let w = val_width as usize;
-    let max_window_start = (total_width + 1).saturating_sub(w);
-    let window_col_start = cursor_col.saturating_sub(w / 2).min(max_window_start);
+    let window_start = |width: usize| {
+        cursor_col
+            .saturating_sub(width / 2)
+            .min((total_width + 1).saturating_sub(width))
+    };
+    let full_width = usize::from(value_width);
+    let full_start = window_start(full_width);
+    let gutter =
+        u16::from(value_width >= 3 && (full_start > 0 || total_width > full_start + full_width));
+    let val_x = value_x + gutter;
+    let val_width = value_width - 2 * gutter;
+    let w = usize::from(val_width);
+    let window_col_start = window_start(w);
     let window_col_end = window_col_start + w;
+    hit.area = Rect::new(val_x, area.y, val_width, 1);
+    hit.stops.reserve(w);
+
+    if gutter != 0 {
+        let (left, right) = match icons {
+            IconMode::Ascii => ("<", ">"),
+            IconMode::Unicode | IconMode::Nerd => ("‹", "›"),
+        };
+        let indicator_style = if focused {
+            val_style.fg(theme.accent)
+        } else {
+            val_style
+        };
+        buf[(value_x, area.y)]
+            .set_symbol(if window_col_start > 0 { left } else { " " })
+            .set_style(indicator_style);
+        buf[(value_x + value_width - 1, area.y)]
+            .set_symbol(if total_width > window_col_end {
+                right
+            } else {
+                " "
+            })
+            .set_style(indicator_style);
+    }
 
     let marker = truncation_marker(icons);
     let mut cur_col = 0usize;
@@ -401,9 +433,9 @@ mod tests {
             IconMode::Ascii,
             &mut hit,
         );
-        // Home reveals beginning: cursor at x = 0
-        assert_eq!(res_home, Some((0, 0)));
-        assert_eq!(hit.stops[0], (0, 0));
+        // Home exposes byte zero at the first text cell, after any passive gutter.
+        assert_eq!(res_home, Some((hit.area.x, hit.area.y)));
+        assert_eq!(hit.stops.first(), Some(&(hit.area.x, 0)));
 
         // End tail: cursor at byte 10
         let view_end = FieldView {
@@ -421,9 +453,127 @@ mod tests {
             IconMode::Ascii,
             &mut hit,
         );
-        // End reveals tail: cursor cell is reserved at the end (x = 5)
-        assert_eq!(res_end, Some((5, 0)));
-        assert_eq!(hit.stops[5], (5, 10));
+        // End exposes the insertion position in text, not in the passive right gutter.
+        let caret_stop = hit.stops.last().copied().expect("End must expose its caret");
+        assert_eq!(res_end, Some((caret_stop.0, hit.area.y)));
+        assert_eq!(caret_stop.1, view_end.text.len());
+    }
+
+    #[test]
+    fn overflow_indicators_follow_caret_and_exclude_decorations_from_hits() {
+        let theme = make_test_theme();
+        let text = "0123456789abcdef";
+        let area = Rect::new(2, 1, 10, 1);
+        let left = area.x + 2;
+        let right = area.right() - 1;
+
+        for (icons, left_symbol, right_symbol) in [
+            (IconMode::Ascii, "<", ">"),
+            (IconMode::Unicode, "‹", "›"),
+            (IconMode::Nerd, "‹", "›"),
+        ] {
+            for cursor in [0, 8, text.len()] {
+                let mut buf = Buffer::empty(Rect::new(0, 0, 14, 3));
+                let mut hit = FieldHit {
+                    kind: FieldKind::Query,
+                    area: Rect::default(),
+                    stops: Vec::new(),
+                };
+                let value = FieldView {
+                    text,
+                    cursor,
+                    selection: Some(2..14),
+                };
+                let (cursor_x, cursor_y) =
+                    draw(&mut buf, area, "> ", &value, true, &theme, icons, &mut hit)
+                        .expect("the focused caret must remain visible");
+
+                assert_eq!(
+                    buf[(left, area.y)].symbol(),
+                    if cursor == 0 { " " } else { left_symbol }
+                );
+                assert_eq!(
+                    buf[(right, area.y)].symbol(),
+                    if cursor == text.len() {
+                        " "
+                    } else {
+                        right_symbol
+                    }
+                );
+                assert!(hit.area.x > left && hit.area.right() <= right);
+                assert_eq!(cursor_y, area.y);
+                assert!(cursor_x >= hit.area.x && cursor_x < hit.area.right());
+                assert_eq!(
+                    hit.stops
+                        .iter()
+                        .find_map(|&(x, byte)| (x == cursor_x).then_some(byte)),
+                    Some(cursor)
+                );
+                for &(x, byte) in &hit.stops {
+                    assert!(x > left && x < right);
+                    let expected = if byte == text.len() {
+                        " "
+                    } else {
+                        &text[byte..byte + 1]
+                    };
+                    assert_eq!(buf[(x, area.y)].symbol(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_compact_fields_keep_caret_and_grapheme_boundaries() {
+        let theme = make_test_theme();
+        let text = "a你e\u{0301}🙂z";
+        let boundaries: Vec<_> = text
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain(std::iter::once(text.len()))
+            .collect();
+
+        for width in 1..=3 {
+            for &cursor in &boundaries {
+                for focused in [false, true] {
+                    let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+                    let mut hit = FieldHit {
+                        kind: FieldKind::Path,
+                        area: Rect::default(),
+                        stops: Vec::new(),
+                    };
+                    let value = FieldView {
+                        text,
+                        cursor,
+                        selection: Some(1..text.len() - 1),
+                    };
+                    let result = draw(
+                        &mut buf,
+                        Rect::new(0, 0, width, 1),
+                        "",
+                        &value,
+                        focused,
+                        &theme,
+                        IconMode::Ascii,
+                        &mut hit,
+                    );
+
+                    assert!(hit.stops.iter().all(|&(x, byte)| {
+                        x >= hit.area.x && x < hit.area.right() && boundaries.contains(&byte)
+                    }));
+                    if focused {
+                        let (cursor_x, _) = result.expect("compact fields must keep their caret");
+                        assert_eq!(
+                            hit.stops
+                                .iter()
+                                .find_map(|&(x, byte)| (x == cursor_x).then_some(byte)),
+                            Some(cursor)
+                        );
+                    } else {
+                        assert_eq!(result, None);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

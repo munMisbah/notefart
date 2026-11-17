@@ -687,6 +687,43 @@ Regresi baru memakai token accent, sebab foreground/canvas ANSI16 memang `Reset`
 - Laporan: `/tmp/naf-nav-scroll-core-final.md` dan `/tmp/naf-nav-scroll-help-final.md`; log, capture dan stream berada di `/tmp/naf-nav-scroll-core-evidence/` dan `/tmp/naf-nav-scroll-help-evidence/`.
 - Fixture/HOME/XDG, driver, helper dan prompt sementara milik batch dibersihkan setelah hasil diperiksa; laporan serta bukti runtime dipertahankan. Server tmux uji sudah dihentikan oleh worker dan kedua terminal worker sukses telah dilepas. Startup Help yang gagal memakai terminal yang kemudian berhasil dipakai retry; terminal tersebut tidak ditutup paksa melalui rekam gagal.
 
+### Hasil indikator overflow field
+
+- Lanjutan UX menambahkan indikator pasif pada field path, Find dan Replace sesuai [kontrak field](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan). Perubahan produksi hanya pada `field_ui`; model/riwayat field, controller input, clipboard, I/O dan dependency tidak diubah.
+- Integrator memformat `src/field_ui.rs` dan berhasil membangun `cargo build --locked --release --bin naf`. Tes dan smoke awal dikerjakan `lab/atmo/cx/gpt-6.1-terra`; penutupan bukti TUI memakai `openai-codex/gpt-6.1-terra` sesuai pilihan pengguna. Tidak menjalankan security test/audit, suite luas, matriks font/SSH atau benchmark.
+- Putaran awal: filter `field_ui::tests::overflow_` lulus dua regresi, mencakup indikator tiga profil, pemetaan hit/caret dan minimum satu–tiga sel dengan grapheme lebar/combining. Filter `field_ui::tests::test_horizontal_window_caret_following` gagal karena assertion Home lama masih mengharapkan kolom 0, bukan awal teks setelah gutter.
+- Integrator memigrasikan assertion Home ke awal area teks/byte 0 dan End ke stop caret/akhir teks, bukan mengunci koordinat layar baru. Ini perubahan tes saja; produksi dan binary tidak diubah. Dua regresi yang sudah lulus tidak dijalankan ulang.
+- Recheck hanya filter caret tersebut lulus satu kasus. Gabungan hasil mencakup **tiga kasus berbeda lulus**, bukan pengulangan suite: dua regresi overflow dari putaran awal dan satu kontrak caret setelah migrasi.
+- Smoke awal membuktikan arah indikator Open path, field panjang/pendek, kembalinya F1 dan exit 0. Penempatan byte klik, clipboard penuh serta hit setelah resize belum dibuktikan oleh smoke awal; posisi cursor sesudah redraw bukan bukti tunggal karena window mengikuti caret.
+- Recheck otomasi ekspor belum menghasilkan output: capture akhir masih menampilkan dialog Replace dan path tujuan berada di field Replacement. Langkah Save As belum tercapai, sehingga ini belum membuktikan kegagalan I/O aplikasi. Driver bukti final memisahkan bare Esc dari tombol selanjutnya dan memeriksa state dialog sebelum ekspor; tidak mengubah kode aplikasi.
+- Driver final dijalankan sekali dan seluruh enam check lulus: seleksi parsial path bertahan saat klik gutter, gutter field nonaktif tidak memindahkan fokus query, F1 menjaga field/fokus, klik token pada 80×24 → 40×10 → 80×24 memilih byte yang benar, clipboard query/replacement penuh dan fixture asli tidak berubah.
+- Hasil Save As `selected.txt.actual` identik dengan expected `TAIL5`; `query.txt.actual` identik dengan query penuh beserta tiga penanda edit pada token yang diklik, tanpa prefix/indikator tambahan. Driver dan aplikasi keluar 0. Integrator membaca log tes, JSON hasil, kedua pasangan output penuh serta capture resize dan dialog Save As; tidak menjalankan ulang tes.
+- SHA-256 binary release: `02aac5035f60d3cbbcec572920715073890788ffe959cac5e34f3f30d31bb73c`.
+- Laporan awal `/tmp/naf-field-overflow-terra-final.md`, dengan log dan capture di `/tmp/naf-field-overflow-terra-evidence/`.
+- Laporan recheck `/tmp/naf-field-overflow-terra-recheck-final.md` dan capture di `/tmp/naf-field-overflow-terra-recheck-evidence/` menyimpan batas tersebut; log tes caret berada di `/tmp/naf-field-overflow-terra-recheck-test.log`.
+- Bukti penutupan: `/tmp/naf-field-overflow-terra-proof-final.md`, `/tmp/naf-field-overflow-terra-proof-evidence/` dan `/tmp/naf-field-overflow-terra-proof.log`. Pasangan expected/actual dipertahankan di evidence sesudah fixture dihapus.
+- Batas: TUI nyata Linux melalui tmux/PTY dengan mouse SGR sintetis, bukan perangkat mouse/font/glass fisik. Unicode/Nerd/ASCII serta ukuran nilai satu–tiga sel tercakup pada tes renderer; smoke akhir tidak mengulang matriks profil atau clipboard sistem. Penutupan tahap 4 tidak diperluas ke platform baru.
+- Seluruh fixture/HOME/XDG, driver dan prompt sementara milik batch dibersihkan; laporan, log dan capture dipertahankan. Server tmux uji dihentikan, terminal worker selesai dilepas dan assignment jalur CX dihentikan terkonfirmasi saat provider dialihkan. Tidak menutup terminal atau mengubah konfigurasi akun pengguna.
+
+### Hasil switcher tampilan runtime
+
+- Appearance menyediakan draft tema, mode warna dan profil ikon melalui F11/Alt+P, Apply/Cancel, keyboard/mouse dan return F1 sesuai [kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime). F12 tetap Close pane; menu tidak ditumpuk di atas modal lain.
+- Preferensi hanya berlaku untuk run ini: tidak menyimpan konfigurasi/sesi atau mengganti clipboard/font. `Options` menyimpan pilihan yang diminta, termasuk Auto; palet hanya dibangun ulang jika tema/warna berubah dan token syntax tetap semantik.
+- Dua worker implementasi serta QA memakai `openai-codex/gpt-6.1-terra`. Review fungsional read-only tidak menemukan bug consumer-visible pada bagian yang diperiksa; bukan audit keamanan, suite seluruh target atau perluasan matriks platform.
+- Integrator memformat `src/app.rs`, `src/ui.rs`, `src/shortcuts.rs`, `src/theme.rs` dan berhasil menjalankan `cargo build --locked --release --bin naf`.
+- Satu kali `cargo test --locked --bin naf appearance_` lulus **empat kasus**, 0 gagal, 330 filtered. Dua regresi controller mencakup draft/F1/Cancel/Apply, clipboard/dokumen/viewport tetap, siklus mouse, klik stale/tiny serta Apply saat fokus Cancel. Dua regresi renderer mencakup geometri/fokus minimum tiga profil dan penghapusan target lama pada tiny.
+- Smoke awal berhenti karena assertion driver mencari kata `Appearance` di seluruh layar, termasuk status sukses. Capture menunjukkan menu sudah tertutup setelah klik Apply dari fokus Cancel, profil ASCII/Auto mono aktif di bawah `NO_COLOR`, viewport tetap baris 25 dan caret Ln 1. Ini kegagalan selector driver, bukan bukti bug aplikasi; empat tes yang sudah lulus tidak diulang.
+- Driver lanjutan mendeteksi row menu, bukan kata pada status. Satu eksekusi oleh Terra Codex menyelesaikan sisa smoke tanpa mengubah produksi: Apply keyboard menjaga baris atas 25/caret Ln 1, reopen tetap menunjukkan requested Auto, Auto mono di bawah `NO_COLOR` dan explicit Truecolor mengembalikan escape RGB; Nerd menampilkan glyph private-use.
+- TUI 40×10 menampilkan seluruh row/aksi, Tab/BackTab memindahkan fokus; pada 39×9 input Apply/cycle tersembunyi diabaikan, F1 kembali ke draft dan Esc membatalkan. Setelah resize, nilai draft serta live diperiksa kembali; resize tetap boleh mengikuti kebijakan viewport yang sudah ada.
+- Edit menambah karakter dan dirty marker, undo mengembalikan teks/status bersih. Driver serta aplikasi exit 0; hash fixture, konfigurasi dan binary identik sebelum/sesudah. Integrator membaca log/exit empat tes, hasil JSON, hash serta capture F1, Apply, minimum/tiny, reopen dan undo.
+- SHA-256 binary release: `44536f2d013daf0079944dd201c24b423ed95a3ee35c3f6a38bdff762c169485`.
+- Laporan dan bukti awal: `/tmp/naf-appearance-qa-final.md` serta `/tmp/naf-appearance-qa-evidence/`, termasuk output/exit tes, capture dan hash fixture/config/binary yang identik sebelum/sesudah.
+- Laporan penutupan: `/tmp/naf-appearance-recheck-final.md` dan `/tmp/naf-appearance-recheck-evidence/`, termasuk `results.json`, capture plain/SGR serta exit/hash aktual.
+- Batas: Linux melalui tmux/PTY dan mouse SGR sintetis; bukan bukti mouse/font/glass fisik, clipboard sistem, Save As, SSH, performa atau audit keamanan. Penutupan tahap 4 tidak diperluas ke platform baru.
+- Fixture/HOME/XDG, driver dan prompt sementara milik batch dibersihkan; laporan, log, capture dan manifest hash dipertahankan. Kedua sesi tmux sudah berhenti dan keempat terminal worker sudah dilepas. Empat rekam startup gagal tetap historis dengan `ownership_transferred`; guarded release tidak melakukan aksi proses atau menutup terminal pengguna.
+
+
+
 
 
 

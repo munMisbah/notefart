@@ -13,7 +13,7 @@ use crate::explorer::{EntryKind, Explorer};
 use crate::highlight::{LineTokens, Token, TokenSpan};
 use crate::layout::{Axis, Divider, Layout, PaneMinimum, SplitTree};
 use crate::scrollbar::{MeasuredWidth, Scrollbar};
-use crate::theme::{self, ChromeIcon, IconKind, IconMode, Theme};
+use crate::theme::{self, ChromeIcon, IconKind, IconMode, Options, Theme};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -28,6 +28,8 @@ use unicode_width::UnicodeWidthStr;
 
 pub const MIN_DIALOG_SIZE: (u16, u16) = (20, 6);
 pub const MIN_SEARCH_SIZE: (u16, u16) = (40, 10);
+pub(crate) const MIN_APPEARANCE_SIZE: (u16, u16) = (40, 10);
+pub(crate) const APPEARANCE_FOCUS_COUNT: usize = 5;
 
 const ASCII_BORDER: border::Set = border::Set {
     top_left: "+",
@@ -143,6 +145,10 @@ pub enum Dialog<'a> {
     },
     Help {
         scroll: usize,
+    },
+    Appearance {
+        draft: Options,
+        focused: usize,
     },
 }
 
@@ -1780,6 +1786,7 @@ const EXPLORER_HELPER_ACTIONS: &[HelperAction] = &[
         KeyCode::Char('q'),
         KeyModifiers::CONTROL,
     ),
+    helper_action("[F11]", "Style", KeyCode::F(11), KeyModifiers::NONE),
 ];
 
 const EDITOR_HELPER_ACTIONS: &[HelperAction] = &[
@@ -1816,6 +1823,7 @@ const EDITOR_HELPER_ACTIONS: &[HelperAction] = &[
         KeyCode::Char('r'),
         KeyModifiers::CONTROL,
     ),
+    helper_action("[F11]", "Style", KeyCode::F(11), KeyModifiers::NONE),
 ];
 
 const MORE_HELP_ACTION: HelperAction =
@@ -2356,10 +2364,10 @@ fn draw_dialog(
     if area.is_empty() {
         return;
     }
-    let min_size = if matches!(dialog, Dialog::Search { .. }) {
-        MIN_SEARCH_SIZE
-    } else {
-        MIN_DIALOG_SIZE
+    let min_size = match dialog {
+        Dialog::Search { .. } => MIN_SEARCH_SIZE,
+        Dialog::Appearance { .. } => MIN_APPEARANCE_SIZE,
+        _ => MIN_DIALOG_SIZE,
     };
     let choices_too_small = match dialog {
         Dialog::Choices {
@@ -2371,6 +2379,35 @@ fn draw_dialog(
         _ => false,
     };
     if area.width < min_size.0 || area.height < min_size.1 || choices_too_small {
+        if matches!(dialog, Dialog::Appearance { .. }) {
+            frame.render_widget(Clear, area);
+            write_clipped_str(
+                frame.buffer_mut(),
+                area.x,
+                area.y,
+                area.width as usize,
+                "Resize to 40x10",
+                Style::default().fg(theme.warning).bg(theme.canvas),
+            );
+            if area.height > 1 {
+                draw_commands(
+                    frame.buffer_mut(),
+                    Rect::new(area.x, area.y + 1, area.width, 1),
+                    [
+                        (
+                            "Esc Cancel",
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        ),
+                        ("F1 Help", KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+                    ],
+                    Style::default().fg(theme.accent).bg(theme.canvas),
+                    None,
+                    theme.focus_style(),
+                    &mut geometry.commands,
+                );
+            }
+            return;
+        }
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new("Resize!\nEsc back")
@@ -2628,6 +2665,96 @@ fn draw_dialog(
                 &mut geometry.commands,
             );
         }
+        Dialog::Appearance { draft, focused } => {
+            let rect = centered_dialog(area, width, 10);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                dialog_block("Appearance", ChromeIcon::Workspace, theme, icons),
+                rect,
+            );
+            let text_style = Style::default().fg(theme.fg).bg(theme.canvas);
+            let rows = [
+                ("Theme", draft.theme.as_str(), 'T', 't'),
+                ("Colors", draft.colors.as_str(), 'C', 'c'),
+                ("Icons", draft.icons.as_str(), 'I', 'i'),
+            ];
+            for (index, (label, value, prev, next)) in rows.into_iter().enumerate() {
+                let y = rect.y + 1 + index as u16;
+                let style = if *focused == index {
+                    theme.focus_style()
+                } else {
+                    text_style
+                };
+                let buf = frame.buffer_mut();
+                write_clipped_str(
+                    buf,
+                    rect.x + 2,
+                    y,
+                    2,
+                    if *focused == index { "> " } else { "  " },
+                    style,
+                );
+                write_clipped_str(buf, rect.x + 4, y, 7, label, style);
+                draw_commands(
+                    buf,
+                    Rect::new(rect.x + 12, y, 3, 1),
+                    [("<", KeyEvent::new(KeyCode::Char(prev), KeyModifiers::NONE))],
+                    button_style,
+                    None,
+                    theme.focus_style(),
+                    &mut geometry.commands,
+                );
+                write_clipped_str(buf, rect.x + 16, y, 12, value, style);
+                draw_commands(
+                    buf,
+                    Rect::new(rect.x + 29, y, 1, 1),
+                    [(">", KeyEvent::new(KeyCode::Char(next), KeyModifiers::NONE))],
+                    button_style,
+                    None,
+                    theme.focus_style(),
+                    &mut geometry.commands,
+                );
+            }
+            let actions = [
+                (
+                    if *focused == 3 {
+                        ">[A] Apply"
+                    } else {
+                        " [A] Apply"
+                    },
+                    KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                ),
+                (
+                    if *focused == 4 {
+                        ">[Esc] Cancel"
+                    } else {
+                        " [Esc] Cancel"
+                    },
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                ),
+                (
+                    "[F1] Help",
+                    KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                ),
+            ];
+            draw_commands(
+                frame.buffer_mut(),
+                Rect::new(rect.x + 2, rect.y + 5, inner_width, 1),
+                actions,
+                button_style,
+                focused.checked_sub(3).filter(|index| *index < 2),
+                theme.focus_style(),
+                &mut geometry.commands,
+            );
+            write_clipped_str(
+                frame.buffer_mut(),
+                rect.x + 2,
+                rect.y + 7,
+                inner_width as usize,
+                "Draft only; Apply for this run",
+                text_style,
+            );
+        }
         Dialog::Help { .. } => unreachable!(),
     }
 }
@@ -2873,6 +3000,117 @@ mod tests {
 
     fn rects_overlap(a: Rect, b: Rect) -> bool {
         a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+    }
+
+    #[test]
+    fn appearance_minimum_hits_and_focus_are_visible() {
+        for icons in [IconMode::Ascii, IconMode::Unicode, IconMode::Nerd] {
+            let theme = Theme::new(ThemeKind::Dark, ColorMode::None);
+            for focused in 0..APPEARANCE_FOCUS_COUNT {
+                let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+                let mut geometry = Geometry::default();
+                let dialog = Dialog::Appearance {
+                    draft: Options::default(),
+                    focused,
+                };
+                terminal
+                    .draw(|frame| {
+                        draw_dialog(frame, frame.area(), &dialog, &theme, icons, &mut geometry);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                for (index, hit) in geometry.commands.iter().enumerate() {
+                    assert_eq!(hit.area.intersection(Rect::new(0, 0, 40, 10)), hit.area);
+                    assert!(!hit.area.is_empty());
+                    assert!(
+                        geometry
+                            .commands
+                            .iter()
+                            .skip(index + 1)
+                            .all(|other| !rects_overlap(hit.area, other.area))
+                    );
+                    assert!(
+                        (hit.area.x..hit.area.right())
+                            .any(|x| buffer[(x, hit.area.y)].symbol() != " ")
+                    );
+                }
+                let key = match focused {
+                    0 => KeyCode::Char('T'),
+                    1 => KeyCode::Char('C'),
+                    2 => KeyCode::Char('I'),
+                    3 => KeyCode::Char('a'),
+                    _ => KeyCode::Esc,
+                };
+                let hit = geometry
+                    .commands
+                    .iter()
+                    .find(|hit| hit.key.code == key)
+                    .unwrap();
+                let markers = (buffer.area.x..buffer.area.right())
+                    .filter(|&x| {
+                        buffer[(x, hit.area.y)].symbol() == ">"
+                            && buffer[(x, hit.area.y)]
+                                .modifier
+                                .contains(Modifier::BOLD | Modifier::REVERSED)
+                    })
+                    .count();
+                assert_eq!(markers, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn appearance_tiny_clears_stale_targets() {
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::None);
+        for (width, height) in [(1, 1), (9, 3), (39, 9)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut geometry = Geometry::default();
+            geometry.fields.push(FieldHit {
+                kind: FieldKind::Path,
+                area: Rect::new(0, 0, 1, 1),
+                stops: vec![],
+            });
+            geometry.commands.push(CommandHit {
+                area: Rect::new(0, 0, 1, 1),
+                key: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            });
+            geometry.help_scrollbar =
+                Some(Scrollbar::new(Rect::new(0, 0, 1, 2), Axis::Rows, 0, 1, 3));
+            let dialog = Dialog::Appearance {
+                draft: Options::default(),
+                focused: 4,
+            };
+            terminal
+                .draw(|frame| {
+                    draw_dialog(
+                        frame,
+                        frame.area(),
+                        &dialog,
+                        &theme,
+                        IconMode::Ascii,
+                        &mut geometry,
+                    );
+                })
+                .unwrap();
+            assert!(geometry.fields.is_empty());
+            assert!(geometry.help_scrollbar.is_none());
+            assert!(
+                geometry
+                    .commands
+                    .iter()
+                    .all(|hit| matches!(hit.key.code, KeyCode::Esc | KeyCode::F(1)))
+            );
+            for hit in &geometry.commands {
+                assert_eq!(
+                    hit.area.intersection(Rect::new(0, 0, width, height)),
+                    hit.area
+                );
+                assert_ne!(
+                    terminal.backend().buffer()[(hit.area.x, hit.area.y)].symbol(),
+                    " "
+                );
+            }
+        }
     }
 
     #[test]

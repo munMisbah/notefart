@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Switcher tampilan runtime
+
+- Tambahkan Appearance lewat F11/Alt+P untuk tema, mode warna dan profil ikon, dengan kontrol keyboard/mouse serta bantuan F1 yang memulihkan draft/fokus.
+- Pisahkan draft dari preferensi aktif: Apply/Enter menerapkan, Esc/Cancel membatalkan. Perubahan hanya berlaku untuk run ini; tidak menulis konfigurasi/sesi atau mengganti clipboard/font.
+- Pertahankan dokumen, undo, cursor, seleksi dan viewport ketika menu ditutup; invalidasi target klik lama. Pada ukuran di bawah 40×10, hanya Esc/F1 yang aktif.
+- Bangun ulang palet hanya ketika tema/warna berubah, tanpa retokenisasi syntax. Background utama tetap mengikuti terminal; Nerd tetap opt-in dan F12 tetap menutup pane.
+- Empat tes Appearance dan smoke TUI terarah melalui `openai-codex/gpt-6.1-terra` lulus; fixture/config/binary tidak berubah dan aplikasi exit 0. [Bukti, hash dan batas](docs/ROADMAP.md#hasil-switcher-tampilan-runtime).
+
+### Indikator overflow field
+
+- Tambahkan indikator pasif `‹`/`›` pada path, Find dan Replace, dengan fallback `<`/`>` pada ASCII; sisi tanpa teks tersembunyi tetap kosong.
+- Sisihkan gutter dari `FieldHit` dan perhitungan caret agar indikator tidak memilih teks/mengganti fokus. Pada satu/dua sel nilai, pertahankan caret tanpa gutter.
+- Pertahankan source byte/grapheme, seleksi, clipping dan sanitasi lama; tanpa salinan field atau pemindaian teks tambahan. Bukan scrollbar interaktif atau autoscroll.
+- Tiga kasus terarah serta TUI nyata lulus setelah migrasi assertion caret: hit setelah resize, seleksi path, clipboard penuh dan return F1 dibuktikan lewat output fixture identik byte-per-byte. Penutupan memakai `openai-codex/gpt-6.1-terra`; [hash, metode dan batas](docs/ROADMAP.md#hasil-indikator-overflow-field).
+
 ### Scrollbar Explorer dan bantuan F1
 
 - Tambahkan rail vertikal di baris tree dan katalog bantuan, terpisah dari parent row, divider, border dan footer. Track yang terlalu kecil tidak diterbitkan.

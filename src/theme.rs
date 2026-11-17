@@ -186,8 +186,8 @@ impl Theme {
     /// Builds a precomputed theme palette for `kind` and `mode`.
     ///
     /// When `mode` is [`ColorMode::Auto`], environment variables (`NO_COLOR`,
-    /// `TERM`, `COLORTERM`) are inspected once. Explicit non-`Auto` modes
-    /// always override the environment.
+    /// `TERM`, `COLORTERM`) are inspected when the palette is built, not per frame.
+    /// Explicit non-`Auto` modes always override the environment.
     pub fn new(kind: ThemeKind, mode: ColorMode) -> Self {
         let resolved = if mode == ColorMode::Auto {
             let no_color = env::var_os("NO_COLOR");
