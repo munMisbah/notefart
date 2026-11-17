@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Ergonomi field dan navigasi Explorer
+
+- Tambahkan undo/redo delta lokal pada field, Ctrl+Backspace/Delete, serta drag autoscroll dengan kepemilikan capture dan guard frame stale.
+- Tambahkan type-ahead jump pada row Explorer ter-load, timeout dan cycling; tampilkan issue entri serta kartu error root dengan Retry/Up.
+- Terima tombol xterm modifyOtherKeys tanpa mengubah byte legacy atau menegosiasikan mode terminal baru. Ctrl+Backspace/Ctrl+Shift+Z tetap bergantung pada encoding terminal.
+- Sebanyak 24 kasus target berbeda serta smoke TUI normal/input lulus setelah perbaikan affordance parent tak diketahui. QA normal memakai Terra Codex; input/negative dan error permission memakai DeepSeek atmo. [Bukti, hash dan batas](docs/ROADMAP.md#hasil-ergonomi-field-dan-navigasi-explorer).
+
 ### Switcher tampilan runtime
 
 - Tambahkan Appearance lewat F11/Alt+P untuk tema, mode warna dan profil ikon, dengan kontrol keyboard/mouse serta bantuan F1 yang memulihkan draft/fokus.

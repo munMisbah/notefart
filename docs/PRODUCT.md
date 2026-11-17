@@ -12,9 +12,11 @@ Scrollbar vertikal/horizontal editor bekerja per view: klik track dan drag thumb
 
 Explorer dan bantuan F1 memiliki scrollbar vertikal dengan gesture yang sama. Tree tidak mengganti pilihan/fokus atau membuka file lewat rail; bantuan menjaga state modal yang ditangguhkan dan wrapping tetap menyisakan footer. Track yang tidak muat disembunyikan, tanpa menimpa parent row, divider atau teks. Scrollbar horizontal Explorer tetap di luar cakupan batch scrollbar; [kontrak](ARCHITECTURE.md#scrollbar-explorer-dan-f1).
 
-Field path, Find dan Replace menandai teks tersembunyi dengan `‹`/`›` (`<`/`>` pada ASCII). Indikator pasif berada di luar area klik/seleksi teks dan tidak ikut menjadi isi field. Pada satu/dua sel nilai, caret diprioritaskan dan indikator disembunyikan; bukan tambahan autoscroll, undo field atau shortcut baru. [Kontrak field](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan).
+Field path, Find dan Replace menandai teks tersembunyi dengan `‹`/`›` (`<`/`>` pada ASCII). Indikator pasif berada di luar area klik/seleksi teks dan tidak ikut menjadi isi field. Pada satu/dua sel nilai, caret diprioritaskan dan indikator disembunyikan. Undo/redo lokal, penghapusan kata dan drag autoscroll kini tersedia tanpa menyentuh riwayat dokumen belakang; [kontrak field](ARCHITECTURE.md#kontrak-ergonomi-field-dan-navigasi-explorer).
 
 Appearance kini menyediakan pergantian tema, mode warna dan profil ikon melalui F11/Alt+P. Perubahan berupa draft sampai Apply; Cancel tidak mengubah tampilan aktif. Preferensi hanya berlaku untuk run ini, tanpa mengubah dokumen/riwayat, viewport, backend clipboard, font atau konfigurasi tersimpan. Ini bukan konfigurasi keymap runtime; [kontrak](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
+
+Explorer mendukung type-ahead jump pada row yang sudah dimuat, bukan filter atau pencarian filesystem rekursif. Root yang tidak dapat dilisting tetap memiliki kartu penyebab dengan Retry serta Up bila parent diketahui, dan issue entri terpilih ditampilkan di status. Klasifikasi/link dan guard I/O tetap memakai kebijakan lama; [kontrak navigasi](ARCHITECTURE.md#kontrak-ergonomi-field-dan-navigasi-explorer).
 
 ## Tujuan
 

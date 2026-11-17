@@ -181,6 +181,14 @@ pub(crate) const SECTIONS: &[Section] = &[
             ),
             ("F5", "Refresh the tree or retry an unavailable explorer."),
             (
+                "Type a name prefix",
+                "Jump among loaded entries; 900 ms timeout, repeated character cycles with wrap.",
+            ),
+            (
+                "Entry issue / unavailable root",
+                "Selection shows the issue; F5 retries, Backspace goes up even without a listing.",
+            ),
+            (
                 "Alt+Shift+Left/Right",
                 "Resize the explorer by two columns while focused and visible.",
             ),
@@ -253,12 +261,20 @@ pub(crate) const SECTIONS: &[Section] = &[
                 "Delete a grapheme or the field selection.",
             ),
             (
+                "Ctrl+Backspace / Ctrl+Delete",
+                "Delete the selection or previous/next word; modified keys require terminal encoding.",
+            ),
+            (
+                "Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z",
+                "Undo / redo this field only; history survives Help.",
+            ),
+            (
                 "Ctrl+C / X / V",
                 "Use the selected clipboard backend for the focused field only.",
             ),
             (
                 "Click / drag",
-                "Place the field caret or extend its selection.",
+                "Place the field caret or extend its selection; hold outside the text edge to autoscroll.",
             ),
             (
                 "Enter / Esc",

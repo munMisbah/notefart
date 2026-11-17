@@ -33,7 +33,7 @@ Batch P1 terpilih telah terintegrasi dan lulus verifikasi fungsional `atmo/alicn
 | 2.2 resize explorer dan tombol konfirmasi | Alt+Shift+Left/Right saat explorer fokus; Tab/panah/Enter/Space dengan Cancel default dan return F1 | Lulus unit/runtime |
 | 3.2.1–2 | Prefill seleksi satu baris, posisi/total match berbatas jujur dan wrapped, cache revisi, overlap Find dua arah | Lulus unit/runtime |
 | 3.3.1, konteks path | Path target/Untitled pada Unsaved/Overwrite/Conflict, termasuk guard ukuran | Lulus unit/runtime |
-| P1/P2 di luar cakupan di atas | Misalnya keymap runtime serta undo/autoscroll field | Tetap usulan; indent/dedent, scrollbar, indikator overflow field dan switcher tampilan ditangani pada batch lanjutan di bawah |
+| P1/P2 di luar cakupan di atas | Misalnya keymap runtime serta hover/toleransi double-click field | Tetap usulan; indent/dedent, scrollbar, indikator field, Appearance serta ergonomi field/navigasi Explorer ditangani batch lanjutan di bawah |
 
 Dua review fungsional read-only AGY telah selesai. Temuan invalidasi cache saat reload, konsistensi overlap maju dan hit mouse stale saat membuka pencarian ditangani integrator dengan regresi tambahan. Suite 310 tes dan seluruh skenario runtime P1 di atas lolos; temuan override warna backend diselesaikan dengan regresi dan uji ulang terarah. Pengguna menyetujui penutupan tahap 4 untuk matriks Linux teruji dengan batas fisik/non-loopback yang dicatat di ROADMAP.
 
@@ -72,6 +72,15 @@ Dua review fungsional read-only AGY telah selesai. Temuan invalidasi cache saat 
 - Ukuran minimum 40×10; di bawahnya hanya Esc/F1 yang aktif dan target klik lama tidak dipakai. Ini bukan konfigurasi keymap atau preview tema.
 - [Kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime). Isi audit awal tetap catatan historis, bukan daftar kekurangan terbaru.
 - Empat tes Appearance lulus. Smoke awal terhenti oleh selector driver yang keliru, bukan bug aplikasi; smoke sisa skenario lulus tanpa mengubah produksi atau mengulang tes. Penutupan memakai `openai-codex/gpt-6.1-terra`, bukan review AGY/security baru; [bukti, hash dan batas](ROADMAP.md#hasil-switcher-tampilan-runtime).
+
+## Status tindak lanjut ergonomi field dan navigasi Explorer
+
+- Field path/Find/Replace memiliki undo/redo delta lokal, penghapusan kata dan drag autoscroll milik field asal. F1 menjaga history, dan revision query tetap monoton tanpa mengubah dokumen belakang.
+- Type-ahead jump memakai prefix pada row ter-load, wrap dan timeout 900 ms, tanpa memfilter atau memindai ulang filesystem. Kartu error root tetap menyediakan F5 Retry, dengan Bksp Up hanya bila parent diketahui; issue entri terpilih tampak pada status.
+- Ctrl+Backspace/Ctrl+Shift+Z memakai dukungan xterm modifyOtherKeys; byte Ctrl+H legacy tetap Backspace. Implementasi protokol dikerjakan DeepSeek via atmo, bukan GPT/AGY.
+- [Kontrak integrasi dan batas](ARCHITECTURE.md#kontrak-ergonomi-field-dan-navigasi-explorer). Catatan audit awal tidak diubah menjadi klaim kekurangan terbaru; keymap runtime, hover dan toleransi double-click field tetap terpisah.
+- Sebanyak 24 kasus target berbeda serta smoke TUI lulus, termasuk recheck affordance root `.` dari cwd terhapus. QA normal oleh Terra Codex; input/negative dan permission oleh DeepSeek atmo, bukan review AGY baru atau audit seluruh repo. [Bukti dan batas](ROADMAP.md#hasil-ergonomi-field-dan-navigasi-explorer).
+
 
 
 

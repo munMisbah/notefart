@@ -311,6 +311,7 @@ pub(crate) struct Workspace {
     tx_top_anchors_scratch: Vec<(u64, usize)>,
     mins_scratch: Vec<PaneMinimum>,
     pub explorer: Option<Explorer>,
+    pub explorer_error: Option<String>,
     pub explorer_root: PathBuf,
     pub root_label: String,
     pub explorer_visible: bool,
@@ -347,6 +348,7 @@ impl Workspace {
             tx_top_anchors_scratch: Vec::new(),
             mins_scratch: Vec::new(),
             explorer,
+            explorer_error: warning.clone(),
             explorer_root,
             root_label,
             explorer_visible: true,
@@ -556,8 +558,7 @@ impl Workspace {
             .checked_add(1)
             .ok_or_else(|| invalid("session pane ID overflow"))?;
         let (explorer, warning, explorer_root) = Self::open_explorer(root);
-        let explorer_focused =
-            metadata.explorer_focused && metadata.explorer_visible && explorer.is_some();
+        let explorer_focused = metadata.explorer_focused && metadata.explorer_visible;
         let root_label = explorer_root.to_string_lossy().into_owned();
         Ok((
             Self {
@@ -571,6 +572,7 @@ impl Workspace {
                 tx_top_anchors_scratch: Vec::new(),
                 mins_scratch: Vec::new(),
                 explorer,
+                explorer_error: warning.clone(),
                 explorer_root,
                 root_label,
                 explorer_visible: metadata.explorer_visible,
@@ -1223,8 +1225,17 @@ impl Workspace {
     }
 
     pub(crate) fn retry_explorer(&mut self) -> io::Result<()> {
-        let exp = Explorer::new(self.explorer_root.clone())?;
+        let exp = match Explorer::new(self.explorer_root.clone()) {
+            Ok(exp) => exp,
+            Err(error) => {
+                if self.explorer.is_none() {
+                    self.explorer_error = Some(error.to_string());
+                }
+                return Err(error);
+            }
+        };
         self.explorer = Some(exp);
+        self.explorer_error = None;
         self.sync_explorer_root();
         Ok(())
     }
@@ -1233,6 +1244,28 @@ impl Workspace {
     /// update only after the explorer commits the move; `Ok(false)` means the
     /// explorer is already at the filesystem root.
     pub(crate) fn explorer_go_parent(&mut self) -> io::Result<bool> {
+        if self.explorer.is_none() {
+            let Some(parent) = self.explorer_root.parent() else {
+                return Ok(false);
+            };
+            if parent.as_os_str().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Explorer parent path unavailable; F5 retries the listing",
+                ));
+            }
+            let explorer = match Explorer::new(parent.to_path_buf()) {
+                Ok(explorer) => explorer,
+                Err(error) => {
+                    self.explorer_error = Some(error.to_string());
+                    return Err(error);
+                }
+            };
+            self.explorer = Some(explorer);
+            self.sync_explorer_root();
+            self.explorer_error = None;
+            return Ok(true);
+        }
         let moved = self
             .explorer
             .as_mut()
@@ -1355,6 +1388,27 @@ pub(crate) fn resolve_canonical_path(path: &Path) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn polish_explorer_unavailable_retry_and_parent_are_transactional() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("missing");
+        let (mut ws, warning) = Workspace::new(root.clone());
+        assert!(warning.is_some());
+        assert!(ws.explorer_error.is_some());
+        assert!(ws.retry_explorer().is_err());
+        assert_eq!(ws.explorer_root, root);
+        assert!(ws.explorer_go_parent().unwrap());
+        assert_eq!(ws.explorer_root, dir.path().canonicalize().unwrap());
+        assert!(ws.explorer_error.is_none());
+
+        let missing = dir.path().join("later");
+        let (mut ws, _) = Workspace::new(missing.clone());
+        std::fs::create_dir(&missing).unwrap();
+        ws.retry_explorer().unwrap();
+        assert!(ws.explorer_error.is_none());
+        assert!(ws.explorer.is_some());
+    }
 
     #[test]
     fn stable_ids_are_never_reused_across_domains() {

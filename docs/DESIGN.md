@@ -224,7 +224,11 @@ Scrollbar editor menempati jalur satu sel di dalam frame, bukan border pembatas 
 
 Explorer dan F1 memakai scrollbar vertikal dengan gaya yang sama. Rail Explorer hanya sejajar baris tree; parent row dan divider bukan bagian rail. Rail F1 hanya sejajar katalog yang di-wrap, tidak menyempitkan footer Esc/F1. Drag tidak memilih/membuka file atau mengubah field modal yang ditangguhkan; track konten yang muat tidak interaktif. Minimum track dua sel menjaga thumb tetap dapat dipakai. [Kontrak state](ARCHITECTURE.md#scrollbar-explorer-dan-f1).
 
+Explorer yang gagal memuat root tetap menampilkan kartu dengan penyebab dan hint F5 Retry, serta Bksp Up/parent row bila parent diketahui. F2 dapat memfokuskan kartu; helper tidak menawarkan Open tanpa listing atau Up tanpa parent. Pemilihan entri ber-issue menampilkan penyebab di status tanpa perlu membuka file. Mengetik prefix melompat pada row yang sudah dimuat (bukan filter); timeout 900 ms, satu karakter berulang menggilir kecocokan, navigasi/mouse/fokus mereset prefix.
+
 Field path/Find/Replace menampilkan `‹`/`›` saat teks berada di luar window (`<`/`>` pada ASCII, termasuk mode tanpa warna). Jika window dasar menyembunyikan teks dan tersedia minimal tiga sel nilai, dua gutter satu sel dipisahkan dari teks; sisi yang tidak overflow kosong. Indikator tidak dapat diklik untuk memindahkan caret/fokus atau ikut terseleksi; prefix tetap terpisah. Dengan satu/dua sel nilai, gutter tidak dibuat agar caret tetap terlihat. Pemotongan sebagian grapheme tetap memakai marker clipping lama; [kontrak byte/hit](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan).
+
+Field memiliki undo/redo lokal: Ctrl+Z, Ctrl+Y atau Ctrl+Shift+Z memulihkan teks serta cursor/seleksi hanya pada field aktif, termasuk sesudah F1. Ctrl+Backspace/Delete menghapus seleksi atau kata sesuai boundary Ctrl+Left/Right. Drag yang ditahan di luar tepi teks memperluas seleksi dan menggeser window tanpa mengubah isi field; release, key, modal/fokus atau resize menghentikannya. Ctrl+Backspace/Ctrl+Shift+Z memerlukan terminal yang mengirim encoding tombol termodifikasi; byte legacy Ctrl+H tetap Backspace. [Kontrak dan batas history](ARCHITECTURE.md#kontrak-ergonomi-field-dan-navigasi-explorer).
 
 ## Shortcut runtime
 
@@ -234,7 +238,7 @@ Field path/Find/Replace menampilkan `‹`/`›` saat teks berada di luar window 
 | Ctrl+S | Save dokumen aktif; dokumen tanpa path membuka Save As |
 | Ctrl+O | Dialog Open path, menambah/mengaktifkan tab |
 | Ctrl+N | Tab dokumen baru |
-| Ctrl+Z / Ctrl+Y | Undo / redo pada dokumen aktif |
+| Ctrl+Z / Ctrl+Y | Undo / redo dokumen atau field aktif sesuai fokus; tidak menembus modal |
 | Tab di editor | Spasi sampai tab stop 4; bila seleksi melintasi newline, tambah empat spasi pada setiap baris tersentuh |
 | Shift+Tab di editor | Kurangi satu tab awal atau hingga empat spasi pada baris aktif/terpilih; satu undo per blok |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste saat fokus di editor |
@@ -248,6 +252,7 @@ Field path/Find/Replace menampilkan `‹`/`›` saat teks berada di luar window 
 | Alt+Left/Right atau Ctrl+PageUp/Down | Pindah tab dalam panel aktif |
 | Ctrl+B / F2 | Toggle explorer / pindah fokus explorer-editor |
 | Right/Left, Enter, F5 di explorer | Expand/collapse, buka/toggle, refresh |
+| Ketik prefix di explorer | Lompat ke nama yang cocok; karakter tunggal berulang menggilir kecocokan dengan wrap |
 | Enter/F3 / Shift+F3 | Hasil berikutnya / sebelumnya dengan wrap |
 | F6 / F7 dalam Replace | Ganti hasil aktif / Replace All satu undo |
 | F8 / F9 | Split kiri-kanan / atas-bawah |

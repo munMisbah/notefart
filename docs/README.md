@@ -220,6 +220,10 @@ Baris panjang memakai cache geometri sparse per dokumen sehingga posisi cursor, 
 
 ### Validasi release terbaru
 
+Field path/Find/Replace kini memiliki undo/redo lokal, penghapusan kata dan drag autoscroll. Explorer mendukung type-ahead pada row ter-load dan kartu error dengan F5 Retry serta Up bila parent diketahui. Ctrl+Backspace/Ctrl+Shift+Z memerlukan encoding xterm modifyOtherKeys; byte Ctrl+H legacy tidak dapat dibedakan dari Backspace. [Kontrak ergonomi dan navigasi](ARCHITECTURE.md#kontrak-ergonomi-field-dan-navigasi-explorer).
+
+Sebanyak 24 kasus target berbeda dan smoke TUI terarah lulus: history/drag field, ekspor query identik byte, type-ahead, resize/F1 serta jalur modified keys/error card. Input/negative dan permission dikerjakan DeepSeek atmo; QA normal oleh Terra Codex. Bukan suite seluruh target atau bukti font/mouse fisik. [Bukti ergonomi, hash dan batas](ROADMAP.md#hasil-ergonomi-field-dan-navigasi-explorer).
+
 F11 atau Alt+P membuka **Appearance** untuk tema, mode warna dan profil ikon. Panah atau T/C/I mengubah draft; Apply/Enter menerapkan untuk run ini, Esc membatalkan, dan F1 memulihkan draft/fokus saat kembali. Keyboard dan mouse tersedia pada minimal 40×10; di bawahnya hanya Esc/F1. Tidak mengubah konfigurasi tersimpan, clipboard atau font terminal. [Kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
 
 Empat tes Appearance serta smoke TUI nyata melalui `openai-codex/gpt-6.1-terra` lulus, termasuk Auto yang tetap menjadi pilihan Auto, override Truecolor/Nerd dan kontrol minimum/tiny. Fixture/config tidak berubah dan aplikasi keluar 0; bukan bukti font/glass atau mouse fisik. [Bukti switcher, hash dan batas](ROADMAP.md#hasil-switcher-tampilan-runtime).

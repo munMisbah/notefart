@@ -146,6 +146,7 @@ enum DragState {
     },
     Field {
         kind: FieldKind,
+        x: u16,
     },
 }
 
@@ -272,6 +273,7 @@ struct App {
     hl_ranges_scratch: Vec<Range<usize>>,
     scroll_scan_cursor: usize,
     scroll_metrics_dirty: bool,
+    explorer_jump: Option<(String, Instant)>,
 }
 
 impl App {
@@ -327,6 +329,7 @@ impl App {
             hl_ranges_scratch: Vec::new(),
             scroll_scan_cursor: 0,
             scroll_metrics_dirty: false,
+            explorer_jump: None,
         }
     }
 
@@ -1767,12 +1770,6 @@ impl App {
                         self.modal_paste();
                         return;
                     }
-                    KeyCode::Char('z')
-                    | KeyCode::Char('Z')
-                    | KeyCode::Char('y')
-                    | KeyCode::Char('Y') => {
-                        return;
-                    }
                     _ => {}
                 }
             }
@@ -1995,12 +1992,6 @@ impl App {
                     self.modal_paste();
                     return;
                 }
-                KeyCode::Char('z')
-                | KeyCode::Char('Z')
-                | KeyCode::Char('y')
-                | KeyCode::Char('Y') => {
-                    return;
-                }
                 KeyCode::Char('u') | KeyCode::Char('U') => {
                     if replace_mode && replacement_focus {
                         self.search.replacement.clear();
@@ -2201,6 +2192,27 @@ impl App {
         self.invalidate_hit_targets();
     }
 
+    fn explorer_parent_available(&self) -> bool {
+        self.workspace
+            .explorer_root
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+    }
+
+    fn explorer_unavailable_message(&self) -> String {
+        let cause = self
+            .workspace
+            .explorer_error
+            .as_deref()
+            .unwrap_or("listing unavailable");
+        let actions = if self.explorer_parent_available() {
+            "F5 Retry / Bksp Up"
+        } else {
+            "F5 Retry"
+        };
+        format!("Explorer unavailable: {cause}; {actions}")
+    }
+
     fn toggle_focus(&mut self) {
         if self.workspace.explorer_focused {
             self.workspace.explorer_focused = false;
@@ -2214,13 +2226,6 @@ impl App {
             );
             return;
         }
-        if self.workspace.explorer.is_none() {
-            self.status = StatusMessage::new(
-                StatusLevel::Warning,
-                "Explorer unavailable; press F5 to retry".into(),
-            );
-            return;
-        }
         if !self.explorer_fits_viewport() {
             self.status = StatusMessage::new(
                 StatusLevel::Warning,
@@ -2229,7 +2234,20 @@ impl App {
             return;
         }
         self.workspace.explorer_focused = true;
-        self.status = StatusMessage::new(StatusLevel::Info, "Explorer focused".into());
+        if !self.show_explorer_issue() {
+            self.status = StatusMessage::new(
+                if self.workspace.explorer.is_some() {
+                    StatusLevel::Info
+                } else {
+                    StatusLevel::Warning
+                },
+                if self.workspace.explorer.is_some() {
+                    "Explorer focused".into()
+                } else {
+                    self.explorer_unavailable_message()
+                },
+            );
+        }
     }
 
     fn refresh_explorer(&mut self) {
@@ -2397,15 +2415,85 @@ impl App {
         }
     }
 
+    fn show_explorer_issue(&mut self) -> bool {
+        let Some(entry) = self
+            .workspace
+            .explorer
+            .as_ref()
+            .and_then(|exp| exp.selected_entry())
+        else {
+            return false;
+        };
+        let Some(issue) = entry.issue.as_ref() else {
+            return false;
+        };
+        self.status = StatusMessage::new(
+            StatusLevel::Warning,
+            format!("Explorer: {}: {issue}", entry.name.to_string_lossy()),
+        );
+        true
+    }
+
+    fn explorer_type_ahead(&mut self, ch: char, now: Instant) {
+        let (prefix, last) = self
+            .explorer_jump
+            .get_or_insert_with(|| (String::new(), now));
+        if now.saturating_duration_since(*last) >= Duration::from_millis(900) {
+            prefix.clear();
+        }
+        let repeated = prefix.chars().eq(ch.to_lowercase());
+        let from_next = prefix.is_empty() || repeated;
+        if !repeated {
+            let added = ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            if prefix.len() + added > 256 {
+                self.status = StatusMessage::new(
+                    StatusLevel::Warning,
+                    "Explorer jump prefix limit: 256 bytes".into(),
+                );
+                return;
+            }
+            prefix.extend(ch.to_lowercase());
+        }
+        *last = now;
+        let matched = self
+            .workspace
+            .explorer
+            .as_mut()
+            .is_some_and(|exp| exp.jump_to_prefix(prefix, from_next));
+        self.status = StatusMessage::new(
+            if matched {
+                StatusLevel::Info
+            } else {
+                StatusLevel::Warning
+            },
+            if matched {
+                format!("Jump: {prefix}")
+            } else {
+                format!("No entry starts with: {prefix}")
+            },
+        );
+        self.ensure_explorer_visible();
+        if matched {
+            self.show_explorer_issue();
+        }
+        self.invalidate_hit_targets();
+    }
+
     fn explorer_key(&mut self, key: KeyEvent) {
-        if !self.workspace.explorer_visible
-            || self.workspace.explorer.is_none()
-            || !self.explorer_fits_viewport()
-        {
+        if !self.workspace.explorer_visible || !self.explorer_fits_viewport() {
             self.status = StatusMessage::new(
                 StatusLevel::Warning,
                 "Explorer hidden on narrow screen; press Esc or F2 for editor".into(),
             );
+            return;
+        }
+        if self.workspace.explorer.is_none() {
+            if key.code == KeyCode::Backspace {
+                self.explorer_go_parent();
+            } else {
+                self.status =
+                    StatusMessage::new(StatusLevel::Warning, self.explorer_unavailable_message());
+            }
             return;
         }
         let page_step = isize::try_from(self.explorer_view_height().max(1)).unwrap_or(1);
@@ -2468,14 +2556,42 @@ impl App {
             // Backspace browses the filesystem parent; it never reaches the
             // document because explorer focus consumes the key here.
             KeyCode::Backspace => self.explorer_go_parent(),
+            KeyCode::Char(ch) if !ch.is_control() => self.explorer_type_ahead(ch, Instant::now()),
             _ => {}
+        }
+        if matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        ) && !self.show_explorer_issue()
+        {
+            self.status = StatusMessage::new(
+                StatusLevel::Info,
+                format!("Explorer: {}", self.workspace.root_label),
+            );
         }
     }
 
     fn key(&mut self, key: KeyEvent) {
-        if matches!(self.drag, Some(DragState::Scrollbar { .. })) {
+        if matches!(
+            self.drag,
+            Some(DragState::Scrollbar { .. } | DragState::Field { .. })
+        ) {
             self.drag = None;
             self.dragged = false;
+        }
+        if !(self.modal.is_none()
+            && self.workspace.explorer_focused
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char(ch) if !ch.is_control()))
+        {
+            self.explorer_jump = None;
         }
         if self.modal.is_some() {
             self.modal_key(key);
@@ -2774,11 +2890,38 @@ impl App {
         }
     }
 
+    fn modal_field_mut(&mut self, kind: FieldKind) -> Option<&mut Field> {
+        match (&mut self.modal, kind) {
+            (Some(Modal::Path { value, .. }), FieldKind::Path) => Some(value),
+            (
+                Some(Modal::Search {
+                    replacement_focus: false,
+                    ..
+                }),
+                FieldKind::Query,
+            ) => Some(&mut self.search.query),
+            (
+                Some(Modal::Search {
+                    replace_mode: true,
+                    replacement_focus: true,
+                }),
+                FieldKind::Replacement,
+            ) => Some(&mut self.search.replacement),
+            _ => None,
+        }
+    }
+
     fn modal_mouse(&mut self, mouse: MouseEvent) {
         if matches!(mouse.kind, MouseEventKind::Up(_)) {
             self.drag = None;
             self.dragged = false;
             return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
+            && let Some(DragState::Field { x, .. }) = &mut self.drag
+        {
+            *x = mouse.column;
+            self.dragged = true;
         }
         let continues_help_drag = matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
             && matches!(
@@ -2833,20 +2976,13 @@ impl App {
                     }
                     let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
                     let byte = byte_for_column(&hit.stops, mouse.column);
-                    match kind {
-                        FieldKind::Path => {
-                            if let Some(Modal::Path { value, .. }) = &mut self.modal {
-                                value.move_to(byte, shift);
-                            }
-                        }
-                        FieldKind::Query => {
-                            self.search.query.move_to(byte, shift);
-                        }
-                        FieldKind::Replacement => {
-                            self.search.replacement.move_to(byte, shift);
-                        }
+                    if let Some(field) = self.modal_field_mut(kind) {
+                        field.move_to(byte, shift);
                     }
-                    self.drag = Some(DragState::Field { kind });
+                    self.drag = Some(DragState::Field {
+                        kind,
+                        x: mouse.column,
+                    });
                     self.dragged = false;
                     self.invalidate_hit_targets_keep_drag();
                 }
@@ -2856,24 +2992,14 @@ impl App {
                     self.drag_scrollbar(mouse);
                     return;
                 }
-                if let Some(DragState::Field { kind }) = self.drag {
+                if let Some(DragState::Field { kind, .. }) = self.drag {
                     if let Some(hit) = self.geometry.fields.iter().find(|f| f.kind == kind) {
                         let clamped_x = mouse
                             .column
                             .clamp(hit.area.left(), hit.area.right().saturating_sub(1));
                         let byte = byte_for_column(&hit.stops, clamped_x);
-                        match kind {
-                            FieldKind::Path => {
-                                if let Some(Modal::Path { value, .. }) = &mut self.modal {
-                                    value.move_to(byte, true);
-                                }
-                            }
-                            FieldKind::Query => {
-                                self.search.query.move_to(byte, true);
-                            }
-                            FieldKind::Replacement => {
-                                self.search.replacement.move_to(byte, true);
-                            }
+                        if let Some(field) = self.modal_field_mut(kind) {
+                            field.move_to(byte, true);
                         }
                         self.dragged = true;
                         self.invalidate_hit_targets_keep_drag();
@@ -2901,6 +3027,7 @@ impl App {
     }
 
     fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
+        self.explorer_jump = None;
         if self.modal.is_some() {
             self.modal_mouse(mouse);
             return;
@@ -3547,7 +3674,46 @@ impl App {
         changed || viewport_changed
     }
 
+    fn field_drag_tick(&mut self) -> bool {
+        if !self.dragged || !self.hit_targets_valid {
+            return false;
+        }
+        let Some(DragState::Field { kind, x }) = self.drag else {
+            return false;
+        };
+        let Some(area) = self
+            .geometry
+            .fields
+            .iter()
+            .find(|hit| hit.kind == kind)
+            .map(|hit| hit.area)
+            .filter(|area| !area.is_empty())
+        else {
+            return false;
+        };
+        let code = if x < area.left() {
+            KeyCode::Left
+        } else if x >= area.right() {
+            KeyCode::Right
+        } else {
+            return false;
+        };
+        let Some(field) = self.modal_field_mut(kind) else {
+            return false;
+        };
+        let before = field.view().cursor;
+        field.handle_key(KeyEvent::new(code, KeyModifiers::SHIFT));
+        let changed = field.view().cursor != before;
+        if changed {
+            self.invalidate_hit_targets_keep_drag();
+        }
+        changed
+    }
+
     fn drag_tick(&mut self) -> bool {
+        if matches!(self.drag, Some(DragState::Field { .. })) {
+            return self.field_drag_tick();
+        }
         let Some(DragState::Text {
             pane_id,
             view_id,
@@ -3871,6 +4037,12 @@ impl App {
             dirty,
             dialog,
             explorer,
+            explorer_error: if self.workspace.explorer_visible {
+                self.workspace.explorer_error.as_deref()
+            } else {
+                None
+            },
+            explorer_parent: self.explorer_parent_available(),
             sidebar_width: self.workspace.sidebar_width,
             explorer_focused: self.workspace.explorer_focused,
             theme: &self.theme,
@@ -4201,6 +4373,215 @@ mod tests {
             next_tab: None,
             ..PaneGeometry::default()
         }];
+    }
+
+    #[test]
+    fn polish_app_field_drag_extends_without_edit_and_stops_on_release_or_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.open_search_modal(true);
+        let text = "word ".repeat(200);
+        app.search.query = Field::new(text.clone());
+        app.search.query.move_to(0, false);
+        app.search.replacement = Field::from("untouched");
+        let revision = app.search.query.revision();
+        draw_frame(&mut app, 80, 24);
+        let area = app
+            .geometry
+            .fields
+            .iter()
+            .find(|hit| hit.kind == FieldKind::Query)
+            .unwrap()
+            .area;
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(down, Instant::now());
+        draw_frame(&mut app, 80, 24);
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: area.right() + 1,
+                row: area.y + 1,
+                ..down
+            },
+            Instant::now(),
+        );
+        draw_frame(&mut app, 80, 24);
+        let before = app.search.query.cursor();
+        let anchor = app.search.query.selection().unwrap().start;
+        assert!(app.drag_tick());
+        let after = app.search.query.cursor();
+        assert!(after > before);
+        assert_eq!(app.search.query.selection(), Some(anchor..after));
+        assert!(!app.drag_tick());
+        assert_eq!(app.search.query.cursor(), after);
+        assert_eq!(app.search.query.as_str(), text);
+        assert_eq!(app.search.query.revision(), revision);
+        assert_eq!(app.search.replacement.as_str(), "untouched");
+        draw_frame(&mut app, 80, 24);
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: area.right() + 1,
+                ..down
+            },
+            Instant::now(),
+        );
+        assert!(!app.drag_tick());
+        let area = app
+            .geometry
+            .fields
+            .iter()
+            .find(|hit| hit.kind == FieldKind::Query)
+            .unwrap()
+            .area;
+        app.mouse(
+            MouseEvent {
+                column: area.x,
+                row: area.y,
+                ..down
+            },
+            Instant::now(),
+        );
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: area.right() + 1,
+                row: area.y,
+                ..down
+            },
+            Instant::now(),
+        );
+        app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        draw_frame(&mut app, 80, 24);
+        assert!(!app.drag_tick());
+        assert_eq!(app.search.query.cursor(), 0);
+    }
+
+    #[test]
+    fn polish_unavailable_parent_is_not_advertised_or_misreported_as_root() {
+        let dir = tempfile::tempdir().unwrap();
+        for icons in [IconMode::Ascii, IconMode::Unicode, IconMode::Nerd] {
+            let mut app = App::new_with_root(
+                dir.path().to_path_buf(),
+                Options {
+                    icons,
+                    ..internal_options()
+                },
+            );
+            app.replace_in_active_tab("keep");
+            let revision = app.workspace.active_document().unwrap().document.revision();
+            app.workspace.explorer = None;
+            app.workspace.explorer_root = PathBuf::from(".");
+            app.workspace.root_label = ".".into();
+            app.workspace.explorer_error = Some("working directory unavailable".into());
+            app.key(fkey(2));
+            assert!(app.workspace.explorer_focused);
+            let terminal = draw_frame(&mut app, 80, 24);
+            let panel = app.geometry.sidebar_panel.unwrap();
+            assert!(app.geometry.sidebar_parent.is_none());
+            assert!(app.geometry.sidebar.is_none());
+            assert!(
+                !app.geometry
+                    .commands
+                    .iter()
+                    .any(|hit| matches!(hit.key.code, KeyCode::Backspace | KeyCode::Enter))
+            );
+            let mut card = String::new();
+            for y in panel.top()..panel.bottom() {
+                for x in panel.left()..panel.right() {
+                    card.push_str(terminal.backend().buffer()[(x, y)].symbol());
+                }
+                card.push('\n');
+            }
+            assert!(card.contains("F5 Retry"));
+            assert!(!card.contains("Bksp Up"));
+            app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert_eq!(app.status.level, StatusLevel::Warning);
+            assert_eq!(app.workspace.explorer_root, PathBuf::from("."));
+            assert_eq!(
+                app.workspace.active_document().unwrap().document.revision(),
+                revision
+            );
+        }
+    }
+
+    #[test]
+    fn polish_app_explorer_prefix_lifecycle_and_unavailable_parent_preserve_document() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["alpha.txt", "beta.txt", "bravo.txt"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        let mut app = test_app(dir.path());
+        app.replace_in_active_tab("keep document");
+        let revision = app.workspace.active_document().unwrap().document.revision();
+        draw_frame(&mut app, 80, 24);
+        app.key(fkey(2));
+        let selected = |app: &App| {
+            app.workspace
+                .explorer
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .unwrap()
+                .name
+                .clone()
+        };
+        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(selected(&app), "beta.txt");
+        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(selected(&app), "bravo.txt");
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(selected(&app), "bravo.txt");
+        app.explorer_jump.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(2);
+        app.key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(selected(&app), "alpha.txt");
+        app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(selected(&app), "alpha.txt");
+        assert_eq!(app.status.level, StatusLevel::Warning);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.explorer_jump.is_none());
+        assert_eq!(
+            app.workspace.active_document().unwrap().document.revision(),
+            revision
+        );
+        assert_eq!(
+            app.workspace
+                .active_document()
+                .unwrap()
+                .document
+                .text()
+                .to_string(),
+            "keep document"
+        );
+
+        let mut unavailable = test_app(&dir.path().join("missing"));
+        draw_frame(&mut unavailable, 80, 24);
+        assert!(unavailable.geometry.sidebar_panel.is_some());
+        assert!(unavailable.geometry.sidebar.is_none());
+        assert!(unavailable.geometry.sidebar_scrollbar.is_none());
+        unavailable.key(fkey(2));
+        assert!(unavailable.workspace.explorer_focused);
+        unavailable.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(unavailable.workspace.explorer_root, dir.path());
+        assert!(unavailable.workspace.explorer_error.is_none());
+        assert_eq!(
+            unavailable
+                .workspace
+                .explorer
+                .as_ref()
+                .unwrap()
+                .rows()
+                .iter()
+                .map(|entry| entry.name.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["alpha.txt", "beta.txt", "bravo.txt"],
+        );
     }
 
     #[test]
@@ -6559,7 +6940,20 @@ mod tests {
 
         // Ctrl+Z / Ctrl+Y while modal open does not reach document
         app.modal_key(ctrl('z'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Path { value, .. }) if value.as_str() == "dialogtext")
+        );
+        app.key(fkey(1));
+        app.key(fkey(1));
         app.modal_key(ctrl('y'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Path { value, .. }) if value.as_str() == "dialogtext_path_")
+        );
+        app.modal_key(ctrl('u'));
+        app.modal_key(ctrl('z'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Path { value, .. }) if value.as_str() == "dialogtext_path_")
+        );
         assert_eq!(
             app.workspace
                 .active_document()

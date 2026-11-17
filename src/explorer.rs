@@ -136,6 +136,26 @@ impl Explorer {
         }
     }
 
+    /// Selects a loaded UTF-8 name matching an already-lowercased prefix.
+    pub fn jump_to_prefix(&mut self, prefix: &str, from_next: bool) -> bool {
+        let len = self.rows.len();
+        if prefix.is_empty() || len == 0 {
+            return false;
+        }
+        let start = (self.selected + usize::from(from_next)) % len;
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            if self.rows[index].name.to_str().is_some_and(|name| {
+                let mut chars = name.chars().flat_map(char::to_lowercase);
+                prefix.chars().all(|ch| chars.next() == Some(ch))
+            }) {
+                self.selected = index;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn move_by(&mut self, delta: isize) {
         if self.rows.is_empty() {
             self.selected = 0;
@@ -388,6 +408,25 @@ mod tests {
             .iter()
             .map(|e| e.name.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn polish_explorer_prefix_cycles_unicode_without_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Älpha"), "").unwrap();
+        fs::write(dir.path().join("äther"), "").unwrap();
+        let mut explorer = Explorer::new(dir.path().to_path_buf()).unwrap();
+        fs::write(dir.path().join("änew"), "").unwrap();
+        assert!(explorer.jump_to_prefix("ä", false));
+        let first = explorer.selected();
+        assert!(explorer.jump_to_prefix("ä", true));
+        assert_ne!(explorer.selected(), first);
+        assert!(explorer.jump_to_prefix("ä", true));
+        assert_eq!(explorer.selected(), first);
+        explorer.set_top(1);
+        assert!(!explorer.jump_to_prefix("änew", false));
+        assert_eq!((explorer.selected(), explorer.top()), (first, 1));
+        assert!(!explorer.jump_to_prefix("", false));
     }
 
     #[test]

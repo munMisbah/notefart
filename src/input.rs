@@ -10,6 +10,9 @@
 //!   - Standard arrows (Up, Down, Right, Left) and modified arrows (Shift, Ctrl, Alt).
 //!   - Home, End, PageUp, PageDown, Insert, Delete, BackTab (Shift+Tab).
 //!   - Function keys F1–F12 (SS3 and CSI encodings).
+//!   - xterm `modifyOtherKeys` (`CSI 27 ; modifier ; codepoint ~`) for modified
+//!     Backspace, Tab, Enter, Esc, and printable Unicode. Other C0 code points,
+//!     invalid modifiers, and invalid Unicode scalars are discarded.
 //! - SGR 1006 mouse protocol:
 //!   - Press, release, drag, move.
 //!   - Left, middle, right buttons.
@@ -727,6 +730,13 @@ fn parse_csi(csi_bytes: &[u8]) -> Option<EscapeParseResult> {
                 return None;
             }
             let code_num = params[0];
+
+            // xterm modifyOtherKeys: `CSI 27 ; modifier ; codepoint ~`. Handled
+            // before the legacy numeric `~` table because 27 is not a legacy code.
+            if code_num == 27 {
+                return parse_modify_other_keys(&params, count);
+            }
+
             let modifiers = if count >= 2 {
                 modifier_from_param(params[1])
             } else {
@@ -908,6 +918,42 @@ fn modifier_from_param(param: u32) -> KeyModifiers {
         mods |= KeyModifiers::CONTROL;
     }
     mods
+}
+
+/// Decodes xterm `modifyOtherKeys` (`CSI 27 ; modifier ; codepoint ~`).
+///
+/// Only the standard xterm modifier range `1..=8` is accepted. Key codes 8/127,
+/// 9, 13, and 27 map to the same keys as the legacy C0 path; other C0/C1 code
+/// points are unsupported and discarded. Printable code points become
+/// `KeyCode::Char` without case folding, so the terminal's emitted code point is
+/// preserved.
+fn parse_modify_other_keys(params: &[u32; 4], count: usize) -> Option<EscapeParseResult> {
+    if count != 3 {
+        return None;
+    }
+
+    let modifier = params[1];
+    if !(1..=8).contains(&modifier) {
+        return None;
+    }
+
+    let key_code = match params[2] {
+        8 | 127 => KeyCode::Backspace,
+        9 => KeyCode::Tab,
+        13 => KeyCode::Enter,
+        27 => KeyCode::Esc,
+        codepoint => {
+            let ch = char::from_u32(codepoint)?;
+            if ch.is_control() {
+                return None;
+            }
+            KeyCode::Char(ch)
+        }
+    };
+
+    Some(EscapeParseResult::Event(InputEvent::Terminal(Event::Key(
+        KeyEvent::new(key_code, modifier_from_param(modifier)),
+    ))))
 }
 
 #[cfg(test)]
@@ -1105,6 +1151,191 @@ mod tests {
                 KeyModifiers::SHIFT
             ))))
         );
+    }
+
+    fn terminal_key(code: KeyCode, modifiers: KeyModifiers) -> Option<InputEvent> {
+        Some(InputEvent::Terminal(Event::Key(KeyEvent::new(
+            code, modifiers,
+        ))))
+    }
+
+    #[test]
+    fn polish_keys_modify_other_keys_modified_backspace() {
+        let mut dec = StreamingDecoder::new();
+        dec.feed(b"\x1b[27;5;127~\x1b[27;3;8~\x1b[27;2;127~\x1b[27;1;8~");
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::ALT)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::SHIFT)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::NONE)
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_modify_other_keys_named_c0_keys() {
+        let mut dec = StreamingDecoder::new();
+        dec.feed(b"\x1b[27;5;9~\x1b[27;6;13~\x1b[27;3;27~");
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Tab, KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Esc, KeyModifiers::ALT)
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_ctrl_delete_existing() {
+        let mut dec = StreamingDecoder::new();
+        dec.feed(b"\x1b[3;5~\x1b[3;6~");
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Delete, KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Delete, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_modify_other_keys_ctrl_shift_z() {
+        let mut dec = StreamingDecoder::new();
+        dec.feed(b"\x1b[27;6;90~\x1b[27;6;122~");
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_modify_other_keys_unicode() {
+        let mut dec = StreamingDecoder::new();
+        // é (U+00E9), 😀 (U+1F600), space, and Esc through modifyOtherKeys.
+        dec.feed(b"\x1b[27;5;233~\x1b[27;3;128512~\x1b[27;1;32~\x1b[27;5;27~");
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char('é'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char('😀'), KeyModifiers::ALT)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char(' '), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Esc, KeyModifiers::CONTROL)
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_modify_other_keys_fragmented() {
+        let mut dec = StreamingDecoder::new();
+
+        dec.feed(b"\x1b[27");
+        assert_eq!(dec.next_event(), None);
+        dec.feed(b";5;12");
+        assert_eq!(dec.next_event(), None);
+        dec.feed(b"7~");
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::CONTROL)
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_modify_other_keys_invalid_ignored() {
+        let mut dec = StreamingDecoder::new();
+        dec.feed(
+            b"\x1b[27;5~\x1b[27;5;127;1~\x1b[27;0;127~\x1b[27;9;127~\
+              \x1b[27;5;1114112~\x1b[27;5;55296~\x1b[27;5;1~\x1b[27;5;10~\
+              \x1b[27;5;133~\x1b[27;5;4294967296;1~a",
+        );
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        );
+        assert_eq!(dec.next_event(), None);
+    }
+
+    #[test]
+    fn polish_keys_legacy_control_bytes_unchanged() {
+        let mut dec = StreamingDecoder::new();
+        dec.feed(b"\x7f\x08\t\r\n\x1a\x01\x00");
+
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Backspace, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Tab, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Enter, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Enter, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            dec.next_event(),
+            terminal_key(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        );
+        assert_eq!(dec.next_event(), None);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -17,12 +18,33 @@ pub(crate) enum FieldKind {
     Replacement,
 }
 
+const HISTORY_TRANSACTIONS: usize = 128;
+const HISTORY_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Edit {
+    start: usize,
+    removed: String,
+    inserted: String,
+    before: (usize, Option<usize>),
+    after: (usize, Option<usize>),
+}
+
+impl Edit {
+    fn payload(&self) -> usize {
+        self.removed.len() + self.inserted.len()
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Field {
     text: String,
     cursor: usize,
     anchor: Option<usize>,
     revision: u64,
+    undo: VecDeque<Edit>,
+    redo: Vec<Edit>,
+    history_bytes: usize,
 }
 
 impl Field {
@@ -33,6 +55,9 @@ impl Field {
             cursor,
             anchor: None,
             revision: 0,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            history_bytes: 0,
         }
     }
 
@@ -72,15 +97,7 @@ impl Field {
     }
 
     pub(crate) fn clear(&mut self) {
-        if !self.text.is_empty() {
-            self.text.clear();
-            self.cursor = 0;
-            self.anchor = None;
-            self.revision = self.revision.saturating_add(1);
-        } else {
-            self.cursor = 0;
-            self.anchor = None;
-        }
+        self.replace(0..self.text.len(), "");
     }
 
     pub(crate) fn insert(&mut self, text: &str, limit: usize) -> bool {
@@ -95,28 +112,97 @@ impl Field {
             return false;
         }
 
-        if let Some(range) = sel {
-            if &self.text[range.clone()] == text {
-                // Equal replacement: true no-op; revision unchanged
-                self.cursor = range.start + text.len();
-                self.anchor = None;
-                return true;
-            }
-            self.text.replace_range(range.clone(), text);
-            self.cursor = range.start + text.len();
-            self.anchor = None;
-            self.revision = self.revision.saturating_add(1);
-        } else {
-            if text.is_empty() {
-                return true;
-            }
-            self.text.insert_str(self.cursor, text);
-            self.cursor += text.len();
-            self.anchor = None;
-            self.revision = self.revision.saturating_add(1);
-        }
-        self.clamp_cursor_and_anchor();
+        let range = sel.unwrap_or(self.cursor..self.cursor);
+        self.replace(range, text);
         true
+    }
+
+    fn replace(&mut self, range: Range<usize>, text: &str) {
+        if &self.text[range.clone()] == text {
+            if !range.is_empty() {
+                self.cursor = range.end;
+                self.anchor = None;
+            }
+            return;
+        }
+        let mut edit = Edit {
+            start: range.start,
+            removed: self.text[range.clone()].to_owned(),
+            inserted: text.to_owned(),
+            before: (self.cursor, self.anchor),
+            after: (0, None),
+        };
+        self.text.replace_range(range, text);
+        self.cursor = edit.start + text.len();
+        self.anchor = None;
+        self.clamp_cursor_and_anchor();
+        edit.after = (self.cursor, self.anchor);
+        self.revision = self.revision.saturating_add(1);
+
+        for discarded in self.redo.drain(..) {
+            self.history_bytes -= discarded.payload();
+        }
+        let bytes = edit.payload();
+        if bytes > HISTORY_BYTES {
+            self.undo.clear();
+            self.history_bytes = 0;
+            return;
+        }
+        while self.undo.len() >= HISTORY_TRANSACTIONS || self.history_bytes + bytes > HISTORY_BYTES
+        {
+            if let Some(oldest) = self.undo.pop_front() {
+                self.history_bytes -= oldest.payload();
+            }
+        }
+        self.history_bytes += bytes;
+        self.undo.push_back(edit);
+    }
+
+    fn undo(&mut self) {
+        if let Some(edit) = self.undo.pop_back() {
+            self.text
+                .replace_range(edit.start..edit.start + edit.inserted.len(), &edit.removed);
+            (self.cursor, self.anchor) = edit.before;
+            self.revision = self.revision.saturating_add(1);
+            self.redo.push(edit);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(edit) = self.redo.pop() {
+            self.text
+                .replace_range(edit.start..edit.start + edit.removed.len(), &edit.inserted);
+            (self.cursor, self.anchor) = edit.after;
+            self.revision = self.revision.saturating_add(1);
+            self.undo.push_back(edit);
+        }
+    }
+
+    fn delete(&mut self, backward: bool, word: bool) {
+        let range = self.selection().unwrap_or_else(|| {
+            if backward {
+                let start = if word {
+                    prev_word_boundary(&self.text, self.cursor)
+                } else {
+                    self.text[..self.cursor]
+                        .grapheme_indices(true)
+                        .next_back()
+                        .map_or(0, |(i, _)| i)
+                };
+                start..self.cursor
+            } else {
+                let end = if word {
+                    next_word_boundary(&self.text, self.cursor)
+                } else {
+                    self.text[self.cursor..]
+                        .graphemes(true)
+                        .next()
+                        .map_or(self.cursor, |g| self.cursor + g.len())
+                };
+                self.cursor..end
+            }
+        });
+        self.replace(range, "");
     }
 
     pub(crate) fn move_to(&mut self, byte: usize, extend: bool) {
@@ -142,6 +228,22 @@ impl Field {
 
         if control {
             match key.code {
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    if shift {
+                        self.redo();
+                    } else {
+                        self.undo();
+                    }
+                    return true;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.redo();
+                    return true;
+                }
+                KeyCode::Backspace | KeyCode::Delete => {
+                    self.delete(key.code == KeyCode::Backspace, true);
+                    return true;
+                }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     self.anchor = Some(0);
                     self.cursor = self.text.len();
@@ -220,42 +322,8 @@ impl Field {
                 self.move_to(len, shift);
                 true
             }
-            KeyCode::Backspace => {
-                if let Some(range) = self.selection() {
-                    self.text.drain(range.clone());
-                    self.cursor = range.start;
-                    self.anchor = None;
-                    self.revision = self.revision.saturating_add(1);
-                    self.clamp_cursor_and_anchor();
-                } else if self.cursor > 0 {
-                    if let Some((idx, _)) =
-                        self.text[..self.cursor].grapheme_indices(true).next_back()
-                    {
-                        self.text.drain(idx..self.cursor);
-                        self.cursor = idx;
-                        self.anchor = None;
-                        self.revision = self.revision.saturating_add(1);
-                        self.clamp_cursor_and_anchor();
-                    }
-                }
-                true
-            }
-            KeyCode::Delete => {
-                if let Some(range) = self.selection() {
-                    self.text.drain(range.clone());
-                    self.cursor = range.start;
-                    self.anchor = None;
-                    self.revision = self.revision.saturating_add(1);
-                    self.clamp_cursor_and_anchor();
-                } else if self.cursor < self.text.len() {
-                    if let Some((_, g)) = self.text[self.cursor..].grapheme_indices(true).next() {
-                        let end = self.cursor + g.len();
-                        self.text.drain(self.cursor..end);
-                        self.anchor = None;
-                        self.revision = self.revision.saturating_add(1);
-                        self.clamp_cursor_and_anchor();
-                    }
-                }
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.delete(key.code == KeyCode::Backspace, false);
                 true
             }
             _ => false,
@@ -474,5 +542,92 @@ mod tests {
             assert!(field.insert("x", 4096));
             assert_eq!(field.as_str(), format!("{merged}x"));
         }
+    }
+    #[test]
+    fn polish_field_history_selection_and_branching() {
+        let ctrl = KeyModifiers::CONTROL;
+        let mut f = Field::from("hello");
+        f.move_to(5, false);
+        f.move_to(1, true);
+        assert!(f.insert("", 100));
+        assert_eq!(f.as_str(), "h");
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), ctrl));
+        assert_eq!(
+            (f.as_str(), f.cursor(), f.selection()),
+            ("hello", 1, Some(1..5))
+        );
+        assert!(!f.insert("too long", 5));
+        assert!(f.insert("ello", 5));
+        f.handle_key(KeyEvent::new(KeyCode::Char('y'), ctrl));
+        assert_eq!(f.as_str(), "h");
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), ctrl));
+        assert!(f.insert("X", 100));
+        f.handle_key(KeyEvent::new(KeyCode::Char('y'), ctrl));
+        assert_eq!(f.as_str(), "hX");
+        f.clear();
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), ctrl));
+        assert_eq!(f.as_str(), "hX");
+        f.handle_key(KeyEvent::new(
+            KeyCode::Char('Z'),
+            ctrl | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(f.as_str(), "");
+    }
+
+    #[test]
+    fn polish_field_grapheme_seam_undo_redo() {
+        let mut f = Field::from("\u{301}x");
+        f.move_to(0, false);
+        f.insert("a", 100);
+        assert_eq!(f.cursor(), "a\u{301}".len());
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!((f.as_str(), f.cursor()), ("\u{301}x", 0));
+        f.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!((f.as_str(), f.cursor()), ("a\u{301}x", "a\u{301}".len()));
+    }
+
+    #[test]
+    fn polish_field_word_delete_matches_navigation() {
+        for (nav, delete) in [
+            (KeyCode::Left, KeyCode::Backspace),
+            (KeyCode::Right, KeyCode::Delete),
+        ] {
+            let mut f = Field::from("éclair,  世界!");
+            f.move_to("éclair,  ".len(), false);
+            let mut moved = f.clone();
+            moved.handle_key(KeyEvent::new(nav, KeyModifiers::CONTROL));
+            let range = f.cursor().min(moved.cursor())..f.cursor().max(moved.cursor());
+            let mut expected = f.as_str().to_owned();
+            expected.replace_range(range, "");
+            f.handle_key(KeyEvent::new(delete, KeyModifiers::CONTROL));
+            assert_eq!(f.as_str(), expected);
+            f.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+            assert_eq!(f.as_str(), "éclair,  世界!");
+        }
+    }
+
+    #[test]
+    fn polish_field_history_limits_preserve_chain() {
+        let ctrl = KeyModifiers::CONTROL;
+        let mut f = Field::default();
+        for _ in 0..130 {
+            f.insert("x", 200);
+        }
+        for _ in 0..130 {
+            f.handle_key(KeyEvent::new(KeyCode::Char('z'), ctrl));
+        }
+        assert_eq!(f.as_str(), "xx");
+        for _ in 0..130 {
+            f.handle_key(KeyEvent::new(KeyCode::Char('y'), ctrl));
+        }
+        assert_eq!(f.as_str(), "x".repeat(130));
+
+        let mut f = Field::default();
+        let chunk = "x".repeat(HISTORY_BYTES / 2 + 1);
+        f.insert(&chunk, usize::MAX);
+        f.insert(&chunk, usize::MAX);
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), ctrl));
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), ctrl));
+        assert_eq!(f.as_str(), chunk);
     }
 }

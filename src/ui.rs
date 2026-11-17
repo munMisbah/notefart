@@ -195,6 +195,8 @@ pub struct Screen<'a> {
     pub dirty: bool,
     pub dialog: Option<Dialog<'a>>,
     pub explorer: Option<&'a Explorer>,
+    pub explorer_error: Option<&'a str>,
+    pub explorer_parent: bool,
     pub sidebar_width: u16,
     pub explorer_focused: bool,
     pub theme: &'a Theme,
@@ -537,7 +539,7 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
         model.sidebar_width,
         active_min_w,
         (tree_min_w, tree_min_h),
-        model.explorer.is_some() && model.sidebar_width > 0,
+        (model.explorer.is_some() || model.explorer_error.is_some()) && model.sidebar_width > 0,
     );
 
     model.tree.layout(
@@ -558,41 +560,44 @@ pub fn draw(frame: &mut Frame, model: &Screen<'_>, geometry: &mut Geometry) {
 
     draw_header(frame, regions.header, regions.framed, model);
 
-    if let (Some(panel), Some(parent), Some(rows), Some(div), Some(explorer)) = (
+    if let (Some(panel), Some(parent), Some(rows), Some(div)) = (
         sidebar_areas.panel,
         sidebar_areas.parent,
         sidebar_areas.rows,
         sidebar_areas.divider,
-        model.explorer,
     ) {
-        draw_sidebar(frame, panel, parent, rows, div, explorer, model);
-        geometry.sidebar_scrollbar = sidebar_areas.scrollbar.map(|track| {
-            Scrollbar::new(
-                track,
-                Axis::Rows,
-                explorer.top(),
-                usize::from(rows.height),
-                explorer.rows().len(),
-            )
-        });
-        if let Some(bar) = geometry.sidebar_scrollbar {
-            draw_scrollbar(
-                frame,
-                bar.track,
-                Axis::Rows,
-                Some(bar),
-                model.explorer_focused,
-                model.theme,
-                model.icons,
-            );
+        draw_sidebar(frame, panel, parent, rows, div, model.explorer, model);
+        if let Some(explorer) = model.explorer {
+            geometry.sidebar_scrollbar = sidebar_areas.scrollbar.map(|track| {
+                Scrollbar::new(
+                    track,
+                    Axis::Rows,
+                    explorer.top(),
+                    usize::from(rows.height),
+                    explorer.rows().len(),
+                )
+            });
+            if let Some(bar) = geometry.sidebar_scrollbar {
+                draw_scrollbar(
+                    frame,
+                    bar.track,
+                    Axis::Rows,
+                    Some(bar),
+                    model.explorer_focused,
+                    model.theme,
+                    model.icons,
+                );
+            }
         }
         geometry.sidebar_panel = Some(panel);
-        geometry.sidebar_parent = if explorer.parent_path().is_some() {
+        geometry.sidebar_parent = if model.explorer.map_or(model.explorer_parent, |explorer| {
+            explorer.parent_path().is_some()
+        }) {
             Some(parent)
         } else {
             None
         };
-        geometry.sidebar = Some(rows);
+        geometry.sidebar = model.explorer.map(|_| rows);
         geometry.explorer_divider = Some(div);
     }
 
@@ -881,7 +886,7 @@ fn draw_sidebar(
     parent_rect: Rect,
     rows_rect: Rect,
     divider_rect: Rect,
-    explorer: &Explorer,
+    explorer: Option<&Explorer>,
     model: &Screen<'_>,
 ) {
     let theme = model.theme;
@@ -949,7 +954,9 @@ fn draw_sidebar(
     // 3. Parent navigation row (top inner row of sidebar)
     if !parent_rect.is_empty() {
         fill_row(buf, parent_rect, base_style);
-        let has_parent = explorer.parent_path().is_some();
+        let has_parent = explorer.map_or(model.explorer_parent, |explorer| {
+            explorer.parent_path().is_some()
+        });
         let right = parent_rect.right();
         let mut cur_x = parent_rect.x + 1;
         let dir_kind = IconKind::Directory { expanded: false };
@@ -976,7 +983,7 @@ fn draw_sidebar(
             if avail > 0 {
                 write_clipped_str(buf, cur_x, parent_rect.y, avail, "..", label_style);
             }
-        } else {
+        } else if let Some(explorer) = explorer {
             let icon_str = theme::icon(explorer.root(), dir_kind, model.icons);
             let disabled_style = Style::default().bg(theme.canvas).fg(theme.muted);
             let icon_style = disabled_style.add_modifier(Modifier::BOLD);
@@ -1014,6 +1021,40 @@ fn draw_sidebar(
 
     // 4. Sidebar tree rows inside rows_rect (below parent row)
     fill_row(buf, rows_rect, base_style);
+    let Some(explorer) = explorer else {
+        if let Some(error) = model.explorer_error {
+            let clean = sanitize_ui_cow(error);
+            let width = rows_rect.width.saturating_sub(1) as usize;
+            let text_height = rows_rect.height.saturating_sub(1) as usize;
+            wrap_choice_line(clean.as_ref(), width, |grapheme, row, col| {
+                if row < text_height {
+                    write_clipped_str(
+                        buf,
+                        rows_rect.x + 1 + col as u16,
+                        rows_rect.y + row as u16,
+                        width - col,
+                        grapheme,
+                        base_style,
+                    );
+                }
+            });
+            if rows_rect.height > 0 && width > 0 {
+                write_clipped_str(
+                    buf,
+                    rows_rect.x + 1,
+                    rows_rect.bottom() - 1,
+                    width,
+                    if model.explorer_parent {
+                        "F5 Retry / Bksp Up"
+                    } else {
+                        "F5 Retry"
+                    },
+                    base_style,
+                );
+            }
+        }
+        return;
+    };
     let rows = explorer.rows();
     if rows.is_empty() {
         if !rows_rect.is_empty() && rows_rect.width >= 3 {
@@ -1901,11 +1942,22 @@ fn draw_helper(
         return;
     }
 
-    let actions = if model.explorer_focused && has_sidebar {
+    let explorer_focused = model.explorer_focused && has_sidebar;
+    let actions = if explorer_focused {
         EXPLORER_HELPER_ACTIONS
     } else {
         EDITOR_HELPER_ACTIONS
     };
+    let actions = actions.iter().filter(|action| {
+        !explorer_focused
+            || match action.key.code {
+                KeyCode::Enter => model.explorer.is_some(),
+                KeyCode::Backspace => model.explorer.map_or(model.explorer_parent, |explorer| {
+                    explorer.parent_path().is_some()
+                }),
+                _ => true,
+            }
+    });
 
     let sep = if model.icons == IconMode::Ascii {
         " | "
@@ -1928,10 +1980,13 @@ fn draw_helper(
         return;
     }
 
-    let total_width = actions.iter().enumerate().fold(0u16, |acc, (idx, action)| {
-        let gw = helper_group_width(action);
-        acc.saturating_add(if idx == 0 { gw } else { sep_w + gw })
-    });
+    let total_width = actions
+        .clone()
+        .enumerate()
+        .fold(0u16, |acc, (idx, action)| {
+            let gw = helper_group_width(action);
+            acc.saturating_add(if idx == 0 { gw } else { sep_w + gw })
+        });
     let all_fit = total_width <= avail;
     let mut first = true;
 
@@ -3145,6 +3200,8 @@ mod tests {
                     focused: kind.cancel_index(),
                 }),
                 explorer: None,
+                explorer_error: None,
+                explorer_parent: false,
                 sidebar_width: 0,
                 explorer_focused: false,
                 theme: &theme,
@@ -3372,10 +3429,39 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme,
             icons,
+        }
+    }
+
+    #[test]
+    fn polish_explorer_error_sidebar_has_no_tree_hits() {
+        let doc = Document::new("hello");
+        let tabs = base_tabs();
+        let panes = [single_pane(&doc, &tabs, &[])];
+        let tree = SplitTree::new(1);
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::None);
+        for icons in [IconMode::Ascii, IconMode::Unicode, IconMode::Nerd] {
+            let mut screen = status_screen(&panes, &tree, &theme, "", None, icons);
+            screen.explorer_error = Some("unavailable");
+            screen.explorer_parent = true;
+            screen.sidebar_width = 28;
+            let (_, geom) = render_screen(80, 20, &screen);
+            assert!(geom.sidebar_panel.is_some());
+            assert!(geom.sidebar_parent.is_some());
+            assert!(geom.explorer_divider.is_some());
+            assert!(geom.sidebar.is_none());
+            assert!(geom.sidebar_scrollbar.is_none());
+            screen.sidebar_width = 0;
+            let (_, hidden) = render_screen(80, 20, &screen);
+            assert!(hidden.sidebar_panel.is_none());
+            screen.sidebar_width = 28;
+            let (_, narrow) = render_screen(15, 8, &screen);
+            assert!(narrow.sidebar_panel.is_none());
         }
     }
 
@@ -3660,6 +3746,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -3718,6 +3806,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -3851,6 +3941,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -4019,6 +4111,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -4106,6 +4200,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -4168,6 +4264,8 @@ mod tests {
                 dirty: false,
                 dialog: None,
                 explorer: None,
+                explorer_error: None,
+                explorer_parent: false,
                 sidebar_width: 0,
                 explorer_focused: false,
                 theme: &theme,
@@ -4237,6 +4335,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: Some(&explorer),
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 28,
             explorer_focused: true,
             theme: &theme,
@@ -4321,6 +4421,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: Some(&explorer),
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 24,
             explorer_focused: true,
             theme: &theme_none,
@@ -4339,6 +4441,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: Some(&explorer),
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 24,
             explorer_focused: false,
             theme: &theme_none,
@@ -4401,6 +4505,8 @@ mod tests {
                 dirty: false,
                 dialog: None,
                 explorer: None,
+                explorer_error: None,
+                explorer_parent: false,
                 sidebar_width: 0,
                 explorer_focused: false,
                 theme: &theme,
@@ -4440,6 +4546,8 @@ mod tests {
                 feedback: None,
             }),
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -4481,6 +4589,8 @@ mod tests {
                 feedback: None,
             }),
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -4630,6 +4740,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -4786,6 +4898,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme_none,
@@ -4886,6 +5000,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: Some(&explorer),
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 24,
             explorer_focused: false,
             theme: &theme,
@@ -4972,6 +5088,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: Some(&explorer),
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 18,
             explorer_focused: false,
             theme: &theme,
@@ -5074,6 +5192,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -5111,6 +5231,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -5146,6 +5268,8 @@ mod tests {
                 dirty: false,
                 dialog: None,
                 explorer: Some(&explorer),
+                explorer_error: None,
+                explorer_parent: false,
                 sidebar_width: 28,
                 explorer_focused: false,
                 theme: &theme,
@@ -5295,6 +5419,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
@@ -5351,6 +5477,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: Some(&explorer),
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 20,
             explorer_focused: false,
             theme: &theme,
@@ -5402,6 +5530,8 @@ mod tests {
             dirty: false,
             dialog: None,
             explorer: None,
+            explorer_error: None,
+            explorer_parent: false,
             sidebar_width: 0,
             explorer_focused: false,
             theme: &theme,
