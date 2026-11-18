@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Tambahkan bootstrap Bash untuk mengunduh latest Release, memverifikasi SHA-256 dan menyiapkan payload privat sebelum menjalankan installer bundle; opsi serta status helper diteruskan dan konfigurasi lama dipertahankan.
+- Dokumentasikan instalasi curl dengan `pipefail`, upgrade dan alternatif bundle offline; QA bootstrap dan publikasi endpoint belum diklaim.
+
 ## 0.1.1 — 2026-11-18
 
 - Perbaiki resolusi commit tag pada workflow draft Release: parameter ref memakai nama tag langsung, tanpa prefix `tags/` yang ditolak GitHub dengan HTTP 422.

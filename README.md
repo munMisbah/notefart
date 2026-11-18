@@ -20,13 +20,33 @@ Editor teks terminal yang familiar, tanpa mode editing wajib. Gunakan keyboard a
 
 ## Instalasi
 
-### 1. Dapatkan bundle
+### Instalasi online
 
-Pilih salah satu cara berikut. Keduanya menghasilkan archive dan checksum yang dipakai pada langkah instalasi yang sama.
+Pada GNU/Linux x86_64, dengan Bash, curl, tar, sha256sum dan coreutils tersedia:
 
-Installer saat ini berbasis bundle, bukan downloader satu-baris `curl | bash`.
+```sh
+bash -o pipefail -c 'curl --proto "=https" --proto-redir "=https" -fsSL https://raw.githubusercontent.com/munMisbah/notefart/main/install.sh | bash'
+```
 
-**Dari CI atau Release:** unduh `naf-linux-x86_64.tar.gz` dan `naf-linux-x86_64.tar.gz.sha256` dari [Releases](https://github.com/munMisbah/notefart/releases) jika asset sudah dipublikasikan, atau dari artifact run Linux CI yang berhasil di [Actions](https://github.com/munMisbah/notefart/actions). Artifact Actions berupa ZIP browser; ekstrak ZIP terlebih dahulu untuk mendapatkan kedua file. Repository privat memerlukan autentikasi dan akses yang sesuai.
+Bootstrap mengunduh archive dan checksum dari latest [Release](https://github.com/munMisbah/notefart/releases), memverifikasi checksum, menyiapkan payload dalam direktori sementara privat, lalu menjalankan installer bundle. Kegagalan download atau checksum menghentikan instalasi; `pipefail` meneruskan kegagalan download bootstrap. SHA-256 mendeteksi korupsi, bukan tanda tangan penerbit. Endpoint memerlukan source dan asset Release yang sudah tersedia publik.
+
+Untuk upgrade, gunakan `--replace`; opsi diteruskan ke installer bundle:
+
+```sh
+bash -o pipefail -c 'curl --proto "=https" --proto-redir "=https" -fsSL https://raw.githubusercontent.com/munMisbah/notefart/main/install.sh | bash -s -- --replace'
+```
+
+Contoh opsi prefix berspasi dan ikon Nerd opt-in:
+
+```sh
+bash -o pipefail -c 'curl --proto "=https" --proto-redir "=https" -fsSL https://raw.githubusercontent.com/munMisbah/notefart/main/install.sh | bash -s -- --prefix "$HOME/My Apps" --theme terminal --icons nerd'
+```
+
+Nerd Font harus disediakan dan dipilih sendiri di terminal; installer tidak memasang font. Opsi lain: `--skip-config`, `--color auto|truecolor|256|16|none` dan `--clipboard auto|internal|system`. Gunakan `bash install.sh --help` untuk bantuan tanpa jaringan.
+
+### Bundle offline atau build source
+
+Unduh `naf-linux-x86_64.tar.gz` dan `naf-linux-x86_64.tar.gz.sha256` dari [Releases](https://github.com/munMisbah/notefart/releases) jika asset sudah dipublikasikan, atau dari artifact run Linux CI yang berhasil di [Actions](https://github.com/munMisbah/notefart/actions). Artifact Actions berupa ZIP browser; ekstrak ZIP terlebih dahulu untuk mendapatkan kedua file. Akses mengikuti visibilitas repository.
 
 **Dari source:** clone repository, lalu build dengan Rust/Cargo melalui [rustup](https://rustup.rs), compiler C, dan `pkg-config` yang tersedia. `rust-toolchain.toml` memilih Rust 1.99.1; rustup akan mengunduhnya bila diperlukan.
 
@@ -39,7 +59,7 @@ bash scripts/package.sh --binary target/release/naf --output "$HOME/naf-dist"
 
 Kedua file bundle berada di `$HOME/naf-dist`. Gunakan direktori output yang dimiliki akun Anda.
 
-### 2. Verifikasi dan pasang
+### Verifikasi dan pasang bundle offline
 
 Masuk ke direktori yang berisi kedua file; untuk hasil build source, gunakan `cd "$HOME/naf-dist"`. Verifikasi sebelum mengekstrak atau menjalankan installer:
 
@@ -60,7 +80,7 @@ naf --version
 
 Tambahkan baris `export` tersebut ke konfigurasi shell Anda agar berlaku pada sesi berikutnya. Untuk prefix lain, gunakan `--prefix /path/absolut` dan tambahkan `PREFIX/bin` ke `PATH`.
 
-### Upgrade
+### Upgrade bundle offline
 
 Dapatkan dan verifikasi bundle baru dengan langkah yang sama, lalu jalankan installer dari bundle hasil ekstraksi dengan `--replace`:
 

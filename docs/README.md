@@ -59,6 +59,15 @@ Repository tujuan: [munMisbah/notefart](https://github.com/munMisbah/notefart). 
 
 Pin diverifikasi dari sumber resmi: [Rust 1.99.1](https://static.rust-lang.org/dist/channel-rust-1.99.1.toml), [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1), dan [upload-artifact v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2). Pembaruan pin harus ditinjau, bukan mengikuti tag bergerak secara otomatis.
 
+## Bootstrap curl
+
+`install.sh` di root adalah bootstrap online; `scripts/install.sh` di bundle tetap satu-satunya pemilik aturan instalasi dan konfigurasi. Perintah online dengan Bash `pipefail`, contoh upgrade dan opsi ada di [README utama](../README.md#instalasi-online). Raw source dan asset latest Release harus tersedia publik; implementasi lokal ini belum menyatakan QA atau publikasi berhasil.
+
+- Pada GNU/Linux x86_64 bootstrap memakai Bash, curl, tar, sha256sum dan coreutils, tanpa sudo otomatis atau perubahan shell rc. `--help` tidak mengakses jaringan.
+- Archive dan sidecar diunduh dari latest Release repository ini melalui HTTPS. Checksum hanya diperiksa terhadap archive yang diharapkan sebelum payload dibaca; SHA-256 mendeteksi korupsi, bukan tanda tangan penerbit.
+- Direktori sementara privat dipakai untuk download dan persiapan enam file reguler bundle yang lengkap dan unik, tanpa menerapkan path/link archive ke lokasi pengguna. Stage dibersihkan saat selesai atau gagal; aturan parent prefix/config yang dipercaya tetap sama seperti installer bundle.
+- Argumen diteruskan ke helper bundle, termasuk prefix berspasi dan `--replace`; config lama beserta komentar tetap dipertahankan. Status gagal helper diteruskan. Jalur offline di bawah tidak memerlukan bootstrap atau jaringan.
+
 ## Installer bundle dan draft rilis
 
 Installer bekerja dari bundle hasil ekstraksi, tanpa download, sudo otomatis atau perubahan shell rc. Dari direktori yang berisi archive dan checksum:

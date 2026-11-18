@@ -173,6 +173,15 @@ Audit di atas merupakan bukti historis sebelum penambahan session restore. Lockf
 - `.gitignore` bukan secret scanner dan tidak menghapus credential yang sudah tracked. Review source sebelum push pertama. Audit lisensi/dependency menyeluruh dan kesiapan distribusi publik tetap terbuka; notice yang ikut artifact bukan klaim seluruh kewajiban distribusi sudah selesai.
 - Build/tes/packaging dibuktikan lokal; akses GitHub, eksekusi runner Ubuntu dan upload/download artifact jarak jauh belum dibuktikan sampai repository tujuan tersedia.
 
+### Bootstrap curl (`install.sh` root)
+
+- `install.sh` di root hanya mengunduh dua asset latest Release dari endpoint HTTPS tetap repositori ini; tidak ada mirror, override URL, token API, `jq`/Python, retry/fallback, atau sudo otomatis. `--help` dan validasi opsi selesai sebelum akses jaringan.
+- Sidecar checksum diurai hanya untuk nama `naf-linux-x86_64.tar.gz`; SHA-256 memverifikasi integritas unduhan, bukan menandatangani penerbit. Download gagal/terpotong, format sidecar salah, atau checksum tidak cocok berhenti nonzero sebelum helper dijalankan.
+- Stage `mktemp` privat (`umask 077`) hanya menerima enam payload yang diharapkan. Nama dan tipe entri diperiksa (reguler, unik, tanpa symlink/hardlink/entri asing/path arbitrer) sebelum ekstraksi; archive tidak diekstrak ke filesystem pengguna. Stage dibersihkan pada sukses, gagal, dan sinyal HUP/INT/TERM.
+- Argumen asli diteruskan ke `install.sh` bundle tanpa menggandakan kebijakan instalasi/konfigurasi, dan exit status helper dikembalikan apa adanya. Root tetap memerlukan `--prefix` absolut dan `--skip-config`; konfigurasi lama beserta komentar dipertahankan helper.
+- Verifikasi lokal 2026-11-19 memakai build release 0.1.1 nyata dari tree ini dan keluaran `scripts/package.sh` pada direktori fixture privat, dengan adaptor `curl` di PATH khusus uji (bukan hook produksi). 85 pemeriksaan lulus: instalasi user-local/prefix berspasi/`--skip-config`, nilai config, upgrade `--replace` yang mempertahankan komentar dan preferensi lama, `--help` tanpa panggilan jaringan, penolakan platform/dependency/opsi/prefix relatif, kegagalan download/checksum/sidecar/arsip terpotong, arsip tidak lengkap/duplikat/symlink/entri ekstra/path traversal, kegagalan helper, dan pembersihan stage saat sinyal.
+- Batas: payload hosted, checksum Release hosted, dan pipeline curl publik belum diuji pada tahap ini; archive yang diuji adalah hasil build lokal, bukan byte hosted. Jalur `EUID == 0` tidak dijalankan karena pengujian berjalan non-root. Containment prefix/config mengikuti batas helper (parent prefix dipercaya), bukan jaminan universal, dan tidak ada klaim keaslian publisher atau jaminan bebas secret.
+
 ## Bukti minimum sebelum rilis
 
 Uji file dengan escape sequence dan nama berkarakter kontrol; save gagal dan disk penuh melalui fault injection yang aman; perubahan file eksternal; Save As ke target existing; symlink/hard link; file non-regular; serta exit/error dan restorasi terminal. Jalankan dengan direktori sementara dan fixture terisolasi, bukan file pengguna.
