@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 — 2026-11-18
+
+- Perbaiki resolusi commit tag pada workflow draft Release: parameter ref memakai nama tag langsung, tanpa prefix `tags/` yang ditolak GitHub dengan HTTP 422.
+- Metadata paket, lockfile dan panduan instalasi memakai 0.1.1. Tag v0.1.0 dipertahankan; perilaku editor tidak berubah.
+
 ## 0.1.0 — 2026-11-18
 
 ### Appearance persisten dan shortcut Alt+P

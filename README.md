@@ -2,7 +2,7 @@
 
 Editor teks terminal yang familiar, tanpa mode editing wajib. Gunakan keyboard atau mouse untuk membuka file, membagi panel, dan mengedit beberapa dokumen dalam satu workspace.
 
-**v0.1.0** adalah versi awal/preview untuk GNU/Linux x86_64. Ketersediaan binary bergantung pada artifact CI atau Release yang benar-benar dipublikasikan.
+**v0.1.1** adalah versi awal/preview untuk GNU/Linux x86_64. Ketersediaan binary bergantung pada artifact CI atau Release yang benar-benar dipublikasikan.
 
 [Keunggulan](#keunggulan) · [Instalasi](#instalasi) · [Mulai cepat](#mulai-cepat) · [Konfigurasi](#konfigurasi) · [Batasan](#batasan) · [Dokumentasi](#dokumentasi)
 
@@ -31,7 +31,7 @@ Installer saat ini berbasis bundle, bukan downloader satu-baris `curl | bash`.
 **Dari source:** clone repository, lalu build dengan Rust/Cargo melalui [rustup](https://rustup.rs), compiler C, dan `pkg-config` yang tersedia. `rust-toolchain.toml` memilih Rust 1.99.1; rustup akan mengunduhnya bila diperlukan.
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/munMisbah/notefart.git
+git clone --branch v0.1.1 --depth 1 https://github.com/munMisbah/notefart.git
 cd notefart
 cargo build --locked --release --bin naf
 bash scripts/package.sh --binary target/release/naf --output "$HOME/naf-dist"
