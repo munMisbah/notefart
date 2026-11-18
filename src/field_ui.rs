@@ -454,7 +454,11 @@ mod tests {
             &mut hit,
         );
         // End exposes the insertion position in text, not in the passive right gutter.
-        let caret_stop = hit.stops.last().copied().expect("End must expose its caret");
+        let caret_stop = hit
+            .stops
+            .last()
+            .copied()
+            .expect("End must expose its caret");
         assert_eq!(res_end, Some((caret_stop.0, hit.area.y)));
         assert_eq!(caret_stop.1, view_end.text.len());
     }

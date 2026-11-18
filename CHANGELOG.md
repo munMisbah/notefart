@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Perbaikan CI
+
+- Rapikan format assertion caret pada tes field sesuai rustfmt agar gate formatting CI dapat dilalui; tidak mengubah perilaku aplikasi.
+
 ### Ergonomi field dan navigasi Explorer
 
 - Tambahkan undo/redo delta lokal pada field, Ctrl+Backspace/Delete, serta drag autoscroll dengan kepemilikan capture dan guard frame stale.
