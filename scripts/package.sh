@@ -38,7 +38,7 @@ chmod 644 "$bundle/VERSION"
 install -m 644 -- "$repo/config.toml.example" "$bundle/config.toml.example"
 install -m 644 -- "$repo/assets/licenses/Oniguruma.txt" "$bundle/licenses/Oniguruma.txt"
 install -m 644 -- "$repo/assets/syntaxes/LICENSE" "$bundle/licenses/Sublime-Packages.txt"
-tar -czf "$stage/naf-linux-x86_64.tar.gz" -C "$stage" naf-linux-x86_64
+tar --owner=0 --group=0 --numeric-owner -czf "$stage/naf-linux-x86_64.tar.gz" -C "$stage" naf-linux-x86_64
 (cd "$stage" && sha256sum naf-linux-x86_64.tar.gz > naf-linux-x86_64.tar.gz.sha256)
 # Do not leave an old checksum claiming to describe a newly replaced archive.
 rm -f -- "$output/naf-linux-x86_64.tar.gz.sha256"

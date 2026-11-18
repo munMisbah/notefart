@@ -1,14 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-11-19
 
 - Tambahkan bootstrap Bash untuk mengunduh latest Release, memverifikasi SHA-256 dan menyiapkan payload privat sebelum menjalankan installer bundle; opsi serta status helper diteruskan dan konfigurasi lama dipertahankan.
 - Dokumentasikan instalasi curl dengan `pipefail`, upgrade dan alternatif bundle offline; QA bootstrap dan publikasi endpoint belum diklaim.
-
-## 0.1.1 — 2026-11-18
+- Tambahkan gate audit paket di CI sebelum upload artifact: checksum sidecar ketat, whitelist enam file reguler, VERSION/ELF, helper serta notice identik checkout, metadata owner ternormalisasi, dan scan kategori credential/path build tanpa mencetak nilai.
+- Normalisasi owner/group archive menjadi numerik `0` tanpa `uname`/`gname` agar metadata build lokal tidak ikut terdistribusi; format dan isi paket tidak berubah.
+- Netralkan path fixture dan metadata penulis sebelum publikasi; history serta tag disanitasi dengan backup privat.
 
 - Perbaiki resolusi commit tag pada workflow draft Release: parameter ref memakai nama tag langsung, tanpa prefix `tags/` yang ditolak GitHub dengan HTTP 422.
-- Metadata paket, lockfile dan panduan instalasi memakai 0.1.1. Tag v0.1.0 dipertahankan; perilaku editor tidak berubah.
+- Metadata paket, lockfile dan panduan instalasi memakai 0.1.1; perilaku editor tidak berubah.
 
 ## 0.1.0 — 2026-11-18
 

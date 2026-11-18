@@ -63,6 +63,15 @@ jobs:
           version=$(tar -xOzf target/dist/naf-linux-x86_64.tar.gz naf-linux-x86_64/VERSION)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Audit release package
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          python3 scripts/audit-package.py \
+            --archive target/dist/naf-linux-x86_64.tar.gz \
+            --checksum target/dist/naf-linux-x86_64.tar.gz.sha256 \
+            --expected-version "$PACKAGE_VERSION"
+
       - name: Smoke test installer
         run: |
           smoke=$(mktemp -d)
