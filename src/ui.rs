@@ -149,6 +149,8 @@ pub enum Dialog<'a> {
     Appearance {
         draft: Options,
         focused: usize,
+        save_config: bool,
+        save_error: Option<&'a str>,
     },
 }
 
@@ -1827,7 +1829,7 @@ const EXPLORER_HELPER_ACTIONS: &[HelperAction] = &[
         KeyCode::Char('q'),
         KeyModifiers::CONTROL,
     ),
-    helper_action("[F11]", "Style", KeyCode::F(11), KeyModifiers::NONE),
+    helper_action("[Alt+P]", "Style", KeyCode::Char('p'), KeyModifiers::ALT),
 ];
 
 const EDITOR_HELPER_ACTIONS: &[HelperAction] = &[
@@ -1864,7 +1866,7 @@ const EDITOR_HELPER_ACTIONS: &[HelperAction] = &[
         KeyCode::Char('r'),
         KeyModifiers::CONTROL,
     ),
-    helper_action("[F11]", "Style", KeyCode::F(11), KeyModifiers::NONE),
+    helper_action("[Alt+P]", "Style", KeyCode::Char('p'), KeyModifiers::ALT),
 ];
 
 const MORE_HELP_ACTION: HelperAction =
@@ -2720,7 +2722,12 @@ fn draw_dialog(
                 &mut geometry.commands,
             );
         }
-        Dialog::Appearance { draft, focused } => {
+        Dialog::Appearance {
+            draft,
+            focused,
+            save_config,
+            save_error,
+        } => {
             let rect = centered_dialog(area, width, 10);
             frame.render_widget(Clear, rect);
             frame.render_widget(
@@ -2801,14 +2808,31 @@ fn draw_dialog(
                 theme.focus_style(),
                 &mut geometry.commands,
             );
-            write_clipped_str(
-                frame.buffer_mut(),
-                rect.x + 2,
-                rect.y + 7,
-                inner_width as usize,
-                "Draft only; Apply for this run",
-                text_style,
-            );
+            if let Some(error) = save_error {
+                let clean = sanitize_ui_cow(error);
+                write_middle_elided(
+                    frame.buffer_mut(),
+                    rect.x + 2,
+                    rect.y + 7,
+                    inner_width as usize,
+                    clean.as_ref(),
+                    text_style.fg(theme.error).add_modifier(Modifier::BOLD),
+                    icons,
+                );
+            } else {
+                write_clipped_str(
+                    frame.buffer_mut(),
+                    rect.x + 2,
+                    rect.y + 7,
+                    inner_width as usize,
+                    if *save_config {
+                        "Apply saves preferences"
+                    } else {
+                        "Run only (--no-config)"
+                    },
+                    text_style,
+                );
+            }
         }
         Dialog::Help { .. } => unreachable!(),
     }
@@ -3067,6 +3091,8 @@ mod tests {
                 let dialog = Dialog::Appearance {
                     draft: Options::default(),
                     focused,
+                    save_config: true,
+                    save_error: None,
                 };
                 terminal
                     .draw(|frame| {
@@ -3115,6 +3141,46 @@ mod tests {
     }
 
     #[test]
+    fn appearance_minimum_shows_save_error_and_run_only_hint() {
+        let theme = Theme::new(ThemeKind::Dark, ColorMode::None);
+        let error = "Save failed: refusing to write configuration /home/user/.config/notefart/config.toml: target is a symbolic link";
+        let cases: &[(bool, Option<&str>, &str, &str)] = &[
+            (true, Some(error), "Save failed", "Run only"),
+            (
+                false,
+                None,
+                "Run only (--no-config)",
+                "Apply saves preferences",
+            ),
+        ];
+        for &(save_config, save_error, expected, absent) in cases {
+            let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            let mut geometry = Geometry::default();
+            let dialog = Dialog::Appearance {
+                draft: Options::default(),
+                focused: 0,
+                save_config,
+                save_error,
+            };
+            terminal
+                .draw(|frame| {
+                    draw_dialog(
+                        frame,
+                        frame.area(),
+                        &dialog,
+                        &theme,
+                        IconMode::Ascii,
+                        &mut geometry,
+                    );
+                })
+                .unwrap();
+            let row = row_text(terminal.backend().buffer(), Rect::new(0, 7, 40, 1), 0);
+            assert!(row.contains(expected), "row: {row}");
+            assert!(!row.contains(absent), "row: {row}");
+        }
+    }
+
+    #[test]
     fn appearance_tiny_clears_stale_targets() {
         let theme = Theme::new(ThemeKind::Dark, ColorMode::None);
         for (width, height) in [(1, 1), (9, 3), (39, 9)] {
@@ -3134,6 +3200,8 @@ mod tests {
             let dialog = Dialog::Appearance {
                 draft: Options::default(),
                 focused: 4,
+                save_config: true,
+                save_error: None,
             };
             terminal
                 .draw(|frame| {

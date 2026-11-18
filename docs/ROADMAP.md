@@ -705,6 +705,28 @@ Regresi baru memakai token accent, sebab foreground/canvas ANSI16 memang `Reset`
 - Batas: TUI nyata Linux melalui tmux/PTY dengan mouse SGR sintetis, bukan perangkat mouse/font/glass fisik. Unicode/Nerd/ASCII serta ukuran nilai satu–tiga sel tercakup pada tes renderer; smoke akhir tidak mengulang matriks profil atau clipboard sistem. Penutupan tahap 4 tidak diperluas ke platform baru.
 - Seluruh fixture/HOME/XDG, driver dan prompt sementara milik batch dibersihkan; laporan, log dan capture dipertahankan. Server tmux uji dihentikan, terminal worker selesai dilepas dan assignment jalur CX dihentikan terkonfirmasi saat provider dialihkan. Tidak menutup terminal atau mengubah konfigurasi akun pengguna.
 
+### Hasil persistensi Appearance
+
+- Laporan pengguna bahwa F11 dipakai window manager dan style hilang setelah restart diterima sebagai repro; tidak mengulang pengujian window manager untuk konfirmasi. F11 tidak lagi binding aplikasi; Alt+P serta chip Style menjadi pembuka Appearance.
+- Apply menyimpan tiga preferensi visual melalui `config::save_merged` dengan Source/Env peluncuran sebelum mengubah tampilan. Clipboard tersimpan tidak ikut diganti oleh override runtime. Save gagal menyisakan draft/fokus/error, tampilan lama dan kesempatan retry; `--no-config` sengaja run-only. [Kontrak aktif](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
+- Regresi, build dan live test dikerjakan `atmo/alicn/deepseek-v4.1-flash-1017`; tidak menjalankan security/live test melalui GPT atau AGY. Tidak ada fix produksi tambahan selama QA.
+
+| Pemeriksaan | Hasil |
+| --- | --- |
+| `cargo fmt --all` dan `cargo fmt --all -- --check` | Exit 0 setelah edit berhenti |
+| `cargo test --locked --bin naf appearance_` | 8 kasus unik lulus, 0 gagal, 348 filtered: 4 lama dan 4 regresi baru |
+| `cargo build --locked --release --bin naf` | Exit 0; binary release baru dibangun |
+| Default XDG dan restart | F11 PTY tidak membuka modal; Alt+P/Apply menyimpan light/256/nerd. Proses kedua tanpa override visual memulihkannya; Cancel menjaga hash file |
+| `--config PATH` | Apply menulis file kustom terminal/16/ascii, bukan lokasi default |
+| `--no-config` | Tampilan runtime berubah; hint/status run-only dan hash file tetap |
+| Save gagal pada 40×10 | TOML dirusak setelah startup; Apply mempertahankan modal/draft dengan error terlihat, file invalid tetap |
+
+Delapan tes sempat dieksekusi ulang lewat binary test langsung karena worker menganggap stdout command hilang, meskipun transcript/log lengkap tersedia; tetap delapan kasus unik, bukan 16. Anomali visibilitas output dilaporkan, tanpa pengulangan tes oleh integrator. Live test mencakup lima skenario perilaku dan enam invokasi: satu startup `--config` ditolak karena fixture belum ada, lalu fixture disiapkan; lima invokasi yang berjalan keluar 0. Tidak mengubah produksi demi fixture/selector driver.
+
+SHA-256 binary live `target/release/naf`: `2833623049305c78a4bf9a0e39bb0b4d5048965f321475dbf32d9394cdba27d2`. Laporan `/tmp/notefart-appearance-persist-qa-report.md` dan capture/log `/tmp/notefart-appearance-persist-evidence/` merekam command, exit, tampilan serta hash aktual. HOME/XDG/CWD dan server tmux terisolasi; fixture/driver dibersihkan, evidence dipertahankan.
+
+Batas: bukan pengujian window manager fisik, font/Nerd Font, glass, clipboard eksternal, suite seluruh target atau CI hosted. Binary terpasang akun pengguna belum diganti; jalankan ulang packaging dari binary release baru dan installer `--replace` sebagai akun tujuan. Catatan switcher F11/run-only di bagian berikut adalah bukti kontrak historis, bukan perilaku terbaru.
+
 ### Hasil switcher tampilan runtime
 
 - Appearance menyediakan draft tema, mode warna dan profil ikon melalui F11/Alt+P, Apply/Cancel, keyboard/mouse dan return F1 sesuai [kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime). F12 tetap Close pane; menu tidak ditumpuk di atas modal lain.
@@ -767,9 +789,30 @@ Fitur tambahan ini kini **tersedia untuk exit normal**, bukan perluasan menuju I
 - Snapshot privat tidak dienkripsi; lokasi/batas/lock/format ditetapkan di ARCHITECTURE.md. Restore memulihkan buffer persis dan baseline asli, bukan reload atau overwrite sumber secara diam-diam. Undo/redo dimulai ulang setelah restore.
 - Session restore berbeda dari crash recovery: tidak ada autosave atau snapshot baru saat signal/panic/proses mati. Perubahan/discard dalam sesi yang berakhir abnormal tidak mengganti snapshot exit normal sebelumnya.
 
-## Distribusi — installer saat publish
+## Distribusi — persiapan installer dan draft rilis
 
-Installer ditunda sampai tahap publish sesuai keputusan pengguna; belum diimplementasikan. Rencana mencakup setup preferensi dan generate konfigurasi setelah pemasangan, dengan instalasi user tanpa sudo sebagai default. Jika instalasi sistem memerlukan root, tampilkan instruksi hak akses yang jelas; konfigurasi tetap milik pengguna dan file yang sudah ada dipertahankan secara default.
+Installer bundle GNU/Linux x86_64, helper paket bersama CI dan workflow draft-release manual sudah diimplementasikan. Jalur teruji lulus verifikasi di bawah. Kontrak di [ARCHITECTURE.md](ARCHITECTURE.md#kontrak-distribusi-linux-dan-installer): user-local tanpa sudo otomatis, empat preferensi tanpa menimpa konfigurasi lama, serta publikasi yang tetap menjadi keputusan terpisah. Tidak membuat tag, mengubah lisensi/visibilitas repository atau menjalankan publish.
+
+### Hasil persiapan distribusi
+
+QA biasa memakai `openai-codex/gpt-6.1-terra` melalui Codex; pengujian integritas/negative, perbaikan temuan dan recheck memakai `atmo/alicn/deepseek-v4.1-flash-1017`. Tidak menjalankan ulang suite Rust karena sumber Rust tidak berubah; keberhasilan CI sebelum batch ini berasal dari konfirmasi pengguna.
+
+| Lingkup | Bukti yang diamati |
+| --- | --- |
+| Packaging dan CLI nyata | Helper dipanggil dari CWD berbeda dengan output berspasi; bundle/checksum valid, `install.sh --help` dan binary hasil instalasi menghasilkan exit 0 / `naf 0.1.0`. |
+| Body smoke CI asli | Diekstrak tanpa modifikasi dan dijalankan pada fixture: prefix berspasi, CWD di luar bundle, empat override, roundtrip config lewat aplikasi dan replay config berkomentar byte-identik; exit 0. |
+| Default dan tanpa config | HOME sementara + XDG unset memakai `HOME/.local/bin` serta config Unicode di fallback HOME. `--skip-config` bekerja dengan prefix absolut tanpa HOME/XDG. |
+| Integritas installer | Binary berbeda ditolak tanpa `--replace`, update eksplisit berfungsi; config lama termasuk sentinel tetap byte-identik. Target final symlink/nonregular ditolak, hardlink pointee tidak berubah, staging gagal tidak menghapus target, config baru 0600 dan mode direktori lama tetap. |
+| Penutupan temuan ringan | SemVer malformed ditolak melalui helper sebenarnya, prerelease/build metadata tetap utuh, output path control di-escape. Syntax shell dan parsing YAML lulus setelah edit. |
+| Guard tag | Body step draft asli diuji dengan transport GH fixture: SHA cocok mencapai permintaan draft; SHA berbeda/API gagal abort sebelum create. Ini unit logic tanpa API/write/publikasi nyata. |
+
+F2 diperbaiki dengan resolusi namespace `tags/` dan perbandingan commit build sebelum membuat draft; F3/F4 dengan SemVer konsisten dan escaping output. F1 menjadi batas trust yang disengaja: alias direktori parent tetap diikuti, seluruh parent harus dipercaya, dan root pada tree shared/untrusted tidak didukung. Ini bukan containment. Pemeriksaan tag tidak mengunci ref secara atomik terhadap force-update setelah check; draft/ref/asset tetap harus ditinjau sebelum publish.
+
+Binary yang dipakai sudah tersedia sebelumnya, bukan build baru batch ini: SHA-256 `3cfac7ff3831c03a8f1ff28aa911a10ffb08a548209b76afaabb1ae47e8ca676`. Archive recheck akhir SHA-256 `a6a3e06d5f7c10bb14e32d45ee15cafab963cb0135d0b51f8c058a56de916f67`, `VERSION=0.1.0`, checksum cocok. Hash archive mengandung pengaruh mtime staging, bukan janji build reproducible.
+
+Laporan/log: `/tmp/notefart-dist-normal-qa-report.md`, `/tmp/notefart-dist-normal-qa.log`, `/tmp/notefart-dist-security-qa-report.md`, `/tmp/notefart-dist-security-qa-logs/`, `/tmp/notefart-dist-close-findings-report.md` dan `/tmp/notefart-dist-close-findings-logs/`. Fixture HOME/prefix, driver dan prompt sementara dibersihkan; laporan/log dipertahankan.
+
+Batas: hosted CI/workflow rilis dan API GitHub belum dijalankan; parsing YAML bukan validasi schema Actions (`actionlint` tidak tersedia). Root guard hanya diuji lewat fakeroot, bukan instalasi/ownership sebagai root nyata. Tidak menguji crash/power loss, race konkuren, seluruh distro/glibc atau OS lain. Instalasi atomik per file, bukan transaksi/rollback seluruh bundle. Checksum bukan signature/autentikasi; bundle harus dipercaya sebelum installer mengeksekusi binary untuk setup config. Lisensi proyek dan publikasi tetap belum diputuskan.
 
 ## Belum diprioritaskan
 

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Appearance persisten dan shortcut Alt+P
+
+- Lepas binding F11 agar tidak bentrok dengan fullscreen/maximize terminal atau window manager; Alt+P dan chip Style membuka Appearance dari editor/explorer.
+- Apply menyimpan tema, warna dan ikon lewat writer konfigurasi yang sama dengan CLI sebelum menerapkannya. Target mengikuti konfigurasi peluncuran; clipboard tersimpan tidak ditimpa override runtime. `--no-config` tetap run-only dengan pemberitahuan.
+- Gagal simpan mempertahankan draft/fokus dan tampilan lama, menampilkan error tersanitasi pada dialog minimum 40×10 dan mendukung retry/F1 tanpa kehilangan draft. Cancel tidak menulis konfigurasi.
+- Delapan regresi unik, format/check, build release dan lima skenario PTY tmux lulus melalui DeepSeek atmo, termasuk restart, target config kustom dan save failure. [Bukti dan batas](docs/ROADMAP.md#hasil-persistensi-appearance); binary terpasang pengguna dan CI hosted belum diperbarui.
+
+### Installer bundle dan draft rilis Linux
+
+- Tambahkan installer user-local tanpa download/sudo otomatis, opsi prefix dan empat preferensi, serta konfigurasi baru melalui writer aplikasi. Konfigurasi lama selalu dipertahankan; pembaruan binary berbeda memerlukan `--replace`.
+- Satukan packaging lokal/CI dengan binary, installer, versi SemVer, template, notice dan sidecar SHA-256; escape output path. Smoke CI memakai prefix berspasi dan CWD di luar bundle serta memeriksa replay config berkomentar.
+- Tambahkan CI reusable dan workflow draft Release manual pada tag yang cocok dengan versi binary; resolusi commit tag diperiksa kembali sebelum membuat draft. Hanya job draft memiliki izin write; tidak membuat tag, memublikasikan otomatis atau mengubah visibilitas/lisensi repo.
+- QA normal Terra Codex lulus pada binary release yang sudah tersedia: syntax shell, parsing YAML, packaging/checksum, body smoke CI asli, instalasi default dan `--skip-config`. Parsing bukan validasi schema GitHub; workflow hosted/rilis belum dijalankan. Bukti serta batas ada di [roadmap distribusi](docs/ROADMAP.md#distribusi--persiapan-installer-dan-draft-rilis).
+- QA integritas/negative dan recheck DeepSeek atmo lulus pada jalur teruji; tutup temuan validasi versi, commit tag dan output path. Parent directory tetap harus dipercaya, alias direktori tetap diikuti dan pemeriksaan tag bukan lock atomik. Root hanya diuji lewat fakeroot; workflow/API hosted belum dijalankan.
+
 ### Perbaikan CI
 
 - Rapikan format assertion caret pada tes field sesuai rustfmt agar gate formatting CI dapat dilalui; tidak mengubah perilaku aplikasi.

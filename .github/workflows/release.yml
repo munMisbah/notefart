@@ -1,0 +1,78 @@
+name: Draft Linux release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a SemVer tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          [[ "$REF_TYPE" == tag && "$REF_NAME" =~ $semver ]] || {
+            echo 'Dispatch harus menggunakan tag vSemVer yang sudah ada.' >&2
+            exit 1
+          }
+
+  build:
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Verify version and download artifact from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          [[ "$TAG" == "v$VERSION" ]] || {
+            echo 'Tag tidak cocok dengan versi binary.' >&2
+            exit 1
+          }
+          gh run download "$RUN_ID" --repo "$REPOSITORY" --name "naf-linux-x86_64-$COMMIT" --dir artifact
+          cd artifact
+          sha256sum --check naf-linux-x86_64.tar.gz.sha256
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          if ! tag_commit=$(gh api "repos/$REPOSITORY/commits/tags/$TAG" --jq .sha); then
+            echo "Tidak dapat membaca commit untuk tag $TAG." >&2
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$COMMIT" ]]; then
+            echo "Tag $TAG menunjuk $tag_commit, bukan commit build $COMMIT." >&2
+            exit 1
+          fi
+          gh release create "$TAG" \
+            artifact/naf-linux-x86_64.tar.gz artifact/naf-linux-x86_64.tar.gz.sha256 \
+            --repo "$REPOSITORY" --draft --verify-tag \
+            --title "Notefart $TAG (draft)" \
+            --notes 'Draft distribusi GNU/Linux x86_64; belum dipublikasikan.'

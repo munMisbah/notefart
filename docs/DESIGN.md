@@ -257,15 +257,15 @@ Field memiliki undo/redo lokal: Ctrl+Z, Ctrl+Y atau Ctrl+Shift+Z memulihkan teks
 | F6 / F7 dalam Replace | Ganti hasil aktif / Replace All satu undo |
 | F8 / F9 | Split kiri-kanan / atas-bawah |
 | F10 / Shift+F10 | Fokus panel berikutnya / sebelumnya, termasuk yang sementara tersembunyi |
-| F11 / Alt+P | Buka Appearance dari editor/explorer; perubahan tampilan berlaku setelah Apply |
+| Alt+P | Buka Appearance dari editor/explorer; Apply menyimpan lalu menerapkan tampilan |
 | F12 | Tutup panel dengan guard per dokumen |
 | Alt+Shift+Left/Right atau Up/Down | Geser divider Columns terdekat dua sel / Rows satu sel |
 
 Ctrl+C tanpa seleksi tidak keluar atau menyalin seluruh dokumen. Modal mengambil input field, bukan meneruskan shortcut editor ke dokumen belakang. Ctrl+H tetap Backspace karena byte terminal sama; Replace memakai Ctrl+R.
 
-Appearance berisi draft tema, mode warna dan profil ikon; tampilan aktual baru berubah saat Apply. Tab/Shift+Tab atau Up/Down mengunjungi tiga row lalu Apply/Cancel; Left/Right mengubah nilai row, Space mengganti nilai atau mengaktifkan tombol, Enter/A menerapkan kecuali Enter pada Cancel. Mnemonic t/T, c/C dan i/I memilih row lalu next/previous; uppercase atau Shift bergerak ke pilihan sebelumnya. Mouse prev/next memakai aksi yang sama, dan klik Apply tidak bergantung pada tombol yang sebelumnya fokus.
+Appearance berisi draft tema, mode warna dan profil ikon; tampilan aktual baru berubah saat Apply. Apply menyimpan tiga preferensi visual ke konfigurasi peluncuran yang sama sebelum menerapkannya, sehingga tetap tersedia saat editor dibuka lagi. Tab/Shift+Tab atau Up/Down mengunjungi tiga row lalu Apply/Cancel; Left/Right mengubah nilai row, Space mengganti nilai atau mengaktifkan tombol, Enter/A menerapkan kecuali Enter pada Cancel. Mnemonic t/T, c/C dan i/I memilih row lalu next/previous; uppercase atau Shift bergerak ke pilihan sebelumnya. Mouse memakai aksi yang sama, dan klik Apply tidak bergantung pada tombol yang sebelumnya fokus.
 
-Esc membuang draft; F1 kembali dengan draft/fokus yang sama. Minimum 40×10 berlaku pada renderer dan input; di bawahnya tidak ada Apply/cycle tersembunyi. Pilihan hanya untuk sesi berjalan: tidak menulis konfigurasi/snapshot atau mengubah dokumen, seleksi, viewport dan clipboard. F11/Alt+P tidak membuka Appearance di atas dialog lain; tidak ada perubahan shortcut F12 atau pemasangan font.
+Esc membuang draft; F1 kembali dengan draft/fokus/error yang sama. Simpan gagal mempertahankan modal, draft dan tampilan lama serta menampilkan error, termasuk pada minimum 40×10. Di bawah minimum hanya Esc/F1 dilayani. `--no-config` membuat Apply hanya berlaku untuk run ini dengan hint/status eksplisit. Cycling/Cancel tidak menulis konfigurasi; snapshot sesi, dokumen, seleksi, viewport dan clipboard tidak berubah. Alt+P tidak membuka Appearance di atas dialog lain. F11 tidak diikat aplikasi agar bebas untuk fullscreen/maximize window manager; F12 dan pengaturan font terminal tidak berubah.
 
 Helper memprioritaskan aksi inti, bukan seluruh shortcut split. F1 dan `--help` memakai katalog berkelompok yang sama. Bantuan memakai panah, PageUp/Down, Home/End dan wheel; page mengikuti jumlah baris visual yang benar-benar terlihat. Flow control, font dan protokol terminal masih memerlukan matriks validasi lebih luas.
 

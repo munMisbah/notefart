@@ -15,6 +15,7 @@ use ratatui::layout::Rect;
 use crate::{
     chrome,
     clipboard::{Clipboard, ClipboardError},
+    config,
     explorer::EntryKind,
     field::{Field, FieldKind},
     file_io::{self, FileError},
@@ -79,6 +80,7 @@ enum Modal {
     Appearance {
         draft: Options,
         focused: usize,
+        save_error: Option<String>,
     },
     Help {
         scroll: usize,
@@ -251,6 +253,8 @@ struct App {
     highlight_pending: bool,
     theme: Theme,
     options: Options,
+    config_source: config::Source,
+    config_env: config::Env,
     search: SearchState,
     geometry: Geometry,
     hit_targets_valid: bool,
@@ -307,6 +311,8 @@ impl App {
             highlight_pending: false,
             theme: Theme::new(options.theme, options.colors),
             options,
+            config_source: config::Source::Disabled,
+            config_env: config::Env::default(),
             search: SearchState::default(),
             geometry: Geometry::default(),
             hit_targets_valid: false,
@@ -1044,6 +1050,7 @@ impl App {
         self.modal = Some(Modal::Appearance {
             draft: self.options,
             focused: 0,
+            save_error: None,
         });
         self.invalidate_hit_targets();
     }
@@ -1057,7 +1064,12 @@ impl App {
         {
             return;
         }
-        let Some(Modal::Appearance { draft, focused }) = &mut self.modal else {
+        let Some(Modal::Appearance {
+            draft,
+            focused,
+            save_error,
+        }) = &mut self.modal
+        else {
             return;
         };
         let mut cycle = None;
@@ -1132,6 +1144,27 @@ impl App {
         }
         if apply {
             let visual = *draft;
+            let save_config = !matches!(&self.config_source, config::Source::Disabled);
+            if save_config {
+                let overrides = config::CliOverrides {
+                    options: visual,
+                    theme: true,
+                    color: true,
+                    icons: true,
+                    ..config::CliOverrides::default()
+                };
+                if let Err(error) =
+                    config::save_merged(&self.config_source, &self.config_env, &overrides)
+                {
+                    let message = format!("Save failed: {error}");
+                    *save_error = Some(match ui::sanitize_ui_cow(&message) {
+                        Cow::Borrowed(_) => message,
+                        Cow::Owned(clean) => clean,
+                    });
+                    self.invalidate_hit_targets();
+                    return;
+                }
+            }
             if self.options.theme != visual.theme || self.options.colors != visual.colors {
                 self.theme = Theme::new(visual.theme, visual.colors);
             }
@@ -1139,10 +1172,14 @@ impl App {
             self.options.colors = visual.colors;
             self.options.icons = visual.icons;
             self.modal = None;
-            self.status = StatusMessage::new(
-                StatusLevel::Success,
-                "Appearance applied for this run".into(),
-            );
+            self.status = if save_config {
+                StatusMessage::new(StatusLevel::Success, "Appearance saved".into())
+            } else {
+                StatusMessage::new(
+                    StatusLevel::Warning,
+                    "Appearance applied for this run (--no-config)".into(),
+                )
+            };
         } else if cancel {
             self.cancel_modal();
             return;
@@ -2687,10 +2724,6 @@ impl App {
                     self.cycle_pane(if shift { -1 } else { 1 });
                     return;
                 }
-                KeyCode::F(11) => {
-                    self.open_appearance();
-                    return;
-                }
                 KeyCode::F(12) => {
                     self.request_close_active_pane();
                     return;
@@ -3958,6 +3991,8 @@ impl App {
         } else {
             None
         };
+        let mut status = self.status.text.as_str();
+        let mut status_level = self.status.level;
         let dialog = match &self.modal {
             Some(Modal::Path { action, value }) => Some(Dialog::Path {
                 title: match action {
@@ -4005,10 +4040,22 @@ impl App {
                 replacement_focus: *replacement_focus,
                 feedback: self.search.current_feedback(&self.workspace),
             }),
-            Some(Modal::Appearance { draft, focused }) => Some(Dialog::Appearance {
-                draft: *draft,
-                focused: *focused,
-            }),
+            Some(Modal::Appearance {
+                draft,
+                focused,
+                save_error,
+            }) => {
+                if let Some(error) = save_error {
+                    status = error;
+                    status_level = StatusLevel::Error;
+                }
+                Some(Dialog::Appearance {
+                    draft: *draft,
+                    focused: *focused,
+                    save_config: !matches!(&self.config_source, config::Source::Disabled),
+                    save_error: save_error.as_deref(),
+                })
+            }
             Some(Modal::Help { scroll }) => Some(Dialog::Help { scroll: *scroll }),
             None => None,
         };
@@ -4024,12 +4071,12 @@ impl App {
             status: if self.input_sequence_pending {
                 "Ctrl+G resumes input; terminal sequence incomplete"
             } else {
-                &self.status.text
+                status
             },
             status_level: if self.input_sequence_pending {
                 StatusLevel::Warning
             } else {
-                self.status.level
+                status_level
             },
             highlight_warning: active_buf.and_then(|buf| self.highlighter.warning(buf.id)),
             active_path,
@@ -4193,6 +4240,8 @@ pub(crate) fn run(
     path: Option<PathBuf>,
     options: Options,
     session_enabled: bool,
+    config_source: config::Source,
+    config_env: config::Env,
 ) -> io::Result<()> {
     crate::terminal::verify_tty()?;
     let mut app = if session_enabled {
@@ -4205,6 +4254,8 @@ pub(crate) fn run(
     } else {
         App::bootstrap(path, options)?
     };
+    app.config_source = config_source;
+    app.config_env = config_env;
     crate::terminal::use_theme_color_policy();
     let mut session = TerminalSession::enter()?;
     let outcome = run_loop(&mut session, &mut app);
@@ -4331,6 +4382,18 @@ mod tests {
                 .unwrap();
         });
         terminal
+    }
+
+    fn frame_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     fn draw_measured_frame(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -4611,6 +4674,11 @@ mod tests {
         let revision = app.workspace.active_document().unwrap().document.revision();
         let key = |code| InputEvent::Terminal(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
         app.event(key(KeyCode::F(11)));
+        assert!(app.modal.is_none());
+        app.event(InputEvent::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+        ))));
         app.event(key(KeyCode::Char('t')));
         app.event(key(KeyCode::Char('i')));
         app.event(key(KeyCode::F(1)));
@@ -4625,6 +4693,7 @@ mod tests {
                     ..
                 },
                 focused: 2,
+                ..
             })
         ));
         assert_eq!(app.options, original);
@@ -4635,7 +4704,10 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::Appearance { .. })));
         app.event(key(KeyCode::Esc));
         assert_eq!(app.options, original);
-        app.event(key(KeyCode::F(11)));
+        app.event(InputEvent::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+        ))));
         app.event(key(KeyCode::Char('t')));
         app.event(key(KeyCode::Char('i')));
         app.event(key(KeyCode::Char('a')));
@@ -4666,7 +4738,10 @@ mod tests {
                 ..internal_options()
             },
         );
-        app.event(InputEvent::Terminal(Event::Key(fkey(11))));
+        app.event(InputEvent::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+        ))));
         draw_frame(&mut app, 80, 24);
         let previous = app
             .geometry
@@ -4690,6 +4765,7 @@ mod tests {
                     ..
                 },
                 focused: 0,
+                ..
             })
         ));
         app.mouse(previous_mouse, Instant::now());
@@ -4701,6 +4777,7 @@ mod tests {
                     ..
                 },
                 focused: 0,
+                ..
             })
         ));
         draw_frame(&mut app, 80, 24);
@@ -4727,6 +4804,7 @@ mod tests {
                     ..
                 },
                 focused: 0,
+                ..
             })
         ));
         app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
@@ -4774,6 +4852,240 @@ mod tests {
         );
         assert!(app.modal.is_none());
         assert_eq!(app.options.theme, ThemeKind::Light);
+    }
+
+    #[test]
+    fn appearance_apply_persists_visual_prefs_for_next_startup_without_clipboard_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let xdg = dir.path().join("xdg");
+        let config_dir = xdg.join("notefart");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "theme = \"terminal\"\ncolor = \"16\"\nicons = \"ascii\"\nclipboard = \"system\"\n",
+        )
+        .unwrap();
+        let env = config::Env {
+            xdg_config_home: Some(xdg.as_os_str().to_owned()),
+            home: None,
+        };
+        let mut app = App::new_with_root(
+            work,
+            Options {
+                theme: ThemeKind::Dark,
+                colors: ColorMode::Auto,
+                icons: IconMode::Unicode,
+                ..internal_options()
+            },
+        );
+        app.config_source = config::Source::Default;
+        app.config_env = env.clone();
+
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.level, StatusLevel::Success);
+        assert_eq!(
+            app.options,
+            Options {
+                theme: ThemeKind::Light,
+                colors: ColorMode::Ansi256,
+                icons: IconMode::Nerd,
+                clipboard: ClipboardMode::Internal,
+            }
+        );
+        assert_eq!(app.theme, Theme::new(ThemeKind::Light, ColorMode::Ansi256));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "theme = \"light\"\ncolor = \"256\"\nicons = \"nerd\"\nclipboard = \"system\"\n"
+        );
+
+        let restored = config::resolve(
+            &config::Source::Default,
+            &env,
+            &config::CliOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.theme, ThemeKind::Light);
+        assert_eq!(restored.colors, ColorMode::Ansi256);
+        assert_eq!(restored.icons, IconMode::Nerd);
+        assert_eq!(restored.clipboard, ClipboardMode::System);
+        assert_ne!(restored.clipboard, app.options.clipboard);
+    }
+
+    #[test]
+    fn appearance_failed_save_retains_error_draft_focus_then_retries_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let target = dir.path().join("prefs.toml");
+        std::fs::write(
+            &target,
+            "theme = \"terminal\"\ncolor = \"16\"\nicons = \"ascii\"\nclipboard = \"system\"\n",
+        )
+        .unwrap();
+        let sentinel_path = dir.path().join("sentinel.toml");
+        const SENTINEL: &str =
+            "theme = \"dark\"\ncolor = \"none\"\nicons = \"unicode\"\nclipboard = \"internal\"\n";
+        std::fs::write(&sentinel_path, SENTINEL).unwrap();
+
+        let original = Options {
+            theme: ThemeKind::Dark,
+            colors: ColorMode::None,
+            icons: IconMode::Unicode,
+            ..internal_options()
+        };
+        let mut app = App::new_with_root(work, original);
+        app.config_source = config::Source::Explicit(target.clone());
+        app.config_env = config::Env::default();
+        let palette = app.theme;
+
+        // The launch target was a regular file; it turns into a symlink before Apply.
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&sentinel_path, &target).unwrap();
+
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        let error = match &app.modal {
+            Some(Modal::Appearance {
+                draft,
+                focused,
+                save_error,
+            }) => {
+                assert_eq!(
+                    *draft,
+                    Options {
+                        theme: ThemeKind::Light,
+                        colors: ColorMode::Ansi256,
+                        icons: IconMode::Nerd,
+                        clipboard: ClipboardMode::Internal,
+                    }
+                );
+                assert_eq!(*focused, 2);
+                save_error.clone().expect("failed save keeps an error")
+            }
+            _ => panic!("failed Apply must keep Appearance open"),
+        };
+        assert!(error.contains("refusing to write configuration"), "{error}");
+        assert!(
+            !error.contains('\u{1b}'),
+            "error must stay sanitized: {error}"
+        );
+        assert_eq!(app.options, original);
+        assert_eq!(app.theme, palette);
+        assert_eq!(std::fs::read_to_string(&sentinel_path).unwrap(), SENTINEL);
+
+        app.key(fkey(1));
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Appearance {
+                draft: Options {
+                    theme: ThemeKind::Light,
+                    colors: ColorMode::Ansi256,
+                    icons: IconMode::Nerd,
+                    ..
+                },
+                focused: 2,
+                save_error: Some(_),
+            })
+        ));
+
+        // The error reaches the minimum dialog, not only the hidden status row.
+        let terminal = draw_frame(&mut app, 40, 10);
+        let text = frame_text(&terminal);
+        assert!(text.contains("Save failed"), "frame: {text}");
+        assert!(text.contains("symbolic link"), "frame: {text}");
+        assert_eq!(app.options, original);
+        assert_eq!(app.theme, palette);
+
+        // Repair the target and retry from the retained draft.
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, SENTINEL).unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.level, StatusLevel::Success);
+        assert_eq!(app.options.theme, ThemeKind::Light);
+        assert_eq!(app.options.colors, ColorMode::Ansi256);
+        assert_eq!(app.options.icons, IconMode::Nerd);
+        assert_eq!(app.options.clipboard, ClipboardMode::Internal);
+        assert_eq!(app.theme, Theme::new(ThemeKind::Light, ColorMode::Ansi256));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "theme = \"light\"\ncolor = \"256\"\nicons = \"nerd\"\nclipboard = \"internal\"\n"
+        );
+    }
+
+    #[test]
+    fn appearance_no_config_apply_is_run_only_and_leaves_existing_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let xdg = dir.path().join("xdg");
+        let config_dir = xdg.join("notefart");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "theme = \"terminal\"\ncolor = \"16\"\nicons = \"ascii\"\nclipboard = \"system\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+        let env = config::Env {
+            xdg_config_home: Some(xdg.as_os_str().to_owned()),
+            home: None,
+        };
+        let mut app = App::new_with_root(
+            work,
+            Options {
+                theme: ThemeKind::Dark,
+                colors: ColorMode::Auto,
+                icons: IconMode::Unicode,
+                ..internal_options()
+            },
+        );
+        app.config_source = config::Source::Disabled;
+        app.config_env = env;
+
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let terminal = draw_frame(&mut app, 40, 10);
+        let text = frame_text(&terminal);
+        assert!(text.contains("Run only (--no-config)"), "frame: {text}");
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.level, StatusLevel::Warning);
+        assert!(
+            app.status.text.contains("--no-config"),
+            "{}",
+            app.status.text
+        );
+        assert!(!app.status.text.contains("saved"), "{}", app.status.text);
+        assert_eq!(app.options.theme, ThemeKind::Light);
+        assert_eq!(app.options.colors, ColorMode::Ansi256);
+        assert_eq!(app.options.icons, IconMode::Nerd);
+        assert_eq!(app.options.clipboard, ClipboardMode::Internal);
+        assert_eq!(app.theme, Theme::new(ThemeKind::Light, ColorMode::Ansi256));
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
     }
 
     #[test]

@@ -198,7 +198,7 @@ pub(crate) const SECTIONS: &[Section] = &[
         title: "Appearance",
         bindings: &[
             (
-                "F11 / Alt+P",
+                "Alt+P",
                 "Open from editor or explorer, not over another modal.",
             ),
             (
@@ -213,7 +213,10 @@ pub(crate) const SECTIONS: &[Section] = &[
                 "Space",
                 "Cycle the focused row or activate the focused button.",
             ),
-            ("Enter / A", "Apply; Enter on Cancel cancels instead."),
+            (
+                "Enter / A",
+                "Apply and save; Enter on Cancel cancels instead.",
+            ),
             (
                 "t/T / c/C / i/I",
                 "Select theme, colors or icons and cycle next/previous.",
@@ -224,7 +227,7 @@ pub(crate) const SECTIONS: &[Section] = &[
             ),
             (
                 "Apply",
-                "Changes are run-only, without preview or configuration writes; terminal font is unchanged and Nerd icons are opt-in.",
+                "Saves theme/colors/icons to the launch configuration; --no-config applies for this run only. Save failure keeps the draft. Clipboard and terminal font are unchanged; Nerd icons remain opt-in.",
             ),
         ],
     },

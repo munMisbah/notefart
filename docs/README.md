@@ -51,13 +51,45 @@ cargo test --locked --all-targets
 cargo build --locked --release --bin naf
 ```
 
-Run sukses mengunggah artifact `naf-linux-x86_64-` diikuti commit SHA, disimpan 7 hari. Unduh melalui tab Actions → run yang sukses → Artifacts. Di dalamnya ada `naf-linux-x86_64.tar.gz`, berisi executable `naf`, `config.toml.example` dan notice Oniguruma/Sublime Packages. Ekstrak tar untuk mempertahankan executable bit. Binary GNU/Linux ini bukan static/musl atau jaminan berjalan pada semua distro/glibc; belum ada build Windows/macOS.
+Run sukses mengunggah artifact `naf-linux-x86_64-` diikuti commit SHA, disimpan 7 hari. Unduh melalui tab Actions → run yang sukses → Artifacts. Isinya `naf-linux-x86_64.tar.gz` dan `naf-linux-x86_64.tar.gz.sha256`; bundle tar memuat executable `naf`, installer, `VERSION`, contoh konfigurasi dan notice Oniguruma/Sublime Packages. Ekstrak tar untuk mempertahankan executable bit. Binary GNU/Linux ini bukan static/musl atau jaminan berjalan pada semua distro/glibc; belum ada build Windows/macOS.
 
-Workflow hanya memakai izin `contents: read`, checkout tidak menyimpan credential, Action dipin full commit SHA dan tidak ada auto-publish Release/installer. Privasi artifact mengikuti visibilitas repository, **bukan** nama workflow: buat repository **Private** sebelum push jika source harus tertutup. Jangan memasukkan credential atau config pribadi; `.gitignore` mengecualikan root `config.toml`, `.env`/`.env.*` dan `target/`, tetapi tidak melindungi file rahasia yang sudah tracked. Template tetap dapat di-commit.
+Linux CI hanya memakai izin `contents: read`, checkout tidak menyimpan credential dan Action dipin full commit SHA. Tidak ada auto-publish; workflow draft rilis terpisah dijelaskan di bawah. Privasi artifact mengikuti visibilitas repository, **bukan** nama workflow: buat repository **Private** sebelum push jika source harus tertutup. Jangan memasukkan credential atau config pribadi; `.gitignore` mengecualikan root `config.toml`, `.env`/`.env.*` dan `target/`, tetapi tidak melindungi file rahasia yang sudah tracked. Template tetap dapat di-commit.
 
-Repository tujuan: [munMisbah/notefart](https://github.com/munMisbah/notefart). Definisi/command CI telah diperiksa lokal; status eksekusi GitHub-hosted runner dan artifact tersedia di [Actions](https://github.com/munMisbah/notefart/actions) setelah push. Validasi lokal bukan klaim run GitHub sukses. Aktivasi Actions/izin akses serta kuota private mengikuti pengaturan akun/repo GitHub. Installer/setup konfigurasi tetap ditunda sampai publish.
+Repository tujuan: [munMisbah/notefart](https://github.com/munMisbah/notefart). Status run dan artifact tersedia di [Actions](https://github.com/munMisbah/notefart/actions). Pengguna telah mengonfirmasi CI sebelum batch distribusi berhasil; perubahan workflow distribusi ini belum dibuktikan pada hosted runner. Validasi lokal bukan klaim run GitHub sukses. Aktivasi Actions/izin akses serta kuota private mengikuti pengaturan akun/repo GitHub.
 
 Pin diverifikasi dari sumber resmi: [Rust 1.99.1](https://static.rust-lang.org/dist/channel-rust-1.99.1.toml), [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1), dan [upload-artifact v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2). Pembaruan pin harus ditinjau, bukan mengikuti tag bergerak secara otomatis.
+
+## Installer bundle dan draft rilis
+
+Installer bekerja dari bundle hasil ekstraksi, tanpa download, sudo otomatis atau perubahan shell rc. Dari direktori yang berisi archive dan checksum:
+
+```sh
+sha256sum -c naf-linux-x86_64.tar.gz.sha256
+tar -xzf naf-linux-x86_64.tar.gz
+./naf-linux-x86_64/install.sh
+export PATH="$HOME/.local/bin:$PATH"
+naf --version
+```
+
+Default binary `~/.local/bin/naf`, notice/contoh di `~/.local/share/notefart`, dan preferensi baru dark/auto/unicode/auto. PATH hanya berubah pada shell contoh di atas; tambahkan sendiri ke konfigurasi shell bila diperlukan. Untuk prefix lain gunakan `--prefix /path/absolut`; PATH mengikuti `PREFIX/bin`.
+
+Preferensi awal dapat dipilih lewat `--theme`, `--color`, `--icons`, `--clipboard`, misalnya `./naf-linux-x86_64/install.sh --theme terminal --icons nerd --clipboard internal`. Nerd memerlukan font terminal yang sesuai dan tetap opt-in. Konfigurasi baru mengikuti `$XDG_CONFIG_HOME/notefart/config.toml` jika XDG absolut, atau `$HOME/.config/notefart/config.toml`; contoh TOML bundle tidak disalin sebagai preferensi aktif.
+
+**Config yang sudah ada selalu dipertahankan**, termasuk komentar dan saat `--replace`. Flag preferensi tidak menimpa file lama; untuk mengubahnya secara eksplisit gunakan API aplikasi, misalnya `naf --theme terminal --icons nerd --save-config`. `--skip-config` memasang binary/notice saja. Binary berbeda memerlukan `--replace`; binary identik boleh dipasang ulang tanpa flag itu. Target file symlink/tipe yang tidak sesuai ditolak.
+
+Tidak perlu root untuk default user-local. Instalasi sistem adalah pilihan eksplisit administrator, misalnya `sudo ./naf-linux-x86_64/install.sh --prefix /usr/local --skip-config`; setup config kemudian dijalankan sebagai pengguna tujuan, bukan melalui sudo. Installer tidak memasang font atau helper clipboard.
+
+**Batas trust:** prefix/config dan seluruh direktori parent harus dipercaya. Alias direktori symlink tetap diikuti, sehingga lokasi fisik dapat berada di luar prefix tekstual; hanya symlink pada file target final yang ditolak. Jangan memakai instalasi root pada tree shared/untrusted atau yang dapat ditulis pengguna lain.
+
+Untuk membuat bundle lokal dari binary release yang sudah dibangun:
+
+```sh
+bash scripts/package.sh --binary target/release/naf --output target/dist
+```
+
+[Workflow draft rilis](../.github/workflows/release.yml) hanya `workflow_dispatch` pada **tag yang sudah ada** dan cocok persis `v` + versi binary/Cargo, misalnya `v0.1.0`. Workflow harus sudah tersedia di default branch; setelah versi/tag disetujui, pilih tag itu pada Actions → Run workflow. Menjalankannya pada branch ditolak. Workflow memanggil Linux CI reusable dari commit yang sama, mengambil artifact dari run yang sama, memeriksa checksum dan memastikan resolusi tag masih cocok dengan commit build tepat sebelum membuat draft Release dengan kedua asset. Job pembuat draft saja memakai `contents: write` dan `actions: read`; tidak mengeksekusi payload paket. Pemeriksaan ini bukan lock tag atomik: hindari force-update, lindungi tag rilis dan tinjau kembali ref/asset sebelum publish.
+
+Tidak ada pembuatan tag, penggantian release lama, perubahan visibilitas repo atau publikasi otomatis. Tinjau draft dan keputusan lisensi sebelum publish; lisensi proyek belum ditetapkan dan `Cargo.toml` tetap `publish = false`. `gh`/token API pada mesin pengembangan tidak diperlukan untuk packaging/installer lokal; workflow memakai token GitHub runner. Kontrak CLI resmi: [download artifact](https://cli.github.com/manual/gh_run_download), [draft dan verifikasi tag](https://cli.github.com/manual/gh_release_create), [workflow reusable](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
 ## Menjalankan editor
 
@@ -72,7 +104,7 @@ naf test.txt
 
 `naf` tanpa argumen memulihkan sesi terakhir dari exit normal, atau membuka editor kosong jika belum ada snapshot; explorer mulai tampil meskipun disembunyikan pada sesi sebelumnya. `naf test.txt` langsung membuka file relatif terhadap direktori kerja dengan explorer tersembunyi, tanpa mengubah sesi default. Path yang belum ada baru ditulis saat Save. Tidak perlu subcommand `run`; folder juga diterima sebagai argumen dan menampilkan explorer. Gunakan `naf --no-session` untuk editor tanpa snapshot.
 
-Build lokal menghasilkan `target/debug/naf` atau `target/release/naf`; tanpa instalasi ke PATH, jalankan misalnya `./target/debug/naf test.txt`. `cargo run` otomatis memilih target `naf`. Belum ada pemasangan otomatis ke `~/.local/bin` atau `/usr/local/bin`; installer tetap ditunda. Nama package Cargo dan lokasi preferensi `notefart/config.toml` tidak diubah, sehingga konfigurasi tersimpan tetap dipakai.
+Build lokal menghasilkan `target/debug/naf` atau `target/release/naf`; tanpa instalasi ke PATH, jalankan misalnya `./target/debug/naf test.txt`. `cargo run` otomatis memilih target `naf`. Untuk pemasangan gunakan [bundle dan installer](#installer-bundle-dan-draft-rilis); build Cargo sendiri tidak memasang ke PATH. Nama package Cargo dan lokasi preferensi `notefart/config.toml` tidak diubah, sehingga konfigurasi tersimpan tetap dipakai.
 
 Default `cargo run` memakai profil dev opt-level 1 dengan debug information/assertions; profil test tetap opt-level 0. Build dev pertama lebih lama, tetapi hitungan sel/render lebih ringan. `cargo run --release -- …` tetap tersedia untuk penggunaan release.
 
@@ -224,9 +256,11 @@ Field path/Find/Replace kini memiliki undo/redo lokal, penghapusan kata dan drag
 
 Sebanyak 24 kasus target berbeda dan smoke TUI terarah lulus: history/drag field, ekspor query identik byte, type-ahead, resize/F1 serta jalur modified keys/error card. Input/negative dan permission dikerjakan DeepSeek atmo; QA normal oleh Terra Codex. Bukan suite seluruh target atau bukti font/mouse fisik. [Bukti ergonomi, hash dan batas](ROADMAP.md#hasil-ergonomi-field-dan-navigasi-explorer).
 
-F11 atau Alt+P membuka **Appearance** untuk tema, mode warna dan profil ikon. Panah atau T/C/I mengubah draft; Apply/Enter menerapkan untuk run ini, Esc membatalkan, dan F1 memulihkan draft/fokus saat kembali. Keyboard dan mouse tersedia pada minimal 40×10; di bawahnya hanya Esc/F1. Tidak mengubah konfigurasi tersimpan, clipboard atau font terminal. [Kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
+**Alt+P** membuka Appearance untuk tema, mode warna dan profil ikon. F11 tidak dipakai aplikasi agar tidak bentrok dengan fullscreen/maximize terminal atau window manager. Panah atau T/C/I mengubah draft; Apply/Enter menyimpan tiga preferensi visual ke konfigurasi peluncuran yang sama, lalu menerapkannya. Setelah quit dan buka ulang, preferensi dibaca kembali; flag CLI tetap memiliki prioritas lebih tinggi. Esc membatalkan tanpa menulis, dan F1 memulihkan draft/fokus/error. Save gagal tidak menutup modal atau mengubah tampilan aktif; penyebabnya terlihat di dialog, termasuk pada minimum 40×10. `--no-config` sengaja hanya menerapkan untuk run ini, dengan hint/status yang jelas. Tidak mengubah clipboard, snapshot sesi atau font terminal. Writer memakai TOML kanonik yang sama dengan `--save-config`, sehingga komentar konfigurasi bukan format yang dipertahankan. [Kontrak switcher](ARCHITECTURE.md#kontrak-switcher-tampilan-runtime).
 
-Empat tes Appearance serta smoke TUI nyata melalui `openai-codex/gpt-6.1-terra` lulus, termasuk Auto yang tetap menjadi pilihan Auto, override Truecolor/Nerd dan kontrol minimum/tiny. Fixture/config tidak berubah dan aplikasi keluar 0; bukan bukti font/glass atau mouse fisik. [Bukti switcher, hash dan batas](ROADMAP.md#hasil-switcher-tampilan-runtime).
+Verifikasi switcher awal sebelum persistensi meliputi empat tes serta smoke TUI melalui `openai-codex/gpt-6.1-terra`; pada kontrak lama file config memang tidak ditulis. Itu bukti historis, bukan verifikasi perilaku Apply persisten yang baru. [Bukti switcher awal, hash dan batas](ROADMAP.md#hasil-switcher-tampilan-runtime).
+
+Perbaikan persistensi telah dibuktikan dengan delapan regresi unik dan lima skenario PTY tmux melalui DeepSeek atmo: F11 tidak membuka menu, Apply menyimpan default/config kustom, proses baru memulihkan nilai, `--no-config` tidak menulis, dan gagal simpan tetap terlihat pada 40×10. Format/check dan build release lulus. Untuk aplikasi yang sudah terpasang, buat ulang bundle dari `target/release/naf` lalu jalankan installer `--replace` sebagai akun tujuan; installer tetap mempertahankan config lama. [Bukti persistensi dan batas](ROADMAP.md#hasil-persistensi-appearance).
 
 Field path, Find dan Replace kini menandai teks tersembunyi dengan `‹`/`›` (`<`/`>` pada ASCII). Indikator pasif tidak menjadi isi/seleksi atau target klik field; caret tetap terlihat, termasuk saat ruang nilai hanya satu/dua sel tanpa indikator. [Kontrak field](ARCHITECTURE.md#keputusan-pemolesan-field-dan-bantuan).
 

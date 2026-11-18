@@ -283,7 +283,7 @@ fn main() -> ExitCode {
                 match config::resolve(&source, &env, &overrides) {
                     Ok(options) => {
                         let session_enabled = path.is_none() && !no_session;
-                        report_io(app::run(path, options, session_enabled))
+                        report_io(app::run(path, options, session_enabled, source, env))
                     }
                     Err(error) => {
                         eprintln!("naf: {}", error.to_string().escape_default());
