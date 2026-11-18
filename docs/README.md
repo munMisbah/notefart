@@ -1,6 +1,6 @@
-# Notefart
+# Panduan teknis Notefart
 
-Editor teks terminal dengan kontrol familiar ala Notepad, tampilan terinspirasi superfile, serta dukungan keyboard dan mouse.
+Referensi instalasi lanjutan, interaksi, konfigurasi dan bukti verifikasi. Untuk gambar aplikasi, ringkasan fitur dan langkah install cepat, mulai dari [README utama](../README.md).
 
 **Status: editor hybrid panel + tab dengan browser folder dan UI bergaya superfile tersedia.** Frame berikon bold/solid, background seragam dan helper berkelompok tetap ada, kini tanpa dua gap vertikal luar. Highlight Markdown memakai backend/cache yang lebih ringan; TypeScript/TSX sudah memiliki grammar asli. Preferensi tema/warna/ikon/clipboard dapat disimpan, dan clipboard sistem lokal Wayland/X11 tersedia jika helper terpasang. Split/shared history, field editable, F1 dan guard file tetap berlaku; produk tetap editor teks, bukan IDE, dan kesiapan rilis belum dikunci final.
 
@@ -84,8 +84,10 @@ Tidak perlu root untuk default user-local. Instalasi sistem adalah pilihan ekspl
 Untuk membuat bundle lokal dari binary release yang sudah dibangun:
 
 ```sh
-bash scripts/package.sh --binary target/release/naf --output target/dist
+bash scripts/package.sh --binary target/release/naf --output "$HOME/naf-dist"
 ```
+
+Gunakan direktori output milik akun pemanggil, seperti `$HOME/naf-dist`, agar tidak berbenturan dengan arsip milik akun lain pada workspace bersama. Folder sementara atau akun khusus tidak diwajibkan; jangan mengubah ownership/permission folder bersama hanya untuk menimpa arsip lama.
 
 [Workflow draft rilis](../.github/workflows/release.yml) hanya `workflow_dispatch` pada **tag yang sudah ada** dan cocok persis `v` + versi binary/Cargo, misalnya `v0.1.0`. Workflow harus sudah tersedia di default branch; setelah versi/tag disetujui, pilih tag itu pada Actions → Run workflow. Menjalankannya pada branch ditolak. Workflow memanggil Linux CI reusable dari commit yang sama, mengambil artifact dari run yang sama, memeriksa checksum dan memastikan resolusi tag masih cocok dengan commit build tepat sebelum membuat draft Release dengan kedua asset. Job pembuat draft saja memakai `contents: write` dan `actions: read`; tidak mengeksekusi payload paket. Pemeriksaan ini bukan lock tag atomik: hindari force-update, lindungi tag rilis dan tinjau kembali ref/asset sebelum publish.
 
