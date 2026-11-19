@@ -170,8 +170,14 @@ Audit di atas merupakan bukti historis sebelum penambahan session restore. Lockf
 - Workflow memakai event `push`/`pull_request`/manual pada runner GitHub-hosted Ubuntu, bukan `pull_request_target` atau self-hosted runner. Job hanya mendapat `contents: read`; checkout tidak mempertahankan credential dan tidak ada PAT/deploy secret atau izin publish yang ditambahkan.
 - Action dipin full commit SHA; toolchain Rust dipin dan Cargo memakai `--locked` untuk tes/build. Pin mengurangi perubahan tak sengaja, bukan pengganti audit dependency/Action atau jaminan build bit-identical.
 - Artifact hanya memuat binary, template konfigurasi dan notice yang disebut eksplisit, tidak mengunggah seluruh workspace/config/log. Masa retensi 7 hari; siapa yang dapat mengunduh mengikuti visibilitas/izin repository. Workflow tidak membuat repository menjadi private.
-- `.gitignore` bukan secret scanner dan tidak menghapus credential yang sudah tracked. Review source sebelum push pertama. Audit lisensi/dependency menyeluruh dan kesiapan distribusi publik tetap terbuka; notice yang ikut artifact bukan klaim seluruh kewajiban distribusi sudah selesai.
-- Build/tes/packaging dibuktikan lokal; akses GitHub, eksekusi runner Ubuntu dan upload/download artifact jarak jauh belum dibuktikan sampai repository tujuan tersedia.
+- `.gitignore` bukan secret scanner dan tidak menghapus credential yang sudah tracked. Review source sebelum push pertama. Audit lisensi/dependency menyeluruh tetap terbuka; publikasi preview dan notice artifact bukan klaim seluruh kewajiban distribusi sudah selesai.
+- Build/tes/packaging dibuktikan lokal; eksekusi runner Ubuntu, upload artifact, dan pembuatan draft Release dibuktikan oleh run hosted pada tag `v0.1.1` (`44421850899`).
+
+### Audit source/history pra-publikasi
+
+- Worker DeepSeek melalui atmo meninjau file tracked serta blob historis yang terjangkau dari `main`, `v0.1.0` dan `v0.1.1`. Tidak ditemukan material credential dalam cakupan heuristik tersebut; config pengguna, snapshot/session, dump dan log kerja tidak dimasukkan ke source atau bundle.
+- Identitas lokal berisiko rendah pada tiga path fixture dan metadata commit awal dinetralkan. Pengguna menyetujui rewrite history serta kedua tag sebelum publikasi; backup privat disimpan di luar repository.
+- Cakupan ini bukan seluruh objek tak terjangkau, reflog, cache GitHub, atau clone lain. Rewrite ref tidak menghapus salinan lama secara otomatis, dan hasil audit bukan jaminan universal bebas secret. Copyright/email lisensi dependency yang sah tetap dipertahankan.
 
 ### Bootstrap curl (`install.sh` root)
 
@@ -179,8 +185,10 @@ Audit di atas merupakan bukti historis sebelum penambahan session restore. Lockf
 - Sidecar checksum diurai hanya untuk nama `naf-linux-x86_64.tar.gz`; SHA-256 memverifikasi integritas unduhan, bukan menandatangani penerbit. Download gagal/terpotong, format sidecar salah, atau checksum tidak cocok berhenti nonzero sebelum helper dijalankan.
 - Stage `mktemp` privat (`umask 077`) hanya menerima enam payload yang diharapkan. Nama dan tipe entri diperiksa (reguler, unik, tanpa symlink/hardlink/entri asing/path arbitrer) sebelum ekstraksi; archive tidak diekstrak ke filesystem pengguna. Stage dibersihkan pada sukses, gagal, dan sinyal HUP/INT/TERM.
 - Argumen asli diteruskan ke `install.sh` bundle tanpa menggandakan kebijakan instalasi/konfigurasi, dan exit status helper dikembalikan apa adanya. Root tetap memerlukan `--prefix` absolut dan `--skip-config`; konfigurasi lama beserta komentar dipertahankan helper.
+- Verifikasi bootstrap dan audit payload berikut dijalankan oleh worker `atmo/alicn/deepseek-v4.1-flash-1017`; integrator mengintegrasikan bukti, bukan mengulang security test.
 - Verifikasi lokal 2026-11-19 memakai build release 0.1.1 nyata dari tree ini dan keluaran `scripts/package.sh` pada direktori fixture privat, dengan adaptor `curl` di PATH khusus uji (bukan hook produksi). 85 pemeriksaan lulus: instalasi user-local/prefix berspasi/`--skip-config`, nilai config, upgrade `--replace` yang mempertahankan komentar dan preferensi lama, `--help` tanpa panggilan jaringan, penolakan platform/dependency/opsi/prefix relatif, kegagalan download/checksum/sidecar/arsip terpotong, arsip tidak lengkap/duplikat/symlink/entri ekstra/path traversal, kegagalan helper, dan pembersihan stage saat sinyal.
-- Batas: payload hosted, checksum Release hosted, dan pipeline curl publik belum diuji pada tahap ini; archive yang diuji adalah hasil build lokal, bukan byte hosted. Jalur `EUID == 0` tidak dijalankan karena pengujian berjalan non-root. Containment prefix/config mengikuti batas helper (parent prefix dipercaya), bukan jaminan universal, dan tidak ada klaim keaslian publisher atau jaminan bebas secret.
+- Verifikasi publik 2026-11-19: raw `main/install.sh` yang diunduh identik dengan commit; asset hosted lolos audit paket; pipeline curl canonical dengan `pipefail` pada sandbox HOME/XDG/prefix dijalankan sekali, exit 0, memasang `naf 0.1.1`, mempertahankan config berkomentar byte-identik, dan membersihkan stage.
+- Batas: jalur `EUID == 0` tidak dijalankan karena pengujian berjalan non-root. Containment prefix/config mengikuti batas helper (parent prefix dipercaya), bukan jaminan universal; checksum bukan bukti keaslian publisher atau jaminan bebas secret.
 
 ### Audit paket Release di runner
 
@@ -188,7 +196,7 @@ Audit di atas merupakan bukti historis sebelum penambahan session restore. Lockf
 - Workflow menjalankan `python3 scripts/audit-package.py --archive … --checksum … --expected-version …` pada archive yang benar-benar akan diupload, sebelum langkah upload artifact. Auditor memakai stdlib Python tanpa network, tidak mengekstrak archive, dan tidak menjalankan binary maupun helper.
 - Pemeriksaan: format sidecar ketat dengan basename tetap dan SHA-256 archive; hanya enam file reguler dan dua direktori resmi tanpa duplikat, link, entri asing, atau path absolut/`..`; `VERSION` sama dengan output packaging; payload ELF64 little-endian x86_64 berdasarkan metadata; `install.sh`, `config.toml.example`, dan dua notice identik byte dengan checkout tag yang sama; owner/group numerik `0` tanpa nama akun; serta scan printable payload untuk pola credential, URL ber-kredensial, PEM, dan path home selain akun runner generik.
 - Output hanya status, digest, versi, tipe, dan hitungan kategori. Nilai match, isi string binary, dan identitas build tidak dicetak atau diunggah; artifact upload tetap hanya dua file resmi. Batas: pemeriksaan ini heuristik, bukan tanda tangan penerbit atau jaminan universal bebas secret. Build lokal pengembang dapat gagal audit karena path build dan memang tidak boleh dipublikasikan.
-- Status bukti: gate berjalan pada workflow tag final; hasil run hosted dan uji live curl publik dicatat hanya setelah masing-masing benar-benar dijalankan. Sebelum bukti itu ada, payload hosted dan endpoint publik belum dinyatakan terverifikasi.
+- Status bukti: gate lulus pada [run hosted #4](https://github.com/munMisbah/notefart/actions/runs/44421850899) untuk tag `v0.1.1`, commit `f80901f`. Archive runner memiliki SHA-256 `2c2dc7c35059f0634ddcd340431934c8f294db582231f75e2f2a267311fc7a23`, 1.746.137 byte, versi 0.1.1. Setelah publikasi, asset diunduh ulang, cocok dengan sidecar publik dan digest runner, serta lulus audit lokal dengan auditor yang sama (22/22).
 
 ## Bukti minimum sebelum rilis
 

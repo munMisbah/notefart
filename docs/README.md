@@ -39,7 +39,7 @@ Detail di luar daftar tersebut adalah **usulan**, bukan keputusan final atau jan
 2. Validasi perilaku terminal melalui spike kecil, terutama input, mouse, Unicode, dan clipboard.
 3. Implementasikan bertahap mengikuti roadmap; sebuah tahap selesai hanya setelah perilakunya dibuktikan.
 
-Belum ada jadwal rilis atau dukungan platform final. Dependency batch ini dikunci di Cargo.lock; versi tersebut bukan klaim versi terbaru.
+[Rilis publik awal v0.1.1](https://github.com/munMisbah/notefart/releases/tag/v0.1.1) tersedia untuk GNU/Linux x86_64. Belum ada jadwal rilis berikutnya atau komitmen dukungan platform lain. Dependency dikunci di Cargo.lock; versi tersebut bukan klaim versi terbaru.
 
 ## CI dan artifact Linux
 
@@ -55,13 +55,13 @@ Run sukses mengunggah artifact `naf-linux-x86_64-` diikuti commit SHA, disimpan 
 
 Linux CI hanya memakai izin `contents: read`, checkout tidak menyimpan credential dan Action dipin full commit SHA. Tidak ada auto-publish; workflow draft rilis terpisah dijelaskan di bawah. Privasi artifact mengikuti visibilitas repository, **bukan** nama workflow: buat repository **Private** sebelum push jika source harus tertutup. Jangan memasukkan credential atau config pribadi; `.gitignore` mengecualikan root `config.toml`, `.env`/`.env.*` dan `target/`, tetapi tidak melindungi file rahasia yang sudah tracked. Template tetap dapat di-commit.
 
-Repository tujuan: [munMisbah/notefart](https://github.com/munMisbah/notefart). Status run dan artifact tersedia di [Actions](https://github.com/munMisbah/notefart/actions). Pengguna telah mengonfirmasi CI sebelum batch distribusi berhasil; perubahan workflow distribusi ini belum dibuktikan pada hosted runner. Validasi lokal bukan klaim run GitHub sukses. Aktivasi Actions/izin akses serta kuota private mengikuti pengaturan akun/repo GitHub.
+Repository [munMisbah/notefart](https://github.com/munMisbah/notefart) sudah publik. [Run distribusi tag v0.1.1](https://github.com/munMisbah/notefart/actions/runs/44421850899) pada commit `f80901f` berhasil: format, seluruh target tes, build release, smoke CLI/installer, audit archive sebenarnya, upload artifact dan pembuatan draft. Draft tersebut kemudian diterbitkan manual sebagai Release v0.1.1; workflow tidak melakukan auto-publish.
 
 Pin diverifikasi dari sumber resmi: [Rust 1.99.1](https://static.rust-lang.org/dist/channel-rust-1.99.1.toml), [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1), dan [upload-artifact v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2). Pembaruan pin harus ditinjau, bukan mengikuti tag bergerak secara otomatis.
 
 ## Bootstrap curl
 
-`install.sh` di root adalah bootstrap online; `scripts/install.sh` di bundle tetap satu-satunya pemilik aturan instalasi dan konfigurasi. Perintah online dengan Bash `pipefail`, contoh upgrade dan opsi ada di [README utama](../README.md#instalasi-online). Raw source dan asset latest Release harus tersedia publik; implementasi lokal ini belum menyatakan QA atau publikasi berhasil.
+`install.sh` di root adalah bootstrap online; `scripts/install.sh` di bundle tetap satu-satunya pemilik aturan instalasi dan konfigurasi. Perintah online dengan Bash `pipefail`, contoh upgrade dan opsi ada di [README utama](../README.md#instalasi-online). Source dan asset latest [Release v0.1.1](https://github.com/munMisbah/notefart/releases/tag/v0.1.1) sudah tersedia publik. Bukti serta batas QA dicatat di [SECURITY.md](SECURITY.md).
 
 - Pada GNU/Linux x86_64 bootstrap memakai Bash, curl, tar, sha256sum dan coreutils, tanpa sudo otomatis atau perubahan shell rc. `--help` tidak mengakses jaringan.
 - Archive dan sidecar diunduh dari latest Release repository ini melalui HTTPS. Checksum hanya diperiksa terhadap archive yang diharapkan sebelum payload dibaca; SHA-256 mendeteksi korupsi, bukan tanda tangan penerbit.

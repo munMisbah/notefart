@@ -1,8 +1,8 @@
 # Roadmap Notefart
 
-Status: draft tanpa tanggal rilis. Urutan di bawah adalah usulan implementasi balanced, bukan pengurangan fitur yang telah disepakati.
+Status: roadmap tetap draft untuk rencana berikutnya; urutan di bawah adalah usulan implementasi balanced, bukan janji tanggal rilis atau pengurangan fitur yang telah disepakati. Status implementasi dan distribusi publik dicatat terpisah di bawah.
 
-Diagnostik, editor aman, workspace, hybrid panel + tab/shared view dan P1 terpilih sudah berjalan. Sesuai keputusan pengguna, tahap 4 ditutup untuk matriks Linux yang telah dibuktikan; bukan klaim seluruh terminal/font/host SSH. Bukti serta batas terkini ada di [hasil P1 aksesibilitas dan pencarian](#hasil-p1-aksesibilitas-dan-pencarian). Publish dan installer tetap terpisah.
+Diagnostik, editor aman, workspace, hybrid panel + tab/shared view dan P1 terpilih sudah berjalan. Sesuai keputusan pengguna, tahap 4 ditutup untuk matriks Linux yang telah dibuktikan; bukan klaim seluruh terminal/font/host SSH. Bukti serta batas editor ada di [hasil P1 aksesibilitas dan pencarian](#hasil-p1-aksesibilitas-dan-pencarian); status rilis dan installer ada di [distribusi publik](#distribusi-publik).
 
 Nama executable saat ini **`naf`**; produk dan namespace konfigurasi tetap Notefart/`notefart`. Perintah serta path binary `notefart` pada laporan batch sebelum migrasi di bawah adalah catatan pemeriksaan historis, bukan alias atau instruksi build aktif. Instruksi terkini ada di [README.md](README.md#menjalankan-editor); output binary/artifact lama telah dibersihkan pada migrasi.
 
@@ -789,7 +789,7 @@ Fitur tambahan ini kini **tersedia untuk exit normal**, bukan perluasan menuju I
 - Snapshot privat tidak dienkripsi; lokasi/batas/lock/format ditetapkan di ARCHITECTURE.md. Restore memulihkan buffer persis dan baseline asli, bukan reload atau overwrite sumber secara diam-diam. Undo/redo dimulai ulang setelah restore.
 - Session restore berbeda dari crash recovery: tidak ada autosave atau snapshot baru saat signal/panic/proses mati. Perubahan/discard dalam sesi yang berakhir abnormal tidak mengganti snapshot exit normal sebelumnya.
 
-## Distribusi — persiapan installer dan draft rilis
+## Distribusi — persiapan installer dan draft rilis (historis)
 
 Installer bundle GNU/Linux x86_64, helper paket bersama CI dan workflow draft-release manual sudah diimplementasikan. Jalur teruji lulus verifikasi di bawah. Kontrak di [ARCHITECTURE.md](ARCHITECTURE.md#kontrak-distribusi-linux-dan-installer): user-local tanpa sudo otomatis, empat preferensi tanpa menimpa konfigurasi lama, serta publikasi yang tetap menjadi keputusan terpisah. Tidak membuat tag, mengubah lisensi/visibilitas repository atau menjalankan publish.
 
@@ -813,6 +813,17 @@ Binary yang dipakai sudah tersedia sebelumnya, bukan build baru batch ini: SHA-2
 Laporan/log: `/tmp/notefart-dist-normal-qa-report.md`, `/tmp/notefart-dist-normal-qa.log`, `/tmp/notefart-dist-security-qa-report.md`, `/tmp/notefart-dist-security-qa-logs/`, `/tmp/notefart-dist-close-findings-report.md` dan `/tmp/notefart-dist-close-findings-logs/`. Fixture HOME/prefix, driver dan prompt sementara dibersihkan; laporan/log dipertahankan.
 
 Batas: hosted CI/workflow rilis dan API GitHub belum dijalankan; parsing YAML bukan validasi schema Actions (`actionlint` tidak tersedia). Root guard hanya diuji lewat fakeroot, bukan instalasi/ownership sebagai root nyata. Tidak menguji crash/power loss, race konkuren, seluruh distro/glibc atau OS lain. Instalasi atomik per file, bukan transaksi/rollback seluruh bundle. Checksum bukan signature/autentikasi; bundle harus dipercaya sebelum installer mengeksekusi binary untuk setup config. Lisensi proyek dan publikasi tetap belum diputuskan.
+
+## Distribusi publik
+
+[Notefart v0.1.1](https://github.com/munMisbah/notefart/releases/tag/v0.1.1) diterbitkan pada 19 November 2026 sebagai rilis awal/preview GNU/Linux x86_64. Repository sudah publik sesuai persetujuan pengguna; publikasi tetap manual, bukan auto-publish.
+
+- [Workflow tag final](https://github.com/munMisbah/notefart/actions/runs/44421850899) pada commit `f80901f` berhasil: format, seluruh target tes, build release, smoke CLI/installer, audit archive sebenarnya, upload artifact, dan pembuatan draft yang kemudian diterbitkan.
+- Resolusi commit pada API hosted memakai `commits/$TAG`, tanpa prefix `tags/`; ini mengoreksi asumsi fixture persiapan lokal di atas yang ditolak hosted API dengan HTTP 422.
+- Bootstrap curl dan upgrade didokumentasikan di [README utama](../README.md#instalasi-online). Bukti QA, audit source/history dan payload, serta batas heuristik/trust dicatat di [SECURITY.md](SECURITY.md). Paket menormalkan metadata owner tar dan hanya memuat enam file resmi serta dua direktori.
+- History dan kedua tag pra-publikasi disanitasi dengan backup privat; clone lama perlu diselaraskan. Penulisan ulang ref tidak menghapus cache GitHub atau clone lain secara otomatis.
+
+Lisensi proyek tetap belum ditetapkan. Publikasi preview ini tidak memperluas dukungan platform, menghilangkan batas filesystem/terminal, atau menjanjikan audit keamanan universal.
 
 ## Belum diprioritaskan
 

@@ -2,7 +2,7 @@
 
 Editor teks terminal yang familiar, tanpa mode editing wajib. Gunakan keyboard atau mouse untuk membuka file, membagi panel, dan mengedit beberapa dokumen dalam satu workspace.
 
-**v0.1.1** adalah versi awal/preview untuk GNU/Linux x86_64. Ketersediaan binary bergantung pada artifact CI atau Release yang benar-benar dipublikasikan.
+**v0.1.1** adalah versi awal/preview untuk GNU/Linux x86_64. [Binary dan checksum sudah tersedia di Release publik](https://github.com/munMisbah/notefart/releases/tag/v0.1.1).
 
 [Keunggulan](#keunggulan) · [Instalasi](#instalasi) · [Mulai cepat](#mulai-cepat) · [Konfigurasi](#konfigurasi) · [Batasan](#batasan) · [Dokumentasi](#dokumentasi)
 
@@ -46,7 +46,7 @@ Nerd Font harus disediakan dan dipilih sendiri di terminal; installer tidak mema
 
 ### Bundle offline atau build source
 
-Unduh `naf-linux-x86_64.tar.gz` dan `naf-linux-x86_64.tar.gz.sha256` dari [Releases](https://github.com/munMisbah/notefart/releases) jika asset sudah dipublikasikan, atau dari artifact run Linux CI yang berhasil di [Actions](https://github.com/munMisbah/notefart/actions). Artifact Actions berupa ZIP browser; ekstrak ZIP terlebih dahulu untuk mendapatkan kedua file. Akses mengikuti visibilitas repository.
+Unduh `naf-linux-x86_64.tar.gz` dan `naf-linux-x86_64.tar.gz.sha256` dari [Release v0.1.1](https://github.com/munMisbah/notefart/releases/tag/v0.1.1). Alternatif artifact CI tersedia di [Actions](https://github.com/munMisbah/notefart/actions): artifact berupa ZIP browser; ekstrak ZIP terlebih dahulu untuk mendapatkan kedua file.
 
 **Dari source:** clone repository, lalu build dengan Rust/Cargo melalui [rustup](https://rustup.rs), compiler C, dan `pkg-config` yang tersedia. `rust-toolchain.toml` memilih Rust 1.99.1; rustup akan mengunduhnya bila diperlukan.
 
